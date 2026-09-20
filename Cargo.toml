@@ -1,0 +1,6 @@
+[package]
+edition = "2024"
+name = "sw-scope"
+version = "0.1.0"
+
+description = "支持分区和依靠强弱引用管理的 Arena 分配器"
