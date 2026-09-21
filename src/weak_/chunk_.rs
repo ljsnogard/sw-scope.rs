@@ -42,7 +42,11 @@ pub(crate) enum DataState {
 
 #[repr(C)]
 pub(crate) struct WeakChunkState {
-    /// 在 WeakChunkPool 中的索引（0开始），也可用于定位 WeakChunkPool 地址
+    /// 在 WeakChunkPool 中的索引（0开始），也可用于定位 WeakChunkPool 地址。
+    ///
+    /// 这个序号只取决于槽位在池内数组中的位置，因此池在构造时就把全部槽位编号完毕，
+    /// 此后终生只读：分配、归还都不再触碰它。既然是只读字段，就没有必要为它引入
+    /// 原子或「只写一次」的接口。
     pool_order_: PoolIndex,
 
     /// 协助 WeakChunPool 记录下一个空闲 Chunk
@@ -77,6 +81,12 @@ where
         self.chunk_state_.data_state()
     }
 
+    /// 读取槽位当前的弱引用计数。
+    #[inline]
+    pub fn weak_count(&self) -> usize {
+        self.chunk_state_.weak_count()
+    }
+
     #[inline]
     pub fn incr_use_count(&self) -> usize {
         self.chunk_state_.incr_use_count()
@@ -85,6 +95,63 @@ where
     #[inline]
     pub fn decr_use_count(&self) -> usize {
         self.chunk_state_.decr_use_count()
+    }
+
+    /// 读取槽位在所属 `WeakChunkPool` 中的序号。该序号由池在构造时写死，总是等于槽位
+    /// 在池内数组中的下标。
+    #[inline]
+    pub fn pool_order(&self) -> PoolIndex {
+        self.chunk_state_.pool_order()
+    }
+
+    /// 读取空闲链表中的下一个槽位序号，仅供 `WeakChunkPool` 遍历空闲链使用。
+    #[inline]
+    pub fn next_freed(&self) -> PoolIndex {
+        self.chunk_state_.next_freed()
+    }
+
+    /// 把槽位挂到空闲链表的表头：写入后继节点并清掉残留的弱引用计数。
+    ///
+    /// 仅供 `WeakChunkPool` 在归还槽位时调用。
+    pub fn link_as_freed(&mut self, next: PoolIndex) {
+        self.chunk_state_.set_next_freed(next);
+        self.chunk_state_.reset_weak_state();
+    }
+
+    /// 初始化一段尚未投入使用的槽位数组，是 `WeakChunkPool` 构造期唯一的槽位入口。
+    ///
+    /// 完成三件事：
+    /// - 按槽位在数组中的下标写死 `pool_order_`，该值此后终生只读，分配的代价里
+    ///   不再包含任何序号写入；
+    /// - 把链接串成初始空闲链：`i` 指向 `i + 1`，末位指向 `capacity`。这为池提供了
+    ///   "只要未满就一定有表头可摘"的不变量，于是分配路径无须区分「从未分配过的槽位」
+    ///   与「归还回来的槽位」；
+    /// - 把弱引用计数清零。分配器返回的是未初始化内存，若不在此统一收口，槽位在首次
+    ///   分配前就会带着随机内容被读到。
+    ///
+    /// # Panics
+    ///
+    /// 当 `slots.len()` 超出 [`PoolIndex`] 表示范围时 panic：链尾标记本身就是容量值，
+    /// 它必须能放进一个 `PoolIndex`。
+    pub fn init_slots(slots: &mut [Self], capacity: PoolIndex) {
+        assert!(
+            slots.len() == capacity as usize,
+            "槽位数量({})必须与容量({})一致",
+            slots.len(),
+            capacity,
+        );
+        let last = slots.len() - 1;
+        for (i, slot) in slots.iter_mut().enumerate() {
+            let next = if i == last {
+                capacity
+            } else {
+                (i + 1) as PoolIndex
+            };
+            let state = &mut slot.chunk_state_;
+            state.pool_order_ = i as PoolIndex;
+            state.set_next_freed(next);
+            state.reset_weak_state();
+        }
     }
 
     pub fn try_retain(&self) -> Result<NonNull<StrongChunk<T>>, DataState> {
@@ -178,6 +245,13 @@ impl WeakChunkState {
 
     pub fn set_next_freed(&mut self, v: PoolIndex) {
         self.next_freed_ = v
+    }
+
+    /// 清除槽位上的弱引用计数，仅供 `WeakChunkPool` 在归还槽位时调用。
+    ///
+    /// 归还意味着该槽位上的弱引用已经结束，残留的计数只会让后续的读取者误判状态。
+    pub fn reset_weak_state(&mut self) {
+        self.weak_state_.store(0, Ordering::Release);
     }
 }
 

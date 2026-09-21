@@ -1,5 +1,6 @@
 use std::boxed::Box;
 
+#[cfg(test)]
 use crate::*;
 
 #[cfg(test)]
@@ -37,3 +38,4 @@ fn demo() {
     assert!(retain.try_owning().is_none());
     assert!(retain.try_sharing().is_some());
 }
+
