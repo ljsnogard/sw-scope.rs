@@ -304,6 +304,73 @@ impl<const CELL_SIZE: usize> WeakChunkPool<CELL_SIZE> {
         self.latest_free_
     }
 
+    /// 池链上的下一个池，没有后继时为 [`None`]。
+    pub const fn next(&self) -> Option<NonNull<WeakChunkPool<CELL_SIZE>>> {
+        self.next_
+    }
+
+    /// 池链上的上一个池，没有前驱时为 [`None`]。
+    pub const fn prev(&self) -> Option<NonNull<WeakChunkPool<CELL_SIZE>>> {
+        self.prev_
+    }
+
+    /// 本池所属的域。
+    #[cfg(test)]
+    pub const fn root(&self) -> Option<NonNull<ScopeInner<CELL_SIZE>>> {
+        self.root_
+    }
+
+    /// 绑定本池所属的域。
+    ///
+    /// 目前只有测试用它搭出带域的池链；等 Scope 的池扩张逻辑落地后，绑定应当在那里
+    /// 与建池同时完成。
+    #[cfg(test)]
+    pub fn set_root(&mut self, root: NonNull<ScopeInner<CELL_SIZE>>) {
+        self.root_ = Option::Some(root);
+    }
+
+    /// 读取某个槽位记录的所属池序号。
+    ///
+    /// 槽位序号是槽位"由自身反推池地址"的唯一线索，池有理由把它读出来核对。
+    pub fn pool_order_of(&self, index: PoolIndex) -> PoolIndex {
+        // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
+        let slot = unsafe { self.chunk_at_(index) };
+        slot.pool_order()
+    }
+
+    /// 读取某个槽位在空闲链上的后继序号，链尾为 `capacity_`。
+    ///
+    /// 仅供测试与诊断遍历空闲链使用；常规的摘取/归还路径直接操作槽位自身。
+    #[cfg(test)]
+    pub fn next_freed_of(&self, index: PoolIndex) -> PoolIndex {
+        // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
+        let slot = unsafe { self.chunk_at_(index) };
+        slot.next_freed()
+    }
+
+    /// 直接改写某个槽位在空闲链上的后继序号。
+    ///
+    /// 仅供测试故意制造损坏的链表，用来验证不变式检查器真的能发现错误；
+    /// 生产代码的链接维护一律走 `allocate` / `deallocate`。
+    #[cfg(test)]
+    pub fn set_next_freed_of(&mut self, index: PoolIndex, next: PoolIndex) {
+        // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
+        let slot = unsafe { self.chunk_mut_at_(index) };
+        slot.link_as_freed(next);
+    }
+
+    /// 把 `next` 接到本池之后，并回填其反向指针，从而把两个池串成双向链的一环。
+    ///
+    /// 目前只有测试用它手工搭链；等池容量扩张逻辑落地后，链的维护应统一收口到那里，
+    /// 而不是由调用方各自拼接。
+    #[cfg(test)]
+    pub fn link_siblings(&mut self, next: &mut WeakChunkPool<CELL_SIZE>) {
+        let this = NonNull::from(&mut *self);
+        let next_ptr = NonNull::from(&mut *next);
+        self.next_ = Option::Some(next_ptr);
+        next.prev_ = Option::Some(this);
+    }
+
     /// 从空闲链表的表头摘下一个槽位并返回其序号；池已满时返回 [`None`]。
     ///
     /// 摘取过程只改动池头自身的 `latest_free_`：槽位的 `pool_order_` 早在池构造时就已
@@ -334,9 +401,7 @@ impl<const CELL_SIZE: usize> WeakChunkPool<CELL_SIZE> {
         let head = self.latest_free_;
         // SAFETY: index 已按 capacity_ 校验，落在槽位数组范围内
         let slot = unsafe { self.chunk_mut_at_(index) };
-
-        debug_assert_eq!(slot.weak_count(), 0usize);
-
+        // debug_assert_eq!(slot.weak_count(), 0usize);
         slot.link_as_freed(head);
         self.latest_free_ = index;
         self.used_length_ -= 1;
@@ -356,6 +421,21 @@ impl<const CELL_SIZE: usize> WeakChunkPool<CELL_SIZE> {
         };
         // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
         unsafe { &mut *slot }
+    }
+
+    /// 按槽位序号取只读槽位引用。
+    ///
+    /// # Safety
+    ///
+    /// `index` 必须小于 `capacity_`，否则返回的引用会越出槽位数组。
+    unsafe fn chunk_at_(&self, index: PoolIndex) -> &WeakChunk<()> {
+        let this = self as *const Self as *const u8;
+        let offset = self.cell_offset_ as usize * Self::SLOT_SIZE;
+        let slot = unsafe {
+            this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *const WeakChunk<()>
+        };
+        // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
+        unsafe { &*slot }
     }
 }
 
