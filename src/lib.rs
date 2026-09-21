@@ -1,6 +1,7 @@
 #![feature(allocator_api)]
 #![feature(coerce_unsized)]
 #![feature(generic_atomic)]
+#![feature(ptr_metadata)]
 #![feature(try_trait_v2)]
 #![feature(unsize)]
 
@@ -22,8 +23,8 @@ mod scope_str_;
 mod strong_;
 mod weak_;
 
-// #[cfg(test)]
-// mod demo_;
+#[cfg(test)]
+mod demo_;
 
 pub use abs_::{TrEmplace, TrScope, IntoEmplace};
 pub use index_::{Owning, Sharing, Retain};

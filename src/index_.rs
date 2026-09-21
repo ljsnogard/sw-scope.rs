@@ -1,6 +1,6 @@
 use core::{
-    ptr::NonNull,
     marker::PhantomData,
+    ptr::{self, NonNull},
 };
 
 use crate::{
@@ -60,7 +60,7 @@ where
     fn deref(&self) -> &Self::Target {
         let chunk = unsafe { self.strong_chunk_.as_ref() };
         debug_assert!(chunk.is_data_alive());
-        chunk.try_get_data().expect("[Retain::deref] should always work.")
+        chunk.try_get_data().expect("[Owning::deref] should always work.")
     }
 }
 
@@ -71,7 +71,9 @@ where
     fn deref_mut(&mut self) -> &mut Self::Target {
         let chunk = unsafe { self.strong_chunk_.as_mut() };
         debug_assert!(chunk.is_data_alive());
-        chunk.try_get_data_mut().expect("[Retain::deref_mut] should always work.")
+        chunk
+            .try_get_data_mut()
+            .expect("[Owning::deref_mut] should always work.")
     }
 }
 
@@ -105,7 +107,7 @@ where
     fn deref(&self) -> &Self::Target {
         let chunk = unsafe { self.strong_chunk_.as_ref() };
         debug_assert!(chunk.is_data_alive());
-        chunk.try_get_data().expect("[Retain::deref] should always work.")
+        chunk.try_get_data().expect("[Owning::deref] should always work.")
     }
 }
 
@@ -148,18 +150,16 @@ where
     /// 当且仅当 `DataState::Allocated` 时会成功
     pub fn try_owning(&self) -> Option<Owning<'_, T>> {
         let chunk = unsafe { self.weak_chunk_.as_ref() };
-        chunk.try_retain()
-            .map(Owning::new)
-            .ok()
+        let strong = chunk.try_owning().ok()?;
+        Option::Some(Owning::new(raw_to_strong_::<T>(strong)))
     }
 
     /// 尝试从 Weak<T> 提升为 Shared<T>。
     /// 当且仅当 `DataState::Allocated` 时会成功。
     pub fn try_sharing(&self) -> Option<Sharing<'_, T>> {
         let chunk = unsafe { self.weak_chunk_.as_ref() };
-        chunk.try_share()
-            .map(Sharing::new)
-            .ok()
+        let strong = chunk.try_sharing().ok()?;
+        Option::Some(Sharing::new(raw_to_strong_::<T>(strong)))
     }
 }
 
@@ -179,4 +179,33 @@ where
     fn drop(&mut self) {
         todo!()
     }
+}
+
+/// 把"类型擦除后的强块头部指针"还原成 `NonNull<StrongChunk<T>>`。
+///
+/// 对 `?Sized` 的 `T` 需要重建胖指针，元数据取自弱槽位的析构登记（弱槽位是生命周期
+/// 最长的一环，见 `WeakChunk` 的文档）。
+fn raw_to_strong_<T: ?Sized + ptr::Pointee>(
+    raw: NonNull<crate::strong_::StrongChunkBase>,
+) -> NonNull<StrongChunk<T>> {
+    let void = raw.as_ptr().cast::<()>();
+    let meta = raw_meta_::<T>(raw);
+    // SAFETY: 由调用方保证该强块当初就是按 T 分配的；头部在偏移 0，因此同址
+    unsafe { NonNull::new_unchecked(ptr::from_raw_parts_mut::<StrongChunk<T>>(void, meta)) }
+}
+
+/// 从强块头部取出它当初分配时的类型元数据。
+fn raw_meta_<T: ?Sized + ptr::Pointee>(
+    raw: NonNull<crate::strong_::StrongChunkBase>,
+) -> T::Metadata {
+    // SAFETY: 强块头部记录着身份槽位，槽位必然比强块活得久
+    let weak = unsafe { raw.as_ref().weak_chunk() };
+    // SAFETY: 同上
+    let weak = unsafe { weak.as_ref() };
+    #[cfg(test)]
+    {
+        let _ = weak;
+    }
+    // SAFETY: 登记信息是用同一个 T 写下的
+    unsafe { crate::weak_::meta_from_raw_::<T>(crate::weak_::meta_of_(weak)) }
 }

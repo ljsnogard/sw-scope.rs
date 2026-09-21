@@ -5,10 +5,17 @@
 //! `demo_.rs` 只作为使用示例，不承担测试职责。
 
 use alloc::{alloc::Global, vec, vec::Vec};
-use core::ptr::NonNull;
+use core::{
+    mem::MaybeUninit,
+    ptr::NonNull,
+    sync::atomic::Ordering,
+};
 
-use crate::scope_inner_::{PoolIndex, ScopeInner, WeakChunkPool};
-use crate::weak_::WeakChunk;
+use crate::scope_inner_::{PoolIndex, ScopeInner};
+use crate::weak_::{DataState, WeakChunk, WeakPool};
+
+/// 测试统一使用"以 `ScopeInner<8>` 为根"的弱池；`Root` 参数在池内部是不透明的。
+type WeakChunkPool<const CELL_SIZE: usize> = WeakPool<CELL_SIZE, ScopeInner<CELL_SIZE>>;
 
 /// 验证 `WeakChunkPool` 布局所依赖的类型前提：`WeakChunk<T>` 的尺寸与对齐
 /// 与 `T` 无关，且恰好等于 `WeakChunk<()>`。
@@ -32,12 +39,12 @@ fn weak_chunk_size_is_type_agnostic() {
     assert_eq!(base_align, align_of::<WeakChunk<[u8]>>());
 }
 
-/// 验证 `WeakChunkPool` 的容量换算与其自述的"池头 = 2 个槽位"布局一致。
+/// 验证 `WeakPool` 的容量换算与其"池头按槽位取整"的布局一致。
 /// - 手段：比较 `min_size_for_max_count` 与 `max_count_within_max_size` 的往返结果，
-///   显式要求池头大小恰好等于 2 个 `WeakChunk<()>`；预算的边界取
-///   "刚好放下 count 个槽位"与"少一个字节"两种。
-/// - 判断：容量到尺寸的换算必须恰好加上池头大小，且少一个字节就应少放一个槽位；
-///   池头若不是 2 个槽位，则池头按槽位大小整除定位的前提被打破，断言失败。
+///   并把池头字节数取为"槽位大小的整数倍"；预算边界取"刚好放下 count 个槽位"与
+///   "少一个字节"两种。
+/// - 判断：容量到尺寸的换算必须恰好等于"取整后的池头 + count 个槽位"，少一个字节就要
+///   少放一个槽位；零容量时也应占满取整后的池头。
 #[test]
 fn weak_chunk_pool_capacity_math() {
     use core::mem::size_of;
@@ -45,12 +52,13 @@ fn weak_chunk_pool_capacity_math() {
     type Pool = WeakChunkPool<8>;
 
     let slot = size_of::<WeakChunk<()>>();
-    // 池头必须恰好占 2 个槽位，cell_offset_ 的整除计算才成立
-    assert_eq!(size_of::<Pool>(), 2 * slot);
+    // 池头按槽位个数向上取整，槽位起点因此始终对齐
+    assert_eq!(Pool::min_size_for_max_count(0), size_of::<Pool>().div_ceil(slot) * slot);
 
     for count in [1u16, 7, 1000, PoolIndex::MAX] {
         let need = Pool::min_size_for_max_count(count);
-        assert_eq!(need, size_of::<Pool>() + count as usize * slot);
+        let header = size_of::<Pool>().div_ceil(slot) * slot;
+        assert_eq!(need, header + count as usize * slot);
         // 恰好足够的预算应换回同样的槽位数
         assert_eq!(Pool::max_count_within_max_size(need), count as usize);
         // 少一个字节就再也放不下这么多槽位
@@ -58,11 +66,12 @@ fn weak_chunk_pool_capacity_math() {
     }
 
     // 预算连池头都放不下时没有任何槽位可用
+    let header = size_of::<Pool>().div_ceil(slot) * slot;
     assert_eq!(Pool::max_count_within_max_size(0), 0);
-    assert_eq!(Pool::max_count_within_max_size(size_of::<Pool>()), 0);
-    assert_eq!(Pool::max_count_within_max_size(size_of::<Pool>() - 1), 0);
+    assert_eq!(Pool::max_count_within_max_size(header), 0);
+    assert_eq!(Pool::max_count_within_max_size(header - 1), 0);
     // 刚好放下一个槽位的预算
-    assert_eq!(Pool::max_count_within_max_size(size_of::<Pool>() + slot), 1);
+    assert_eq!(Pool::max_count_within_max_size(header + slot), 1);
 }
 
 /// 验证池初始化后空闲链表的初始形态：槽位 `i` 的 `next_freed_` 指向 `i + 1`，
@@ -81,7 +90,7 @@ fn weak_chunk_pool_init_builds_sequential_free_list() {
     assert_eq!(pool.latest_free(), 0);
 
     // SAFETY: chunks() 返回的切片长度即 capacity_，索引 0..4 均在范围内
-    let slots = unsafe { pool.chunks().as_mut() };
+    let slots = unsafe { pool.slots().as_mut() };
     assert_eq!(slots.len(), 4);
     for (i, slot) in slots.iter().enumerate() {
         assert_eq!(slot.next_freed(), (i + 1) as u16);
@@ -108,7 +117,7 @@ fn weak_chunk_pool_allocate_pops_free_list_head() {
         let index = pool.allocate().expect("池未满时必定能分配");
         assert_eq!(index, expect);
         // SAFETY: index 是刚由本池分配的槽位序号，必定小于 capacity_
-        let slots = unsafe { pool.chunks().as_mut() };
+        let slots = unsafe { pool.slots().as_mut() };
         assert_eq!(slots[index as usize].pool_order(), index);
     }
     assert_eq!(pool.used_count(), 3);
@@ -177,7 +186,7 @@ fn weak_chunk_pool_deallocate_rejects_invalid_input() {
     assert_eq!(index, 0);
     {
         // SAFETY: index 是刚由本池分配的槽位序号，必定小于 capacity_
-        let slots = unsafe { pool.chunks().as_mut() };
+        let slots = unsafe { pool.slots().as_mut() };
         let chunk = &slots[index as usize];
         chunk.incr_use_count();
         chunk.incr_use_count();
@@ -186,7 +195,7 @@ fn weak_chunk_pool_deallocate_rejects_invalid_input() {
     assert!(pool.deallocate(index));
     assert_eq!(pool.used_count(), 0);
     // SAFETY: 与上段相同，index 在范围内
-    let slots = unsafe { pool.chunks().as_mut() };
+    let slots = unsafe { pool.slots().as_mut() };
     assert_eq!(slots[index as usize].weak_count(), 0);
     assert_eq!(pool.allocate(), Some(index));
 }
@@ -236,7 +245,7 @@ fn weak_chunk_pool_slot_order_is_fixed_at_construction() {
     let pool = unsafe { pool.as_mut() };
 
     // SAFETY: chunks() 返回的切片长度即 capacity_，索引 0..3 均在范围内
-    let slots = unsafe { pool.chunks().as_mut() };
+    let slots = unsafe { pool.slots().as_mut() };
     let expected: [u16; 3] = [0, 1, 2];
     for (i, slot) in slots.iter().enumerate() {
         assert_eq!(slot.pool_order(), expected[i]);
@@ -252,7 +261,7 @@ fn weak_chunk_pool_slot_order_is_fixed_at_construction() {
 
     // 完整走过一轮分配与归还之后，所有槽位的序号仍是构造时的那一份
     // SAFETY: 与上段相同，索引 0..3 均在范围内
-    let slots = unsafe { pool.chunks().as_mut() };
+    let slots = unsafe { pool.slots().as_mut() };
     for (i, slot) in slots.iter().enumerate() {
         assert_eq!(slot.pool_order(), expected[i]);
     }
@@ -651,4 +660,201 @@ fn weak_chunk_pool_invariant_checker_detects_corruption() {
     }))
     .is_err();
     assert!(caught, "损坏的空闲链表没有被不变式检查器发现");
+}
+
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// -- 状态锁
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+/// 验证状态锁的尝试语义与守卫的自动释放。
+/// - 手段：造一个槽位，先用带重试上限的 `try_lock` 取得守卫；在守卫存活期间再尝试一次
+///   （另一个借用），随后析构守卫，再尝试第三次。
+/// - 判断：第一次必须成功；守卫存活期间的第二次必须失败；守卫析构后的第三次必须成功，
+///   且锁位确实被释放。这条测试同时说明守卫是"持有即独占、析构即归还"的。
+#[test]
+fn weak_chunk_state_lock_is_exclusive_and_released_by_guard() {
+    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    // SAFETY: 先把 1 个槽位初始化干净，再取可变引用
+    let chunk = unsafe {
+        let ptr = slot.as_mut_ptr();
+        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        &mut *ptr
+    };
+
+    {
+        let guard = chunk.try_lock(64).expect("空闲槽位应当能立刻上锁");
+        // 守卫存活期间，别的持有者拿不到锁
+        assert!(chunk.try_lock(4).is_none(), "已上锁的槽位不应再次成功上锁");
+        assert_eq!(guard.pool_order(), 0);
+    }
+    // 守卫析构后锁位应当被释放，且状态字没有残留垃圾位
+    assert!(chunk.try_lock(64).is_some(), "守卫析构后应当能重新上锁");
+    assert_eq!(chunk.data_state(), DataState::Reclaimed);
+    assert_eq!(chunk.weak_count(), 0);
+}
+
+/// 验证忙等版加锁（`lock_busy`）在无竞争时同样可用。
+/// - 手段：对空闲槽位调用 `lock_busy` 取得守卫，检查能通过 `Deref` 读到槽位字段。
+/// - 判断：能拿到守卫并读到正确的 `pool_order`；守卫析构后 `try_lock` 仍能成功。
+#[test]
+fn weak_chunk_lock_busy_acquires_and_releases() {
+    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    // SAFETY: 初始化 1 个槽位后取可变引用
+    let chunk = unsafe {
+        let ptr = slot.as_mut_ptr();
+        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        &mut *ptr
+    };
+
+    {
+        let guard = chunk.lock_busy();
+        assert_eq!(guard.pool_order(), 0);
+    }
+    assert!(chunk.try_lock(64).is_some(), "忙等守卫析构后应当释放锁");
+}
+
+/// 验证锁在并发下确实互斥：多线程各自"取锁—进入临界区—放锁"，临界区不重叠。
+/// - 手段：用一个槽位，8 个线程各重复 64 次 `lock_busy`；临界区内递增一个记录
+///   "当前在临界区内的线程数"的原子计数（超过 1 就记一次溢出），再递减、放锁；
+///   同时统计总进入次数。
+/// - 判断：溢出次数必须为 0（互斥成立），总进入次数必须等于 8 × 64（没有线程饿死）。
+///   若锁失效，两个线程会同时看到计数为 1，溢出计数大于 0。
+#[test]
+fn weak_chunk_state_lock_is_mutually_exclusive_across_threads() {
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicUsize;
+    use std::thread;
+
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 64;
+
+    /// 把裸指针包起来以便跨线程传递；真正的同步由槽位状态锁负责。
+    struct SharedPtr(*mut WeakChunk<()>);
+    // SAFETY: 各线程只在持有状态锁时解引用该指针
+    unsafe impl Send for SharedPtr {}
+    // SAFETY: 同上；锁保证同一时刻只有一个线程在临界区内
+    unsafe impl Sync for SharedPtr {}
+
+    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    // SAFETY: 先初始化这一个槽位，之后各线程只通过共享引用访问它
+    let shared = unsafe {
+        let ptr = slot.as_mut_ptr();
+        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        Arc::new(SharedPtr(ptr))
+    };
+
+    let inside = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let overflowed = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..THREADS {
+        let shared = Arc::clone(&shared);
+        let inside = Arc::clone(&inside);
+        let entered = Arc::clone(&entered);
+        let overflowed = Arc::clone(&overflowed);
+        handles.push(thread::spawn(move || {
+            // SAFETY: 指针在整个测试期间有效；访问由状态锁串行化
+            let chunk = unsafe { &*shared.0 };
+            for _ in 0..ROUNDS {
+                let guard = chunk.lock_busy();
+                if inside.fetch_add(1, Ordering::AcqRel) + 1 > 1 {
+                    overflowed.fetch_add(1, Ordering::AcqRel);
+                }
+                entered.fetch_add(1, Ordering::AcqRel);
+                inside.fetch_sub(1, Ordering::AcqRel);
+                drop(guard);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("线程不应 panic");
+    }
+
+    assert_eq!(
+        overflowed.load(Ordering::Acquire),
+        0,
+        "临界区内同时出现了多个线程，互斥失败"
+    );
+    assert_eq!(
+        entered.load(Ordering::Acquire),
+        THREADS * ROUNDS,
+        "有线程没能进入临界区（饥饿或丢锁）"
+    );
+}
+
+/// 验证守卫的析构是唯一的解锁点，且临界区内 panic 也不会把锁漏掉。
+/// - 手段：在 `catch_unwind` 里取得守卫并主动 panic，让栈回退触发守卫的 `Drop`；
+///   随后在外部再尝试上锁。
+/// - 判断：panic 被捕获后，槽位必须能重新上锁，且此前无人调用过任何"解锁方法"
+///   （代码里根本不存在这样的入口）。若解锁只靠显式调用，这里会永久锁死。
+#[test]
+fn weak_chunk_lock_is_released_when_guard_drops_during_panic() {
+    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    // SAFETY: 初始化 1 个槽位后取可变引用
+    let chunk = unsafe {
+        let ptr = slot.as_mut_ptr();
+        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        &mut *ptr
+    };
+
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = chunk.try_lock(64).expect("空闲槽位应当能上锁");
+        panic!("在临界区内 panic，检查锁是否会被守卫带走");
+    }));
+    assert!(caught.is_err(), "panic 应当被 catch_unwind 捕获");
+
+    // 守卫随栈回退析构，锁必须已经释放
+    assert!(
+        chunk.try_lock(64).is_some(),
+        "临界区 panic 后锁必须已被守卫释放"
+    );
+}
+
+/// 验证 `DataState` 的完整 7 态迁移路径与"认领唯一"。
+/// - 手段：造一个 `Created` 槽位，依次走
+///   `Created → Owning → Destroying → Destroyed → Finalized`，并在每一步检查状态与
+///   重复调用的结果。
+/// - 判断：`Owning` 之后再次升级必须失败；`Destroying` 之后再次 `try_claim_destroy`
+///   必须失败（认领唯一，保证恰好析构一次）；`Destroyed` / `Finalized` 的状态值必须
+///   与定义一致；整个过程中弱计数不受影响。
+#[test]
+fn weak_chunk_data_state_full_transition_path() {
+    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    // SAFETY: 初始化 1 个槽位后取可变引用
+    let chunk = unsafe {
+        let ptr = slot.as_mut_ptr();
+        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        &mut *ptr
+    };
+    let state = &chunk.chunk_state_;
+
+    assert_eq!(state.data_state(), DataState::Reclaimed);
+    assert!(!state.data_state().is_data_alive());
+
+    // Created → Owning
+    state.init_created();
+    assert_eq!(state.data_state(), DataState::Created);
+    assert!(state.data_state().is_data_alive());
+    assert!(state.try_set_state(DataState::Owning).is_some());
+    assert_eq!(state.data_state(), DataState::Owning);
+
+    // Owning 之后不能再被认领成 Sharing / Created
+    assert!(state.try_set_state(DataState::Sharing).is_none());
+    assert!(state.compare_exchange_state(DataState::Created, DataState::Sharing).is_none());
+
+    // Owning → Destroying → Destroyed → Finalized
+    assert_eq!(state.try_claim_destroy(), Some(DataState::Owning));
+    assert_eq!(state.data_state(), DataState::Destroying);
+    assert!(!state.data_state().is_data_alive(), "Destroying 不算存活");
+    assert_eq!(state.try_claim_destroy(), None, "销毁认领必须唯一");
+
+    state.mark_destroyed();
+    assert_eq!(state.data_state(), DataState::Destroyed);
+    state.mark_finalized();
+    assert_eq!(state.data_state(), DataState::Finalized);
+
+    // 全程不影响弱计数
+    assert_eq!(state.weak_count(), 0);
+    assert_eq!(state.pool_order(), 0);
 }
