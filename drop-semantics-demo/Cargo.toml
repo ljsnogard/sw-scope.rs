@@ -1,0 +1,12 @@
+[package]
+name = "sw-scope-drop-semantics-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 这个 crate 是"对照实验"，不属于 sw-scope 本体：
+# sw-scope 本体保持零外部依赖，bumpalo 只在这里被引用。
+# 它是 sw-scope workspace 的成员，但需要单独运行（见 README）：
+# 在 sw-scope/ 下跑 `cargo test -p sw-scope` 不会编译它。
+[dependencies]
+bumpalo = { version = "3.20.3", features = ["boxed"] }

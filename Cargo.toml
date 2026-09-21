@@ -10,3 +10,8 @@ core-alloc = []
 std = []
 
 default = ["core-alloc"]
+
+# 对照实验 crate：独立 workspace，引用 bumpalo 以实证析构语义。
+# sw-scope 本体本身不依赖任何外部 crate。
+[workspace]
+members = [".", "drop-semantics-demo"]
