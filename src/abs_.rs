@@ -1,14 +1,41 @@
-use core::mem::MaybeUninit;
+use core::{
+    alloc::Layout,
+    marker::PhantomData,
+    mem::MaybeUninit,
+};
 
 use crate::{
     index_::Retain,
     scope_str_::ScopeStr,
 };
 
+pub trait TrEmplace {
+    type Target: ?Sized;
+
+    type Result<'f>: core::ops::Try<Output = &'f mut Self::Target>
+    where
+        Self: 'f;
+
+    /// Initialize at the place specified by the place pointer following
+    /// the given layout.
+    ///
+    /// # Safety
+    /// - Must gurantee the initialization will not exceed the memory border
+    ///   specified by the layout;
+    /// - The initialized result must safe for drop semantics;
+    unsafe fn emplace(
+        self,
+        layout: Layout,
+        place: *mut Self::Target,
+    );
+}
+
 pub trait TrScope {
     type Err;
 
-    fn try_put<T>(self, data: T) -> Result<Retain<T>, Self::Err>;
+    fn try_put<F, T>(self, factory: F) -> Result<Retain<T>, Self::Err>
+    where
+        F: FnOnce() -> T;
 
     fn try_put_str(self, str: &str) -> Result<Retain<ScopeStr>, Self::Err>;
 
@@ -16,10 +43,21 @@ pub trait TrScope {
     where
         T: Clone;
 
-    fn try_emplace<F, T>(self, emplace: F) -> Result<Retain<T>, Self::Err>
+    /// Like placement new in C++, to construct big object directly in place
+    /// instead of create on stack then move. This is also helpful when `T` has
+    /// self-referential structure.
+    ///
+    /// # Safety
+    /// - Caller must guarantee the emplaced value is safe for drop semantics;
+    /// - Caller must guarantee the process of emplacement will not exceed the
+    ///   memory border;
+    unsafe fn try_emplace<TyEmp>(
+        self,
+        layout: Layout,
+        emplace: TyEmp,
+    ) -> Result<Retain<TyEmp::Target>, Self::Err>
     where
-        F: FnOnce(&mut MaybeUninit<T>) -> &mut T,
-        T: Sized;
+        TyEmp: TrEmplace;
 
     fn try_alloc_slice_uninit<T>(
         self,
@@ -27,7 +65,7 @@ pub trait TrScope {
     ) -> Result<Retain<[MaybeUninit<T>]>, Self::Err>;
 
     fn put<T>(self, data: T) -> Retain<T> where Self: Sized {
-        let Result::Ok(w) = self.try_put(data) else {
+        let Result::Ok(w) = self.try_put(|| data) else {
             panic!()
         };
         w
@@ -38,5 +76,47 @@ pub trait TrScope {
             panic!()
         };
         w
+    }
+}
+
+pub struct IntoEmplace<F, T>
+where
+    F: FnOnce(Layout, *mut T),
+    T: ?Sized,
+{
+    factory_: F,
+    _use_t_: PhantomData<fn() -> T>,
+}
+
+impl<F, T> IntoEmplace<F, T>
+where
+    F: FnOnce(Layout, *mut T),
+    T: ?Sized,
+{
+    pub const fn new(factory: F) -> Self {
+        IntoEmplace {
+            factory_: factory,
+            _use_t_: PhantomData,
+        }
+    }
+}
+
+impl<F, T> TrEmplace for IntoEmplace<F, T>
+where
+    F: FnOnce(Layout, *mut T),
+    T: ?Sized,
+{
+    type Target = T;
+    type Result<'f> = Result<&'f mut T, !>
+    where
+        Self: 'f;
+
+    unsafe fn emplace(
+        self,
+        layout: Layout,
+        place: *mut Self::Target,
+    ) {
+        let IntoEmplace { factory_: f, _use_t_: _ } = self;
+        f(layout, place)
     }
 }

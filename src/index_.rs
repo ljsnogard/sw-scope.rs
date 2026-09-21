@@ -75,6 +75,12 @@ where
     }
 }
 
+impl<'a, T, U> core::ops::CoerceUnsized<Owning<'a, U>> for Owning<'a, T>
+where
+    T: ?Sized + core::marker::Unsize<U>,
+    U: ?Sized,
+{}
+
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
@@ -102,6 +108,12 @@ where
         chunk.try_get_data().expect("[Retain::deref] should always work.")
     }
 }
+
+impl<'a, T, U> core::ops::CoerceUnsized<Sharing<'a, U>> for Sharing<'a, T>
+where
+    T: ?Sized + core::marker::Unsize<U>,
+    U: ?Sized,
+{}
 
 impl<'a, T> Clone for Sharing<'a, T>
 where

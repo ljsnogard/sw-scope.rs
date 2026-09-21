@@ -14,19 +14,15 @@ pub(crate) struct StrongChunk<T>
 where
     T: ?Sized,
 {
-    base_: StrongChunkBase<T>,
+    base_: StrongChunkBase,
     data_: T,
 }
 
-
 #[repr(C)]
-pub(crate) struct StrongChunkBase<T>
-where
-    T: ?Sized,
-{
+pub(crate) struct StrongChunkBase {
     /// 包含状态，以及 strong_count
     chunk_state_: StrongChunkState,
-    weak_chunk_: NonNull<WeakChunk<T>>,
+    weak_chunk_: NonNull<WeakChunk<()>>,
 }
 
 #[repr(C)]
