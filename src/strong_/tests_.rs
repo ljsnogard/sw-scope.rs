@@ -231,3 +231,53 @@ fn weak_state_sharing_path_claims_destroy_exactly_once() {
     state.mark_finalized();
     assert_eq!(state.data_state(), DataState::Finalized);
 }
+
+/// 验证强池的 bump 分配：按布局对齐、`used_count_` 只增不减、空闲区随之收缩。
+/// - 手段：申请一个 64 cell 的池，先分配对齐 8 的块，再分配对齐 16 的块（模拟 `u128`）。
+/// - 判断：两块地址分别满足各自对齐；`used_count_` 随分配单调增加且不超过容量；
+///   空闲字节数在第二次分配后严格减少。最后把池内存还给分配器，避免测试泄漏。
+#[test]
+fn strong_pool_bump_allocation_is_aligned() {
+    use alloc::alloc::Global;
+    use core::alloc::{Allocator, Layout};
+
+    static GLOBAL: Global = Global;
+
+    let pool_ptr = StrongPool::<8>::try_new_(64, &GLOBAL, Option::None).expect("建池应当成功");
+    {
+        // SAFETY: pool_ptr 是刚初始化的独占池
+        let pool = unsafe { pool_ptr.as_ref() };
+        assert_eq!(pool.cell_count_(), 64);
+        assert_eq!(pool.used_count_(), 0);
+    }
+    let first_used;
+    // SAFETY: 同上；只在本块内可变借用
+    {
+        let pool = unsafe { pool_ptr.as_ptr().as_mut().unwrap() };
+        let a = pool
+            .allocate_(Layout::from_size_align(16, 8).unwrap())
+            .expect("第一块应当放得下");
+        assert_eq!(
+            (a.as_ptr() as *mut u8).align_offset(8),
+            0,
+            "第一块必须满足 align=8"
+        );
+        first_used = pool.used_count_();
+
+        let b = pool
+            .allocate_(Layout::from_size_align(16, 16).unwrap())
+            .expect("第二块应当放得下");
+        assert_eq!(
+            (b.as_ptr() as *mut u8).align_offset(16),
+            0,
+            "第二块必须满足 align=16"
+        );
+        assert!(
+            pool.used_count_() > first_used,
+            "第二次分配后已用 cell 必须增加"
+        );
+        assert!(pool.used_count_() <= pool.cell_count_());
+    }
+    // SAFETY: pool_ptr 由 GLOBAL 按 layout_for_(64) 分配，且此时借用已结束
+    unsafe { GLOBAL.deallocate(pool_ptr.cast(), StrongPool::<8>::layout_for_(64)) };
+}

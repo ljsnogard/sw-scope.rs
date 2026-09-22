@@ -1,5 +1,5 @@
 use core::{
-    alloc::Layout,
+    alloc::{AllocError, Allocator, Layout},
     mem,
     ptr::{self, NonNull},
 };
@@ -42,6 +42,57 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
     /// 池头自身的大小。
     pub(crate) const THIS_SIZE: usize = mem::size_of::<Self>();
 
+    /// 承载 `cell_count` 个 cell 的整块布局（池头 + cell 区）。
+    ///
+    /// 对齐取"池头对齐"与 `CELL_SIZE` 的较大者，保证 cell 区起点满足 cell 步长。
+    pub(crate) fn layout_for_(cell_count: PoolIndex) -> Layout {
+        let size = Self::THIS_SIZE + (cell_count as usize) * CELL_SIZE;
+        let align = mem::align_of::<Self>().max(CELL_SIZE);
+        // SAFETY: size 是池头加上整数个 cell，align 是 2 的幂且不会造成溢出
+        unsafe { Layout::from_size_align_unchecked(size, align) }
+    }
+
+    /// 申请并初始化一个新池，把它挂在 `prev` 之后。
+    ///
+    /// # Errors
+    ///
+    /// `cell_count` 为 0，或底层分配器无法满足布局时返回 [`AllocError`]。
+    pub(crate) fn try_new_(
+        cell_count: PoolIndex,
+        alloc: &'static dyn Allocator,
+        prev: Option<NonNull<Self>>,
+    ) -> Result<NonNull<Self>, AllocError> {
+        if cell_count == 0 {
+            return Result::Err(AllocError);
+        }
+        let mem = alloc.allocate(Self::layout_for_(cell_count))?;
+        let base = mem.as_ptr() as *mut u8 as *mut Self;
+        // SAFETY: mem 是刚分配、尚无人共享的独占内存，就地写入池头是安全的
+        unsafe {
+            base.write(StrongPool {
+                prev_pool_: prev,
+                cell_count_: cell_count,
+                used_count_: 0,
+            });
+            Result::Ok(NonNull::new_unchecked(base))
+        }
+    }
+
+    /// 本池承载的 cell 总数。
+    pub(crate) const fn cell_count_(&self) -> PoolIndex {
+        self.cell_count_
+    }
+
+    /// 池链上的上一个池。
+    pub(crate) const fn prev_(&self) -> Option<NonNull<StrongPool<CELL_SIZE>>> {
+        self.prev_pool_
+    }
+
+    /// 本池已经用掉的 cell 数。
+    pub(crate) const fn used_count_(&self) -> PoolIndex {
+        self.used_count_
+    }
+
     /// 整块池子承载的全部 cell 空间。
     pub(crate) const fn memory_(&self) -> NonNull<[u8]> {
         let p = self as *const Self as *const u8;
@@ -56,20 +107,44 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
     /// 尚未分配出去的那段 cell 空间，从第一个空闲位置直到池尾。
     pub(crate) const fn free_addr_(&self) -> NonNull<[u8]> {
         let p = self as *const Self as *const u8;
-        let offset = (self.used_count_ as usize) * CELL_SIZE;
+        let used = (self.used_count_ as usize) * CELL_SIZE;
+        let total = (self.cell_count_ as usize) * CELL_SIZE;
         unsafe {
-            let data = p.add(Self::THIS_SIZE + offset);
-            let len = (self.cell_count_ as usize) * CELL_SIZE;
-            let slice = ptr::slice_from_raw_parts(data, len);
+            let data = p.add(Self::THIS_SIZE + used);
+            let slice = ptr::slice_from_raw_parts(data, total - used);
             NonNull::new_unchecked(slice as *mut [u8])
         }
     }
 
-    /// 尝试分配，若容量不足，返回最大能分配的长度。
-    pub(crate) fn allocate_(
-        &mut self,
-        layout: Layout,
-    ) -> Result<NonNull<[u8]>, usize> {
-        todo!("[StrongPool::allocate_] not implemented")
+    /// 从池尾 bump 出一块满足 `layout` 的内存。
+    ///
+    /// 分配按 `layout.align()` 向上对齐，对齐跳过的字节也计入 `used_count_`；这是为了让
+    /// 对齐要求高于 `CELL_SIZE` 的类型（例如 `u128`）也能落在正确的边界上。
+    ///
+    /// # Errors
+    ///
+    /// 剩余空间放不下时返回当前可用的连续字节数，供上层决定是否开新池。
+    pub(crate) fn allocate_(&mut self, layout: Layout) -> Result<NonNull<[u8]>, usize> {
+        let data_addr = self as *mut Self as usize;
+        let cell_addr = data_addr + Self::THIS_SIZE;
+        let used_bytes = (self.used_count_ as usize) * CELL_SIZE;
+        let free_start = cell_addr + used_bytes;
+        let align = layout.align();
+        // 向上对齐到 layout 要求的边界（align 是 2 的幂）
+        let start = (free_start + align - 1) & !(align - 1);
+        let end = start + layout.size();
+        let pool_end = cell_addr + (self.cell_count_ as usize) * CELL_SIZE;
+        if end > pool_end {
+            return Result::Err(pool_end - free_start);
+        }
+        // 推进 used_count_，把对齐跳过的字节也算成已用
+        self.used_count_ = ((end - cell_addr).div_ceil(CELL_SIZE)) as PoolIndex;
+        // SAFETY: start..end 落在本池 cell 区内，且 start 已按 layout 对齐
+        unsafe {
+            Result::Ok(NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
+                start as *mut u8,
+                layout.size(),
+            )))
+        }
     }
 }

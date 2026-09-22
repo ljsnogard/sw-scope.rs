@@ -65,7 +65,9 @@ impl Scope {
     }
 
     pub fn new_from_parent(parent: &Scope) -> Scope {
-        todo!()
+        // SAFETY: parent.inner_ptr_ 来自一个仍然存活的 Scope
+        let inner = ScopeInner::new_child_(parent.inner_ptr_).expect("分配子 Scope 失败");
+        Scope { inner_ptr_: inner }
     }
 
     /// 创建一个子域，该子域将拥有独立的内存池和自身的生命周期。
@@ -74,11 +76,24 @@ impl Scope {
         Self::new_from_parent(self)
     }
 
+    /// 把 `factory` 造出的值就地放进本域的 arena，并交出它的句柄。
+    ///
+    /// 流程：从树共享的弱池取一个槽位 → 从本域强池分配一块 `StrongChunk<T>` → 就地写入
+    /// 数据并登记清理信息 → 把槽位置为 `Created`、弱计数置 1 → 追加到存活链尾。
+    ///
+    /// # Errors
+    ///
+    /// 弱池已满，或强池分配失败时返回 [`ScopeError::MallocFailed`]。
     pub fn try_put<F, T>(&mut self, factory: F) -> Result<Retain<T>, ScopeError>
     where
         F: FnOnce() -> T,
     {
-        todo!()
+        let value = factory();
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let inner = unsafe { self.inner_ptr_.as_mut() };
+        inner
+            .put_value_(value)
+            .map_err(|_| ScopeError::MallocFailed)
     }
 
     pub fn try_put_str(&mut self, str: &str) -> Result<Retain<ScopeStr>, ScopeError> {

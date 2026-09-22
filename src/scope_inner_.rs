@@ -5,7 +5,11 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-use crate::strong_::StrongPool;
+use crate::{
+    index_::Retain,
+    strong_::{StrongChunk, StrongPool},
+    weak_::{WeakChunk, WeakPool},
+};
 
 pub(crate) const DEFAULT_CELL_SIZE: usize = mem::size_of::<usize>();
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 4 * 4096usize;
@@ -19,6 +23,11 @@ pub(crate) static DEFAULT_ROOT_SCOPE: AtomicPtr<ScopeInner<DEFAULT_CELL_SIZE>> =
 ///
 /// 域持有若干 [`StrongPool`] 组成的链，池内的对象位置终身不变（见 `StrongPool` 的文档）；
 /// 域静默时整条链一次性回收。
+///
+/// 数据对象的"存活链"挂在弱槽位上（`WeakChunk::prev_live_` / `next_live_`），这里只保存
+/// 链头与链尾。弱槽位池由整棵树共享（root 分配、子域复制指针，见
+/// `dev-notes/weak-20260922-1135.md` D2d 的同款理由：`RootScope` 对分配器类型泛型，
+/// 在 `Scope` 这一侧已被擦除，指不到它的字段）。
 #[repr(C)]
 pub(crate) struct ScopeInner<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
     /// 子域数量
@@ -29,6 +38,12 @@ pub(crate) struct ScopeInner<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
     chain_head_: Option<NonNull<StrongPool<CELL_SIZE>>>,
     /// 指向 Scope 所持有的最新一块内存池
     chain_tail_: Option<NonNull<StrongPool<CELL_SIZE>>>,
+    /// 存活链链头（弱槽位）
+    live_head_: Option<NonNull<WeakChunk<()>>>,
+    /// 存活链链尾（弱槽位）
+    live_tail_: Option<NonNull<WeakChunk<()>>>,
+    /// 整棵树共享的弱槽位池链头
+    weak_pool_: Option<NonNull<WeakPool<CELL_SIZE, ScopeInner<CELL_SIZE>>>>,
     /// 指向本 Scope 所有内存池的分配器，也就是 RootScope 的分配器
     /// 也可用于计算 RootScope 的地址
     allocator_: &'static dyn Allocator,
@@ -44,6 +59,37 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         }
     }
 
+    /// 造一个子域的内部状态；分配与就地写入由 [`ScopeInner::new_child_`] 负责。
+    pub(crate) fn child_of_(parent: &Self) -> Self {
+        ScopeInner {
+            children_num_: AtomicUsize::new(0),
+            parent_scope_: Option::Some(NonNull::from(parent)),
+            chain_head_: Option::None,
+            chain_tail_: Option::None,
+            live_head_: Option::None,
+            live_tail_: Option::None,
+            weak_pool_: parent.weak_pool_,
+            allocator_: parent.allocator_,
+        }
+    }
+
+    /// 用本域分配器申请并就地构造一个子域，同时把父域的子域计数加 1。
+    ///
+    /// # Errors
+    ///
+    /// 分配器无法提供 `ScopeInner` 所需内存时返回 [`AllocError`]。
+    pub(crate) fn new_child_(parent: NonNull<Self>) -> Result<NonNull<Self>, AllocError> {
+        // SAFETY: 由调用方保证 parent 有效
+        let parent_ref = unsafe { parent.as_ref() };
+        let mem = parent_ref.allocator_.allocate(Layout::new::<Self>())?;
+        let inner = mem.as_ptr() as *mut u8 as *mut Self;
+        // SAFETY: mem 是刚分配、尚无人共享的独占内存
+        unsafe { inner.write(Self::child_of_(parent_ref)) };
+        parent_ref.children_num_.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: inner 来自成功分配，必然非空
+        Result::Ok(unsafe { NonNull::new_unchecked(inner) })
+    }
+
     /// 只统计最新的一个内存链中可分配空间大小，因为其他空间默认不会被提前释放，
     /// 因此不必统计。`Scope` 或者说所有 Arena 的使用者就是为了一次性兜底释放，
     /// 才会选用 Arena 而不是直接用智能指针。
@@ -55,8 +101,114 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         b.free_addr_().len()
     }
 
+    /// 从强池链上分配一块满足 `layout` 的内存；尾池放不下时开新池。
+    ///
+    /// # Errors
+    ///
+    /// 需要的 cell 数超过 [`PoolIndex`] 上界，或底层分配器失败时返回 [`AllocError`]。
     pub fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        todo!("[ScopeInner::allocate] not implemented.")
+        if let Option::Some(tail) = self.chain_tail_ {
+            // SAFETY: 池链上的池都由本域分配器分配且仍然存活
+            let pool = unsafe { tail.as_ptr().as_mut() }.ok_or(AllocError)?;
+            if let Result::Ok(mem) = pool.allocate_(layout) {
+                return Result::Ok(mem);
+            }
+        }
+        // 需要新池：容量取"够放下这一块"与默认页大小的较大者
+        let need = (StrongPool::<CELL_SIZE>::THIS_SIZE + layout.size()).div_ceil(CELL_SIZE) + 1;
+        let cell_count = need.max(DEFAULT_PAGE_SIZE / CELL_SIZE);
+        if cell_count > PoolIndex::MAX as usize {
+            return Result::Err(AllocError);
+        }
+        let pool = StrongPool::try_new_(cell_count as PoolIndex, self.allocator_, self.chain_tail_)?;
+        if self.chain_head_.is_none() {
+            self.chain_head_ = Option::Some(pool);
+        }
+        self.chain_tail_ = Option::Some(pool);
+        // SAFETY: pool 是刚初始化的独占池
+        unsafe { pool.as_ptr().as_mut() }
+            .ok_or(AllocError)?
+            .allocate_(layout)
+            .map_err(|_| AllocError)
+    }
+
+    /// 从树共享的弱池链上取一个槽位。
+    ///
+    /// 目前只走"链尾还有空位"这条路径；整条链都满时返回 [`None`]（弱池扩容待补：
+    /// 需要 `WeakPool::try_new_with_max_size` + `link_siblings`）。
+    pub(crate) fn allocate_weak_(&mut self) -> Option<NonNull<WeakChunk<()>>> {
+        let head = self.weak_pool_?;
+        let mut tail = head;
+        while let Option::Some(next) = unsafe { tail.as_ref() }.next() {
+            tail = next;
+        }
+        let pool = unsafe { tail.as_ptr().as_mut() }?;
+        let index = pool.allocate()?;
+        let slots = pool.slots();
+        // SAFETY: index < capacity_，落点必在槽位数组内
+        Option::Some(unsafe {
+            NonNull::new_unchecked(slots.as_ptr().cast::<WeakChunk<()>>().add(index as usize))
+        })
+    }
+
+    /// 把刚分配好的弱槽位追加到存活链尾。
+    pub(crate) fn push_live_(&mut self, weak: NonNull<WeakChunk<()>>) {
+        // SAFETY: weak 是本域刚分配的槽位
+        let weak_ref = unsafe { weak.as_ref() };
+        weak_ref.set_prev_live(self.live_tail_.map_or(ptr::null_mut(), NonNull::as_ptr));
+        weak_ref.set_next_live(ptr::null_mut());
+        match self.live_tail_ {
+            Option::Some(tail) => unsafe { tail.as_ref() }.set_next_live(weak.as_ptr()),
+            Option::None => self.live_head_ = Option::Some(weak),
+        }
+        self.live_tail_ = Option::Some(weak);
+    }
+
+    /// 存活链链头。
+    pub(crate) const fn live_head_(&self) -> Option<NonNull<WeakChunk<()>>> {
+        self.live_head_
+    }
+
+    /// 就地构造 `value` 并交出句柄：分配弱槽位 → 分配强块 → 绑定清理登记 → 挂存活链。
+    ///
+    /// # Errors
+    ///
+    /// 弱池已满或强池分配失败时返回 [`AllocError`]。
+    pub(crate) fn put_value_<T>(&mut self, value: T) -> Result<Retain<T>, AllocError> {
+        let weak = self.allocate_weak_().ok_or(AllocError)?;
+        let layout = Layout::new::<StrongChunk<T>>();
+        let mem = self.allocate(layout)?;
+        let chunk = mem.as_ptr() as *mut u8 as *mut StrongChunk<T>;
+        // SAFETY: mem 满足 StrongChunk<T> 的布局，且本域独占
+        unsafe { (*chunk).init_with_(weak, value) };
+        // SAFETY: weak 是本域刚分配的槽位
+        let weak_ref = unsafe { weak.as_ref() };
+        weak_ref.chunk_state_.init_created();
+        weak_ref.incr_weak_count();
+        self.push_live_(weak);
+        Result::Ok(Retain::new(weak.cast()))
+    }
+
+    /// 整块回收强池链：把每个池的内存还给分配器。
+    ///
+    /// 只在域静默（没有存活对象、也没有子域）时调用；调用方负责在此之前完成 `PreDrop`
+    /// 与数据析构。
+    pub(crate) fn reclaim_strong_pools_(&mut self) {
+        let mut cursor = self.chain_tail_;
+        while let Option::Some(pool) = cursor {
+            // SAFETY: 池仍由本域持有
+            let pool_ref = unsafe { pool.as_ref() };
+            cursor = pool_ref.prev_();
+            // SAFETY: 池是按 `layout_for_` 分配的，且此时仍未被回收
+            unsafe {
+                self.allocator_.deallocate(
+                    pool.cast::<u8>(),
+                    StrongPool::<CELL_SIZE>::layout_for_(pool_ref.cell_count_()),
+                )
+            };
+        }
+        self.chain_head_ = Option::None;
+        self.chain_tail_ = Option::None;
     }
 }
 
@@ -97,7 +249,6 @@ where
             init_cell_count,
             PoolIndex::MAX,
         );
-        let init_cell_count = init_cell_count as PoolIndex;
 
         // 用这个绝不合法的地址是为了表明抢占中的状态
         let acquired = root_ptr_ref as *const AtomicPtr<_>
@@ -140,10 +291,16 @@ where
             parent_scope_: Option::None,
             chain_head_: Option::None,
             chain_tail_: Option::None,
+            live_head_: Option::None,
+            live_tail_: Option::None,
+            weak_pool_: Option::None,
             allocator_: alloc,
         };
         let x = crate::weak_::WeakPool::try_new_with_max_size(page_size, alloc).expect("");
         root_scope_mut.weak_pools_ = Option::Some(x);
+        // 让 `ScopeInner` 也能直接到达弱池：`Scope` 只持有 `ScopeInner`，而 `RootScope`
+        // 对分配器类型泛型、在这一侧已擦除，指不到 `weak_pools_` 字段。
+        root_scope_mut.scope_inner_.weak_pool_ = Option::Some(x);
         // 初始化完成后才把真正的地址放入，以表示初始化已完成
         root_ptr_ref.store(&mut root_scope_mut.scope_inner_, Ordering::SeqCst);
         Result::Ok(unsafe {

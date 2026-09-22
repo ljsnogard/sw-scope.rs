@@ -11,7 +11,6 @@ mod pre_drop_tests_;
 #[cfg(test)]
 mod tests_;
 
-pub(crate) use chunk_::data_ptr_of_;
 pub(crate) use chunk_::meta_from_raw_;
 pub(crate) use chunk_::meta_of_;
 pub(crate) use chunk_::meta_to_raw_;
