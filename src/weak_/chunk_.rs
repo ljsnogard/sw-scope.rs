@@ -417,8 +417,9 @@ where
 
     /// 尝试把 `Retain` 的持有关系升级为 `Owning`。
     ///
-    /// 前提是当前状态恰为 [`DataState::Created`]（数据活着且没有强引用持有者）。状态位上的
-    /// 迁移同时充当"无强引用"的判据与上锁动作，因此成败唯一、不需要额外的锁。
+    /// 前提是当前状态恰为 [`DataState::Created`]（数据活着且没有强引用持有者）。整个
+    /// “检查无强引用 + 迁移状态”步骤在槽位锁内完成，因此判据与写入不会被并发的
+    /// `Sharing` 计数变化撕开。
     ///
     /// # Errors
     ///
@@ -427,12 +428,15 @@ where
         let Some(chunk) = self.strong_chunk() else {
             return Result::Err(self.data_state());
         };
-        match self
-            .chunk_state_
+        // 升级要同时保证"状态为 Created"与"没有其它访问者"；锁住槽位后判据与状态写
+        // 构成一个临界区。守卫在返回时自动释放，因此成功路径不会把锁带出函数。
+        let guard = self.lock_busy();
+        match guard
+            .chunk_state()
             .try_transition_state(DataState::Created, DataState::Owning)
         {
             Option::Some(_) => Result::Ok(chunk),
-            Option::None => Result::Err(self.data_state()),
+            Option::None => Result::Err(guard.data_state()),
         }
     }
 
@@ -449,8 +453,12 @@ where
         let Some(chunk) = self.strong_chunk() else {
             return Result::Err(self.data_state());
         };
-        if self
-            .chunk_state_
+        // `try_sharing` 不只改状态，还要把强计数从 0 抬到 1（或做幂等增量）。状态写与
+        // 强计数写必须与 `Sharing::drop` / `Sharing::clone` 共用同一把槽位锁，否则会出现
+        // “最后一个 Sharing 已减到 0、并发的 try_sharing 又把它加回 1”这类撕裂窗口。
+        let guard = self.lock_busy();
+        if guard
+            .chunk_state()
             .try_transition_state(DataState::Created, DataState::Sharing)
             .is_some()
         {
@@ -458,12 +466,12 @@ where
             unsafe { &*chunk.as_ptr() }.incr_strong_count();
             return Result::Ok(chunk);
         }
-        if self.data_state() == DataState::Sharing {
+        if guard.data_state() == DataState::Sharing {
             // SAFETY: 同上
             unsafe { &*chunk.as_ptr() }.incr_strong_count();
             return Result::Ok(chunk);
         }
-        Result::Err(self.data_state())
+        Result::Err(guard.data_state())
     }
 
     /// 初始化一整段从未使用过的槽位，是 `WeakPool` 构造期唯一的槽位入口。

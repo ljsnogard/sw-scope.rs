@@ -39,6 +39,54 @@ where
     weak_chunk_: NonNull<WeakChunk<T>>,
 }
 
+// SAFETY: `Owning` 持有 `T` 的独占访问权，语义与 `Box<T>` 一致。把 `Owning` 移到别的
+// 线程等价于把 `T` 的独占所有权移过去，因此 `Send` 要求 `T: Send`；而 `&Owning` 只给出
+// `&T`，跨线程共享它要求 `T: Sync`。
+unsafe impl<'a, T> Send for Owning<'a, T>
+where
+    T: 'a + ?Sized + Send,
+{
+}
+
+// SAFETY: 见上。
+unsafe impl<'a, T> Sync for Owning<'a, T>
+where
+    T: 'a + ?Sized + Sync,
+{
+}
+
+// SAFETY: `Sharing` 可以克隆，多个句柄可以同时存在于不同线程，并且每个句柄都能给出
+// `&T`，因此它与 `Arc<T>` 的 marker 约束一致：`Send` 与 `Sync` 都要求
+// `T: Send + Sync`。
+unsafe impl<'a, T> Send for Sharing<'a, T>
+where
+    T: 'a + ?Sized + Send + Sync,
+{
+}
+
+// SAFETY: 见上。
+unsafe impl<'a, T> Sync for Sharing<'a, T>
+where
+    T: 'a + ?Sized + Send + Sync,
+{
+}
+
+// SAFETY: `Retain` 可以克隆并分发到不同线程，并且可由任意一个克隆在任意线程升级出
+// `Owning` / `Sharing`；因此它也按 `Arc<T>` 的边界要求 `T: Send + Sync`。实际的状态
+// 迁移由 `WeakChunkStateGuard` 串行化，`Retain::clone/drop` 只改动原子弱计数。
+unsafe impl<T> Send for Retain<T>
+where
+    T: ?Sized + Send + Sync,
+{
+}
+
+// SAFETY: 见上。
+unsafe impl<T> Sync for Retain<T>
+where
+    T: ?Sized + Send + Sync,
+{
+}
+
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
@@ -104,10 +152,14 @@ where
             weak.weak_count() > 0,
             "Owning 必然借用自某个 Retain，弱计数不该是 0"
         );
-        let _ = weak
-            .chunk_state()
-            .try_transition_state(DataState::Owning, DataState::Created);
-        // 正常路径下弱计数 > 0，这里不会触发；保留判断以覆盖泄漏 / unsafe 组合
+        // 状态归还与强计数/后续升级共用槽位锁；锁在语句块结束时释放，然后再尝试
+        // 确定性析构。正常路径下弱计数 > 0，claim 不会触发；保留判断以覆盖泄漏 / unsafe。
+        {
+            let guard = weak.lock_busy();
+            let _ = guard
+                .chunk_state()
+                .try_transition_state(DataState::Owning, DataState::Created);
+        }
         let _ = claim_and_destroy_if_unreachable_(weak);
     }
 }
@@ -154,7 +206,18 @@ where
     fn clone(&self) -> Self {
         // SAFETY: Sharing 持有强块指针，强块活着时它有效
         let chunk = unsafe { self.strong_chunk_.as_ref() };
+        // SAFETY: 同上；强块活着时它的身份槽位也活着
+        let weak = unsafe { chunk.weak_chunk().as_ref() };
+        // 克隆必须与“最后一个 Sharing 归零并改回 Created”的临界区互斥，否则可能把
+        // 一个正在回退的状态重新加回 Sharing，造成状态与强计数不一致。
+        let guard = weak.lock_busy();
+        debug_assert_eq!(
+            guard.data_state(),
+            DataState::Sharing,
+            "Sharing 句柄存在时状态必须是 Sharing"
+        );
         chunk.incr_strong_count();
+        drop(guard);
         Sharing {
             strong_chunk_: self.strong_chunk_,
             _lifetime_a_: PhantomData,
@@ -173,14 +236,18 @@ where
     fn drop(&mut self) {
         // SAFETY: 同上
         let chunk = unsafe { self.strong_chunk_.as_ref() };
+        // SAFETY: 同上；强块活着时身份槽位也活着
+        let weak = unsafe { chunk.weak_chunk().as_ref() };
+        // 强计数减到 0 与状态 Sharing -> Created 必须在同一个临界区内完成；否则并发的
+        // `try_sharing` / `clone` 可能在本句柄减到 0 后、状态尚未回退前又加回计数。
+        let guard = weak.lock_busy();
         if chunk.decr_strong_count() != 0 {
             return;
         }
-        // SAFETY: 同上
-        let weak = unsafe { chunk.weak_chunk().as_ref() };
-        let _ = weak
+        let _ = guard
             .chunk_state()
             .try_transition_state(DataState::Sharing, DataState::Created);
+        drop(guard);
         let _ = claim_and_destroy_if_unreachable_(weak);
     }
 }

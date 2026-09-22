@@ -65,7 +65,7 @@ where
 }
 
 /// 释放锁；返回是否确实由本次调用完成释放。
-pub(crate) fn release<D, C, S, O>(cell: &C) -> bool
+fn release_<D, C, S, O>(cell: &C) -> bool
 where
     D: TrBitWord,
     C: TrAtomicCell<Value = D>,
@@ -117,7 +117,7 @@ where
 }
 
 /// 读当前字（锁位由调用方按需解释）。
-fn load<D, C, O>(cell: &C) -> D
+fn load_<D, C, O>(cell: &C) -> D
 where
     D: TrAtomicData,
     C: TrAtomicCell<Value = D>,
@@ -208,7 +208,7 @@ where
     /// 当前是否已上锁。
     #[allow(dead_code)] // 预留给诊断与断言；当前仅测试使用
     pub(crate) fn is_acquired(&self) -> bool {
-        S::is_acquired(load::<D, C, O>(&self.state_))
+        S::is_acquired(load_::<D, C, O>(&self.state_))
     }
 
     /// 忙等抢锁并交出守卫。
@@ -231,7 +231,7 @@ where
 
     /// 释放锁。**只应由 [`SpinMutexGuard`] 的 `Drop` 调用。**
     fn release(&self) -> bool {
-        release::<D, C, S, O>(&self.state_)
+        release_::<D, C, S, O>(&self.state_)
     }
 }
 
@@ -363,39 +363,35 @@ where
 
     /// 读业务位（**不含**锁位），无锁快路径。
     #[inline]
-    pub(crate) fn read(&self) -> D {
-        S::make_released(load::<D, C, O>(&self.bits_))
+    pub fn read(&self) -> D {
+        S::make_released(load_::<D, C, O>(&self.bits_))
     }
 
     /// 当前是否已上锁。
     #[inline]
-    pub(crate) fn is_locked(&self) -> bool {
-        S::is_acquired(load::<D, C, O>(&self.bits_))
+    pub fn is_locked(&self) -> bool {
+        S::is_acquired(load_::<D, C, O>(&self.bits_))
     }
 
     /// 按信号策略抢锁；`max_try == 0` 表示忙等。
     ///
-    /// 存在的手动抢锁入口：只应由本类型的守卫（`WeakChunkStateGuard`）使用，并由它在
-    /// `Drop` 里调用 [`release`](SpinFlag::release)。
-    ///
-    /// 升级路径尚未接通，该链在非测试构建下是 dead code。
-    #[allow(dead_code)]
-    pub(crate) fn try_acquire(&self, max_try: usize) -> bool {
+    /// 抢锁入口：只应由本类型的守卫（`WeakChunkStateGuard`）使用，并由它在 `Drop` 里
+    /// 调用 [`release`](SpinFlag::release)。
+    pub fn try_acquire(&self, max_try: usize) -> bool {
         try_acquire::<D, C, S, O>(&self.bits_, max_try)
     }
 
     /// 释放锁；返回是否确实由本次调用完成释放。
     ///
     /// **只应由持锁守卫的 `Drop` 调用。**
-    #[allow(dead_code)] // 同 `try_acquire`
-    pub(crate) fn release(&self) -> bool {
-        release::<D, C, S, O>(&self.bits_)
+    pub fn release(&self) -> bool {
+        release_::<D, C, S, O>(&self.bits_)
     }
 
     /// 无锁的条件读—改—写：`op` 收到业务位，返回 `(新业务位, 结果)`。
     ///
     /// `op` 返回 [`None`] 表示前提不成立、放弃。锁位在写回时保持原状。
-    pub(crate) fn try_update<R>(&self, op: impl FnMut(D) -> Option<(D, R)>) -> Option<R> {
+    pub fn try_update<R>(&self, op: impl FnMut(D) -> Option<(D, R)>) -> Option<R> {
         try_update::<D, C, S, O, R>(&self.bits_, op)
     }
 

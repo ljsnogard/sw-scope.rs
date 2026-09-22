@@ -5,7 +5,7 @@
 
 use core::{mem::MaybeUninit, ptr::NonNull, sync::atomic::{AtomicUsize, Ordering}};
 
-use super::Retain;
+use super::{Owning, Retain, Sharing};
 use crate::strong_::StrongChunk;
 use crate::weak_::{DataState, WeakChunk};
 
@@ -175,5 +175,67 @@ fn data_survives_until_last_cloned_retain_is_dropped() {
         CLONE_DROPPED.load(Ordering::Acquire),
         1,
         "最后一个句柄消失才析构"
+    );
+}
+
+/// 验证三种句柄的 `Send` / `Sync` marker 采用与 `Box` / `Arc` 一致的边界。
+///
+/// - 手段：对 `T = u64`（`Send + Sync`）做静态 trait 约束断言，不实际跨线程发送。
+/// - 判断：所有断言必须编译通过；若 marker 边界写错，`Owning` / `Sharing` / `Retain`
+///   将无法满足 `Send` / `Sync`，测试编译失败。
+#[test]
+fn handle_markers_follow_box_and_arc_bounds() {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    // `Owning` 比照 `Box<T>`：Send 看 T: Send，Sync 看 T: Sync。
+    assert_send::<Owning<'static, u64>>();
+    assert_sync::<Owning<'static, u64>>();
+
+    // `Sharing` 与 `Retain` 比照 `Arc<T>`：二者都要求 T: Send + Sync。
+    assert_send::<Sharing<'static, u64>>();
+    assert_sync::<Sharing<'static, u64>>();
+    assert_send::<Retain<u64>>();
+    assert_sync::<Retain<u64>>();
+}
+
+/// 验证 `Retain` 作为 `Sync` 句柄跨线程共享时，状态机不会把 `Created` / `Owning` /
+/// `Sharing` 迁移撕开。
+///
+/// - 手段：在 `std::thread::scope` 中让 4 个线程共享同一个 `Retain<u64>`，反复尝试
+///   `try_owning`（成功则改值）或 `try_sharing`（成功则克隆、读取再析构）。
+/// - 判断：所有线程正常结束；最终值必须等于所有线程成功独占并写入的次数。若状态锁缺失，
+///   可能出现 `Owning` 已生效却仍有 `Sharing` 持有着、或强计数回退时被重新加回等撕裂。
+#[test]
+fn retain_state_machine_is_safe_across_threads() {
+    let mut weak_slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    let mut chunk_slot = MaybeUninit::<StrongChunk<u64>>::uninit();
+    // SAFETY: 两个栈槽位活得比 `retain` 和 scoped threads 更久，线程会在函数返回前 join。
+    let retain = unsafe { make_retain_(&mut weak_slot, &mut chunk_slot, 0u64) };
+    let owning_wins = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..500 {
+                    if let Some(mut owning) = retain.try_owning() {
+                        *owning += 1;
+                        owning_wins.fetch_add(1, Ordering::AcqRel);
+                        drop(owning);
+                    } else if let Some(sharing) = retain.try_sharing() {
+                        let clone = sharing.clone();
+                        let _ = *clone;
+                        drop(clone);
+                        drop(sharing);
+                    }
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        *retain.try_owning().expect("线程结束后应回到 Created"),
+        owning_wins.load(Ordering::Acquire) as u64,
+        "最终值必须等于成功独占写入的次数"
     );
 }
