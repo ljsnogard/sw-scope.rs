@@ -6,23 +6,15 @@ use core::{
 };
 
 use super::*;
-use crate::weak_::{DataState, WeakChunk, WeakChunkState};
+use crate::weak_::{DataState, WeakChunk};
 
 /// 造一个仅用于测试的"身份槽位"：栈上的 `WeakChunk<()>`，并推进到 `Created`，
 /// 模拟一次成功分配之后的状态。
 fn make_identity_() -> WeakChunk<()> {
-    let slot = WeakChunk::<()> {
-        chunk_state_: WeakChunkState::empty_(),
-        prev_live_: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        next_live_: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        strong_chunk_: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        record_: Option::None,
-        meta_: core::ptr::null(),
-        _unused_t_: core::marker::PhantomData,
-    };
+    let slot = WeakChunk::<()>::stack_empty_();
     // 真实路径上这一步由分配流程完成
     let _ = slot
-        .chunk_state_
+        .chunk_state()
         .try_transition_state(DataState::Reclaimed, DataState::Created);
     slot
 }
@@ -90,7 +82,7 @@ fn strong_chunk_binds_identity_both_ways() {
     assert!(chunk.is_data_alive(), "绑定后数据应当活着");
     assert_eq!(chunk.strong_count(), 0, "新建的强块强计数从 0 开始");
     assert!(
-        weak.record_.is_none(),
+        weak.record().is_none(),
         "u64 不需要析构，因此不该登记清理入口"
     );
 }
@@ -123,7 +115,7 @@ fn strong_chunk_drop_is_type_erased_but_effective() {
 
     // 登记的清理入口必须能就地析构数据，这正是清盘流程依赖的路径
     assert!(
-        weak.record_.is_some_and(|record| !record.is_noop_()),
+        weak.record().is_some_and(|record| !record.is_noop_()),
         "带 Drop 的数据必须登记清理入口"
     );
     assert_eq!(DROPPED.load(Ordering::Acquire), 0);
@@ -180,7 +172,7 @@ fn weak_chunk_rebuilds_unsized_data_from_metadata() {
 
     // 从槽位取回元数据：`?Sized` 的虚表指针必须被原样保存
     let roundtrip: core::ptr::DynMetadata<dyn core::fmt::Debug> =
-        unsafe { crate::weak_::meta_from_raw_::<dyn core::fmt::Debug>(weak.meta_) };
+        unsafe { crate::weak_::meta_from_raw_::<dyn core::fmt::Debug>(weak.meta()) };
     assert_eq!(roundtrip, repr_meta, "虚表元数据必须逐位保存");
 
     // 用取回的元数据重建胖指针，内容必须与原始引用一致
@@ -197,7 +189,7 @@ fn weak_chunk_rebuilds_unsized_data_from_metadata() {
 #[test]
 fn weak_state_upgrade_primitive_is_exclusive() {
     let mut weak = make_identity_();
-    let state = &weak.chunk_state_;
+    let state = &weak.chunk_state();
     state.init_created();
 
     assert_eq!(state.try_set_state(DataState::Owning), Option::Some(DataState::Created));
@@ -215,7 +207,7 @@ fn weak_state_upgrade_primitive_is_exclusive() {
 #[test]
 fn weak_state_sharing_path_claims_destroy_exactly_once() {
     let mut weak = make_identity_();
-    let state = &weak.chunk_state_;
+    let state = &weak.chunk_state();
     state.init_created();
 
     assert_eq!(state.try_set_state(DataState::Sharing), Option::Some(DataState::Created));

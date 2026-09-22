@@ -64,49 +64,6 @@ pub(crate) struct WeakPool<const CELL_SIZE: usize, Root> {
 }
 
 impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
-    /// 一个槽位的大小，池中所有槽位一律按 `WeakChunk<()>` 解释
-    const SLOT_SIZE: usize = mem::size_of::<WeakChunk<()>>();
-
-    /// 池头占据的槽位数：向上取整，保证槽位数组起点仍满足 `WeakChunk<()>` 的对齐要求。
-    ///
-    /// 池头随 `Root` 等参数变大时，这里会自然跟着变，不再依赖"池头恰好等于若干个槽位"
-    /// 这种脆弱假设。
-    const HEADER_SLOT_COUNT: usize =
-        mem::size_of::<Self>().div_ceil(Self::SLOT_SIZE);
-
-    /// 池头占用的字节数，即槽位数组相对池首的固定偏移。
-    ///
-    /// `cell_offset_` 在构造时就写成 `HEADER_SLOT_COUNT`，因此第 `i` 个槽位相对池首的偏移是
-    /// `HEADER_BYTES + i * SLOT_SIZE`；这正是"由槽位地址反推所属池"能成立的前提，见
-    /// [`WeakPool::of_slot_`]。
-    pub(crate) const HEADER_BYTES: usize = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE;
-
-    /// 由槽位地址反推它所属的池（O(1)，不依赖池链）。
-    ///
-    /// 槽位数组紧跟在池头之后，第 `i` 个槽位相对池首的偏移是
-    /// `(HEADER_SLOT_COUNT + i) * SLOT_SIZE`；`i` 正是槽位里的 `pool_order_`——它在池构造时
-    /// 按数组下标写死、终生只读（归还槽位也不会重置），因此对空闲槽位同样有效。
-    ///
-    /// 返回 `None` 表示该地址不可能是本类池的槽位（越界或未按池对齐）。
-    pub(crate) fn of_slot_(weak: NonNull<WeakChunk<()>>) -> Option<NonNull<Self>> {
-        let addr = weak.as_ptr() as usize;
-        // 先按槽位对齐校验，避免对错位地址解引用去读 `pool_order_`
-        if !addr.is_multiple_of(mem::align_of::<WeakChunk<()>>()) {
-            return Option::None;
-        }
-        // SAFETY: addr 已按槽位对齐；调用方保证它指向一个本类池分配出的（含空闲）槽位
-        let order = unsafe { weak.as_ref() }.pool_order() as usize;
-        let offset = Self::HEADER_BYTES + order * Self::SLOT_SIZE;
-        if addr < offset {
-            return Option::None;
-        }
-        let base = addr - offset;
-        if !base.is_multiple_of(mem::align_of::<Self>()) {
-            return Option::None;
-        }
-        // SAFETY: base 由非空槽位地址减去固定偏移得到，必定非空
-        Option::Some(unsafe { NonNull::new_unchecked(base as *mut Self) })
-    }
 
     /// 根据目标要容纳的 WeakChunk 数量，计算最小内存占用量
     pub fn min_size_for_max_count(count: PoolIndex) -> usize {
@@ -156,76 +113,6 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
         Self::try_new_with_cell_count(count as PoolIndex, alloc)
     }
 
-    /// 计算容纳 `cell_count` 个槽位所需的布局。
-    fn layout_of_(cell_count: PoolIndex) -> Layout {
-        let size = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE
-            + (cell_count as usize) * Self::SLOT_SIZE;
-        let align = mem::align_of::<Self>().max(mem::align_of::<WeakChunk<()>>());
-        // SAFETY: size 只是池头大小加上 cell_count * 槽位大小，align 不超过两者对齐的
-        // 较大值，既不会溢出也不会违反 Layout 的约束。
-        unsafe { Layout::from_size_align_unchecked(size, align) }
-    }
-
-    /// 在 `mem` 所指的内存上就地构造池头，并把全部槽位串成初始的空闲链表。
-    ///
-    /// # Safety
-    ///
-    /// `mem` 必须是由 `layout_of_(cell_count)` 分配、尚未被写入的独占内存块。
-    fn init_in_place_(mem: NonNull<[u8]>, cell_count: PoolIndex) -> NonNull<Self> {
-        let mut mem = mem;
-        let base = unsafe { mem.as_mut().as_mut_ptr() as *mut Self };
-        // 槽位数组的起点必须与 slot_at_ / slots() 用同一套算法（按槽位个数向上取整），
-        // 否则"写入"与"读取"会落在两块不同的地址上。
-        let header_bytes = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE;
-        let all_slots = core::ptr::slice_from_raw_parts_mut(
-            unsafe { (base as *mut u8).byte_add(header_bytes) } as *mut WeakChunk<()>,
-            cell_count as usize,
-        );
-        // 池头与槽位数组都在同一块刚刚分配、尚未共享出去的内存上，因此独占地写入是安全的。
-        unsafe {
-            let pool = &mut *base;
-            let slots = &mut *all_slots;
-            WeakChunk::<()>::init_slots(slots, cell_count);
-            pool.capacity_ = cell_count;
-            pool.used_length_ = 0;
-            pool.cell_offset_ = Self::HEADER_SLOT_COUNT as PoolIndex;
-            pool.latest_free_ = 0;
-            pool.prev_ = Option::None;
-            pool.next_ = Option::None;
-            pool.root_ = Option::None;
-        }
-        // SAFETY: base 来自分配器返回的非空内存块，必然非空
-        unsafe { NonNull::new_unchecked(base) }
-    }
-
-    /// 按槽位序号取只读槽位引用。
-    ///
-    /// # Safety
-    ///
-    /// `index` 必须小于 `capacity_`，否则返回的引用会越出槽位数组。
-    unsafe fn slot_at_(&self, index: PoolIndex) -> &WeakChunk<()> {
-        let this = self as *const Self as *const u8;
-        let offset = self.cell_offset_ as usize * Self::SLOT_SIZE;
-        let slot =
-            unsafe { this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *const WeakChunk<()> };
-        // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
-        unsafe { &*slot }
-    }
-
-    /// 按槽位序号取可写槽位引用。
-    ///
-    /// # Safety
-    ///
-    /// `index` 必须小于 `capacity_`，否则返回的引用会越出槽位数组。
-    unsafe fn slot_mut_at_(&mut self, index: PoolIndex) -> &mut WeakChunk<()> {
-        let this = self as *mut Self as *mut u8;
-        let offset = self.cell_offset_ as usize * Self::SLOT_SIZE;
-        let slot =
-            unsafe { this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *mut WeakChunk<()> };
-        // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
-        unsafe { &mut *slot }
-    }
-
     /// 池的槽位总容量。
     pub const fn capacity(&self) -> PoolIndex {
         self.capacity_
@@ -263,7 +150,7 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     pub fn set_next_freed_of(&mut self, index: PoolIndex, next: PoolIndex) {
         // SAFETY: 由调用方保证 index 小于 capacity_
         let slot = unsafe { self.slot_mut_at_(index) };
-        slot.chunk_state_.set_next_freed(next);
+        slot.chunk_state_mut().set_next_freed(next);
     }
 
     /// 池链上的下一个池。
@@ -344,6 +231,119 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
         let chunks = unsafe { this.byte_add(offset) as *mut WeakChunk<()> };
         let ptr = core::ptr::slice_from_raw_parts_mut(chunks, self.capacity_ as usize);
         unsafe { NonNull::new_unchecked(ptr) }
+    }
+    /// 一个槽位的大小，池中所有槽位一律按 `WeakChunk<()>` 解释
+    const SLOT_SIZE: usize = mem::size_of::<WeakChunk<()>>();
+
+    /// 池头占据的槽位数：向上取整，保证槽位数组起点仍满足 `WeakChunk<()>` 的对齐要求。
+    ///
+    /// 池头随 `Root` 等参数变大时，这里会自然跟着变，不再依赖"池头恰好等于若干个槽位"
+    /// 这种脆弱假设。
+    const HEADER_SLOT_COUNT: usize =
+        mem::size_of::<Self>().div_ceil(Self::SLOT_SIZE);
+
+    /// 池头占用的字节数，即槽位数组相对池首的固定偏移。
+    ///
+    /// `cell_offset_` 在构造时就写成 `HEADER_SLOT_COUNT`，因此第 `i` 个槽位相对池首的偏移是
+    /// `HEADER_BYTES + i * SLOT_SIZE`；这正是"由槽位地址反推所属池"能成立的前提，见
+    /// [`WeakPool::of_slot_`]。
+    pub(crate) const HEADER_BYTES: usize = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE;
+
+    /// 由槽位地址反推它所属的池（O(1)，不依赖池链）。
+    ///
+    /// 槽位数组紧跟在池头之后，第 `i` 个槽位相对池首的偏移是
+    /// `(HEADER_SLOT_COUNT + i) * SLOT_SIZE`；`i` 正是槽位里的 `pool_order_`——它在池构造时
+    /// 按数组下标写死、终生只读（归还槽位也不会重置），因此对空闲槽位同样有效。
+    ///
+    /// 返回 `None` 表示该地址不可能是本类池的槽位（越界或未按池对齐）。
+    pub(crate) fn of_slot_(weak: NonNull<WeakChunk<()>>) -> Option<NonNull<Self>> {
+        let addr = weak.as_ptr() as usize;
+        // 先按槽位对齐校验，避免对错位地址解引用去读 `pool_order_`
+        if !addr.is_multiple_of(mem::align_of::<WeakChunk<()>>()) {
+            return Option::None;
+        }
+        // SAFETY: addr 已按槽位对齐；调用方保证它指向一个本类池分配出的（含空闲）槽位
+        let order = unsafe { weak.as_ref() }.pool_order() as usize;
+        let offset = Self::HEADER_BYTES + order * Self::SLOT_SIZE;
+        if addr < offset {
+            return Option::None;
+        }
+        let base = addr - offset;
+        if !base.is_multiple_of(mem::align_of::<Self>()) {
+            return Option::None;
+        }
+        // SAFETY: base 由非空槽位地址减去固定偏移得到，必定非空
+        Option::Some(unsafe { NonNull::new_unchecked(base as *mut Self) })
+    }
+
+    /// 计算容纳 `cell_count` 个槽位所需的布局。
+    fn layout_of_(cell_count: PoolIndex) -> Layout {
+        let size = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE
+            + (cell_count as usize) * Self::SLOT_SIZE;
+        let align = mem::align_of::<Self>().max(mem::align_of::<WeakChunk<()>>());
+        // SAFETY: size 只是池头大小加上 cell_count * 槽位大小，align 不超过两者对齐的
+        // 较大值，既不会溢出也不会违反 Layout 的约束。
+        unsafe { Layout::from_size_align_unchecked(size, align) }
+    }
+
+    /// 在 `mem` 所指的内存上就地构造池头，并把全部槽位串成初始的空闲链表。
+    ///
+    /// # Safety
+    ///
+    /// `mem` 必须是由 `layout_of_(cell_count)` 分配、尚未被写入的独占内存块。
+    fn init_in_place_(mem: NonNull<[u8]>, cell_count: PoolIndex) -> NonNull<Self> {
+        let mut mem = mem;
+        let base = unsafe { mem.as_mut().as_mut_ptr() as *mut Self };
+        // 槽位数组的起点必须与 slot_at_ / slots() 用同一套算法（按槽位个数向上取整），
+        // 否则"写入"与"读取"会落在两块不同的地址上。
+        let header_bytes = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE;
+        let all_slots = core::ptr::slice_from_raw_parts_mut(
+            unsafe { (base as *mut u8).byte_add(header_bytes) } as *mut WeakChunk<()>,
+            cell_count as usize,
+        );
+        // 池头与槽位数组都在同一块刚刚分配、尚未共享出去的内存上，因此独占地写入是安全的。
+        unsafe {
+            let pool = &mut *base;
+            let slots = &mut *all_slots;
+            WeakChunk::<()>::init_slots(slots, cell_count);
+            pool.capacity_ = cell_count;
+            pool.used_length_ = 0;
+            pool.cell_offset_ = Self::HEADER_SLOT_COUNT as PoolIndex;
+            pool.latest_free_ = 0;
+            pool.prev_ = Option::None;
+            pool.next_ = Option::None;
+            pool.root_ = Option::None;
+        }
+        // SAFETY: base 来自分配器返回的非空内存块，必然非空
+        unsafe { NonNull::new_unchecked(base) }
+    }
+
+    /// 按槽位序号取只读槽位引用。
+    ///
+    /// # Safety
+    ///
+    /// `index` 必须小于 `capacity_`，否则返回的引用会越出槽位数组。
+    unsafe fn slot_at_(&self, index: PoolIndex) -> &WeakChunk<()> {
+        let this = self as *const Self as *const u8;
+        let offset = self.cell_offset_ as usize * Self::SLOT_SIZE;
+        let slot =
+            unsafe { this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *const WeakChunk<()> };
+        // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
+        unsafe { &*slot }
+    }
+
+    /// 按槽位序号取可写槽位引用。
+    ///
+    /// # Safety
+    ///
+    /// `index` 必须小于 `capacity_`，否则返回的引用会越出槽位数组。
+    unsafe fn slot_mut_at_(&mut self, index: PoolIndex) -> &mut WeakChunk<()> {
+        let this = self as *mut Self as *mut u8;
+        let offset = self.cell_offset_ as usize * Self::SLOT_SIZE;
+        let slot =
+            unsafe { this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *mut WeakChunk<()> };
+        // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
+        unsafe { &mut *slot }
     }
 
     /// 判断某个槽位是否落在本池的槽位数组内；是则返回它在池内的序号。

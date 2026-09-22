@@ -25,7 +25,7 @@ unsafe fn make_retain_<T>(
     let weak_ptr = NonNull::from(&mut *weak);
     // SAFETY: chunk_slot 可写；weak 是本测试栈上的有效身份槽位
     unsafe { (*chunk_slot.as_mut_ptr()).init_with_(weak_ptr, value) };
-    weak.chunk_state_.init_created();
+    weak.chunk_state().init_created();
     // 一个 Retain 对应一个弱计数
     weak.incr_weak_count();
     Retain::new(weak_ptr.cast())

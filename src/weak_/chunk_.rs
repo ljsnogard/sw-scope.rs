@@ -44,23 +44,23 @@ where
     T: ?Sized,
 {
     /// 状态、弱计数与空闲链链接。
-    pub(crate) chunk_state_: WeakChunkState,
+    chunk_state_: WeakChunkState,
     /// 存活链的链头方向链接（指向上一个存活对象）；这是"存活链挂弱槽位"的落点。
-    pub(crate) prev_live_: AtomicPtr<WeakChunk<()>>,
+    prev_live_: AtomicPtr<WeakChunk<()>>,
     /// 存活链的链尾方向链接。
-    pub(crate) next_live_: AtomicPtr<WeakChunk<()>>,
+    next_live_: AtomicPtr<WeakChunk<()>>,
     /// 本槽位对应的强块。数据的析构与访问都要经过它。
-    pub(crate) strong_chunk_: AtomicPtr<StrongChunkBase>,
+    strong_chunk_: AtomicPtr<StrongChunkBase>,
     /// 类型擦除的清理登记，指向**每类型一份**的 [`PreDropRecord`]；空闲槽位为 [`None`]。
     ///
     /// 记录里不含数据区地址：它由 `strong_chunk_` 首址加上单态化入口自己算出的偏移重建。
-    pub(crate) record_: Option<&'static PreDropRecord>,
+    record_: Option<&'static PreDropRecord>,
     /// `T: ?Sized` 的类型元数据（切片长度 / 虚表）；`Sized` 时为空。
     ///
     /// 这是**逐对象**信息，所以不能进"每类型一份"的记录里，只能留在槽位上。
-    pub(crate) meta_: *const (),
+    meta_: *const (),
     /// `T` 只在类型上区分，不参与布局。
-    pub(crate) _unused_t_: PhantomData<NonNull<StrongChunk<T>>>,
+    _unused_t_: PhantomData<NonNull<StrongChunk<T>>>,
 }
 
 /// `WeakChunk` 的生命周期状态。**这是"数据要不要析构"的唯一权威来源**，
@@ -140,13 +140,13 @@ pub(crate) struct WeakChunkState {
     /// 在所属 `WeakPool` 中的索引（0 开始），也用于从槽位反推池地址。
     ///
     /// 只取决于槽位在池内数组中的位置，池在构造时一次写死，此后终生只读。
-    pub(crate) pool_order_: PoolIndex,
+    pool_order_: PoolIndex,
 
     /// 协助 `WeakPool` 串联空闲槽位。
-    pub(crate) next_freed_: PoolIndex,
+    next_freed_: PoolIndex,
 
     /// 状态字；锁位、状态位与弱计数的读写全部经由 [`SpinFlag`] 的操作。
-    pub(crate) weak_state_: StateWord,
+    weak_state_: StateWord,
 }
 
 /// 把状态与计数打包成一个字。
@@ -413,6 +413,133 @@ where
         self.strong_chunk_.store(chunk, Ordering::Release);
     }
 
+    // -- 升级路径 -----------------------------------------------------------
+
+    /// 尝试把 `Retain` 的持有关系升级为 `Owning`。
+    ///
+    /// 前提是当前状态恰为 [`DataState::Created`]（数据活着且没有强引用持有者）。状态位上的
+    /// 迁移同时充当"无强引用"的判据与上锁动作，因此成败唯一、不需要额外的锁。
+    ///
+    /// # Errors
+    ///
+    /// 状态不是 `Created`（数据已析构，或已被 `Owning` / `Sharing` 持有）时返回当前状态。
+    pub fn try_owning(&self) -> Result<NonNull<StrongChunkBase>, DataState> {
+        let Some(chunk) = self.strong_chunk() else {
+            return Result::Err(self.data_state());
+        };
+        match self
+            .chunk_state_
+            .try_transition_state(DataState::Created, DataState::Owning)
+        {
+            Option::Some(_) => Result::Ok(chunk),
+            Option::None => Result::Err(self.data_state()),
+        }
+    }
+
+    /// 尝试把 `Retain` 的持有关系升级为 `Sharing`。
+    ///
+    /// - 状态为 `Created`：置为 `Sharing` 并把强计数置 1；
+    /// - 状态已经是 `Sharing`：只把强计数加 1。这条**幂等增量**是 README 使用思路里
+    ///   "泄漏一个 `Sharing` 之后仍能继续共享"的依据。
+    ///
+    /// # Errors
+    ///
+    /// 数据已被 `Owning` 独占、或已被销毁 / 回收时返回当前状态。
+    pub fn try_sharing(&self) -> Result<NonNull<StrongChunkBase>, DataState> {
+        let Some(chunk) = self.strong_chunk() else {
+            return Result::Err(self.data_state());
+        };
+        if self
+            .chunk_state_
+            .try_transition_state(DataState::Created, DataState::Sharing)
+            .is_some()
+        {
+            // SAFETY: 强块与身份槽位互相绑定，chunk 有效
+            unsafe { &*chunk.as_ptr() }.incr_strong_count();
+            return Result::Ok(chunk);
+        }
+        if self.data_state() == DataState::Sharing {
+            // SAFETY: 同上
+            unsafe { &*chunk.as_ptr() }.incr_strong_count();
+            return Result::Ok(chunk);
+        }
+        Result::Err(self.data_state())
+    }
+
+    /// 初始化一整段从未使用过的槽位，是 `WeakPool` 构造期唯一的槽位入口。
+    ///
+    /// - 按数组下标写死 `pool_order_`，此后终生只读；
+    /// - 把空闲链接串成顺序链：`i` 指向 `i + 1`，末位指向 `capacity`，于是分配路径
+    ///   无须区分「从未分配过的槽位」与「归还回来的槽位」；
+    /// - 把状态、计数、存活链链接与清理登记一律拉到干净初值（分配器给的是未初始化内存）。
+    ///
+    /// # Panics
+    ///
+    /// `slots.len()` 与 `capacity` 不一致时 panic：链尾标记就是容量值，必须能放进
+    /// 一个 [`PoolIndex`]。
+    pub fn init_slots(slots: &mut [Self], capacity: PoolIndex) {
+        assert!(
+            slots.len() == capacity as usize,
+            "槽位数量({})必须与容量({})一致",
+            slots.len(),
+            capacity,
+        );
+        let last = slots.len() - 1;
+        for (i, slot) in slots.iter_mut().enumerate() {
+            let next = if i == last {
+                capacity
+            } else {
+                (i + 1) as PoolIndex
+            };
+            slot.chunk_state_.pool_order_ = i as PoolIndex;
+            slot.chunk_state_.set_next_freed(next);
+            slot.chunk_state_.init_unallocated();
+            slot.set_strong_chunk(ptr::null_mut());
+            slot.set_prev_live(ptr::null_mut());
+            slot.set_next_live(ptr::null_mut());
+            slot.record_ = Option::None;
+            slot.meta_ = ptr::null();
+        }
+    }
+
+    /// 槽位状态（锁、弱计数与空闲链链接）。
+    #[inline]
+    pub(crate) fn chunk_state(&self) -> &WeakChunkState {
+        &self.chunk_state_
+    }
+
+    /// 槽位状态的可变引用，供弱池在分配 / 归还时改写空闲链。
+    #[inline]
+    pub(crate) fn chunk_state_mut(&mut self) -> &mut WeakChunkState {
+        &mut self.chunk_state_
+    }
+
+    /// 类型擦除的清理登记；空闲槽位为 [`None`]。
+    #[inline]
+    pub(crate) fn record(&self) -> Option<&'static PreDropRecord> {
+        self.record_
+    }
+
+    /// `?Sized` 类型元数据（切片长度 / 虚表）；`Sized` 时为空指针。
+    #[inline]
+    pub(crate) fn meta(&self) -> *const () {
+        self.meta_
+    }
+
+    /// 造一个栈上的空槽位，仅供单元测试使用。
+    #[cfg(test)]
+    pub(crate) fn stack_empty_() -> Self {
+        WeakChunk {
+            chunk_state_: WeakChunkState::empty_(),
+            prev_live_: AtomicPtr::new(ptr::null_mut()),
+            next_live_: AtomicPtr::new(ptr::null_mut()),
+            strong_chunk_: AtomicPtr::new(ptr::null_mut()),
+            record_: Option::None,
+            meta_: ptr::null(),
+            _unused_t_: PhantomData,
+        }
+    }
+
     /// 登记类型擦除的清理信息：调用方已经算好了有效登记与 `?Sized` 元数据。
     ///
     /// 类型相关的调用方（例如 `StrongChunk`）走这个入口：在那里有具体的 `T`，可以算出
@@ -494,59 +621,6 @@ where
         self.prev_live_.store(prev, Ordering::Relaxed);
     }
 
-    // -- 升级路径 -----------------------------------------------------------
-
-    /// 尝试把 `Retain` 的持有关系升级为 `Owning`。
-    ///
-    /// 前提是当前状态恰为 [`DataState::Created`]（数据活着且没有强引用持有者）。状态位上的
-    /// 迁移同时充当"无强引用"的判据与上锁动作，因此成败唯一、不需要额外的锁。
-    ///
-    /// # Errors
-    ///
-    /// 状态不是 `Created`（数据已析构，或已被 `Owning` / `Sharing` 持有）时返回当前状态。
-    pub fn try_owning(&self) -> Result<NonNull<StrongChunkBase>, DataState> {
-        let Some(chunk) = self.strong_chunk() else {
-            return Result::Err(self.data_state());
-        };
-        match self
-            .chunk_state_
-            .try_transition_state(DataState::Created, DataState::Owning)
-        {
-            Option::Some(_) => Result::Ok(chunk),
-            Option::None => Result::Err(self.data_state()),
-        }
-    }
-
-    /// 尝试把 `Retain` 的持有关系升级为 `Sharing`。
-    ///
-    /// - 状态为 `Created`：置为 `Sharing` 并把强计数置 1；
-    /// - 状态已经是 `Sharing`：只把强计数加 1。这条**幂等增量**是 README 使用思路里
-    ///   "泄漏一个 `Sharing` 之后仍能继续共享"的依据。
-    ///
-    /// # Errors
-    ///
-    /// 数据已被 `Owning` 独占、或已被销毁 / 回收时返回当前状态。
-    pub fn try_sharing(&self) -> Result<NonNull<StrongChunkBase>, DataState> {
-        let Some(chunk) = self.strong_chunk() else {
-            return Result::Err(self.data_state());
-        };
-        if self
-            .chunk_state_
-            .try_transition_state(DataState::Created, DataState::Sharing)
-            .is_some()
-        {
-            // SAFETY: 强块与身份槽位互相绑定，chunk 有效
-            unsafe { &*chunk.as_ptr() }.incr_strong_count();
-            return Result::Ok(chunk);
-        }
-        if self.data_state() == DataState::Sharing {
-            // SAFETY: 同上
-            unsafe { &*chunk.as_ptr() }.incr_strong_count();
-            return Result::Ok(chunk);
-        }
-        Result::Err(self.data_state())
-    }
-
     // -- 池的维护 -----------------------------------------------------------
 
     /// 把槽位串成空闲链的一环，并清掉上一轮使用留下的状态与清理登记。
@@ -560,42 +634,6 @@ where
         self.set_next_live(ptr::null_mut());
         self.record_ = Option::None;
         self.meta_ = ptr::null();
-    }
-
-    /// 初始化一整段从未使用过的槽位，是 `WeakPool` 构造期唯一的槽位入口。
-    ///
-    /// - 按数组下标写死 `pool_order_`，此后终生只读；
-    /// - 把空闲链接串成顺序链：`i` 指向 `i + 1`，末位指向 `capacity`，于是分配路径
-    ///   无须区分「从未分配过的槽位」与「归还回来的槽位」；
-    /// - 把状态、计数、存活链链接与清理登记一律拉到干净初值（分配器给的是未初始化内存）。
-    ///
-    /// # Panics
-    ///
-    /// `slots.len()` 与 `capacity` 不一致时 panic：链尾标记就是容量值，必须能放进
-    /// 一个 [`PoolIndex`]。
-    pub fn init_slots(slots: &mut [Self], capacity: PoolIndex) {
-        assert!(
-            slots.len() == capacity as usize,
-            "槽位数量({})必须与容量({})一致",
-            slots.len(),
-            capacity,
-        );
-        let last = slots.len() - 1;
-        for (i, slot) in slots.iter_mut().enumerate() {
-            let next = if i == last {
-                capacity
-            } else {
-                (i + 1) as PoolIndex
-            };
-            slot.chunk_state_.pool_order_ = i as PoolIndex;
-            slot.chunk_state_.set_next_freed(next);
-            slot.chunk_state_.init_unallocated();
-            slot.set_strong_chunk(ptr::null_mut());
-            slot.set_prev_live(ptr::null_mut());
-            slot.set_next_live(ptr::null_mut());
-            slot.record_ = Option::None;
-            slot.meta_ = ptr::null();
-        }
     }
 }
 

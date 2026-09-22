@@ -835,7 +835,7 @@ fn weak_chunk_data_state_full_transition_path() {
         WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
         &mut *ptr
     };
-    let state = &chunk.chunk_state_;
+    let state = &chunk.chunk_state();
 
     assert_eq!(state.data_state(), DataState::Reclaimed);
     assert!(!state.data_state().is_data_alive());

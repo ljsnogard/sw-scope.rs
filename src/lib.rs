@@ -1,6 +1,5 @@
 #![feature(allocator_api)]
 #![feature(coerce_unsized)]
-#![feature(generic_atomic)]
 #![feature(ptr_metadata)]
 #![feature(try_trait_v2)]
 #![feature(unsize)]

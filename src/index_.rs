@@ -105,7 +105,7 @@ where
             "Owning 必然借用自某个 Retain，弱计数不该是 0"
         );
         let _ = weak
-            .chunk_state_
+            .chunk_state()
             .try_transition_state(DataState::Owning, DataState::Created);
         // 正常路径下弱计数 > 0，这里不会触发；保留判断以覆盖泄漏 / unsafe 组合
         let _ = claim_and_destroy_if_unreachable_(weak);
@@ -179,7 +179,7 @@ where
         // SAFETY: 同上
         let weak = unsafe { chunk.weak_chunk().as_ref() };
         let _ = weak
-            .chunk_state_
+            .chunk_state()
             .try_transition_state(DataState::Sharing, DataState::Created);
         let _ = claim_and_destroy_if_unreachable_(weak);
     }
@@ -192,11 +192,6 @@ impl<T> Retain<T>
 where
     T: ?Sized,
 {
-    /// 构造一个句柄。分配管线（Batch 2）落地前，生产路径还没有调用点。
-    #[allow(dead_code)]
-    pub(crate) const fn new(chunk: NonNull<WeakChunk<T>>) -> Self {
-        Retain { weak_chunk_: chunk }
-    }
 
     /// 尝试从 Weak<T> 提升为 Retain<T>。
     /// 当且仅当 `DataState::Allocated` 时会成功
@@ -212,6 +207,11 @@ where
         let chunk = unsafe { self.weak_chunk_.as_ref() };
         let strong = chunk.try_sharing().ok()?;
         Option::Some(Sharing::new(raw_to_strong_::<T>(strong)))
+    }
+    /// 构造一个句柄。分配管线（Batch 2）落地前，生产路径还没有调用点。
+    #[allow(dead_code)]
+    pub(crate) const fn new(chunk: NonNull<WeakChunk<T>>) -> Self {
+        Retain { weak_chunk_: chunk }
     }
 }
 
@@ -255,12 +255,12 @@ fn claim_and_destroy_if_unreachable_(weak: &WeakChunk<()>) -> bool {
     if weak.weak_count() != 0 || weak.data_state() != DataState::Created {
         return false;
     }
-    if weak.chunk_state_.try_claim_destroy().is_none() {
+    if weak.chunk_state().try_claim_destroy().is_none() {
         return false;
     }
     // SAFETY: 刚由本调用认领成功，且本路径恰好执行一次
     unsafe { weak.drop_data() };
-    weak.chunk_state_.mark_destroyed();
+    weak.chunk_state().mark_destroyed();
     true
 }
 

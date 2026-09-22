@@ -40,4 +40,3 @@ fn demo() {
     assert!(retain.try_owning().is_none());
     assert!(retain.try_sharing().is_some());
 }
-

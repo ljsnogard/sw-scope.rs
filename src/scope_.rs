@@ -2,6 +2,7 @@ use core::{
     alloc::{Allocator, Layout},
     mem::MaybeUninit,
     ptr::{self, NonNull},
+    sync::atomic::AtomicPtr,
 };
 
 #[cfg(feature = "core-alloc")]
@@ -10,10 +11,12 @@ extern crate alloc;
 use crate::{
     abs_::{IntoEmplace, TrEmplace, TrScope},
     index_::Retain,
-    scope_inner_::{self, PoolIndex, RootScope, ScopeInner},
+    scope_inner_::{self, RootScope, RootScopeRef},
     scope_str_::ScopeStr,
     weak_::PreDropRecord,
 };
+
+pub use scope_inner_::{DEFAULT_CELL_SIZE, ScopeInner};
 
 #[derive(Debug)]
 pub enum ScopeError {
@@ -32,25 +35,15 @@ pub enum ScopeError {
 /// 一个自包含结构，位于 Root 树，其生命周期由其分配的所有 Retain<T> 共同决定。
 /// 即，当其分配的所有 Retain 指针都不再存活，且其所有子 Scope 也不存活，这个
 /// `Scope` 的内存才会被回收。
-pub struct Scope {
-    inner_ptr_: NonNull<ScopeInner<>>,
+pub struct Scope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
+    inner_ptr_: NonNull<ScopeInner<CELL_SIZE>>,
 }
 
-impl Scope {
-    pub fn root<A, const CELL_SIZE: usize>(
-        init_cell_count: PoolIndex,
-        alloc: A,
-    ) -> Scope
-    where
-        A: Allocator,
-    {
-        todo!()
-    }
-
+impl Scope<DEFAULT_CELL_SIZE> {
     /// 从默认的 RootScope 中创建一个子 scope
     #[allow(clippy::new_without_default)]
     #[cfg(feature = "core-alloc")]
-    pub fn new() -> Scope {
+    pub fn new() -> Self {
         let root = match RootScope::try_init_default_root_scope_(
             &scope_inner_::DEFAULT_ROOT_SCOPE,
             scope_inner_::DEFAULT_PAGE_SIZE,
@@ -59,13 +52,32 @@ impl Scope {
             Result::Err(s) | Result::Ok(s) => s,
         };
         // 以 root 域为父创建子 Scope；root 自身没有父域，临时句柄析构时会被跳过
-        let root_scope = Scope {
-            inner_ptr_: NonNull::from(root.inner_()),
-        };
+        let root_scope = Self::make_scope_(root);
         Self::new_from_parent(&root_scope)
     }
+}
 
-    pub fn new_from_parent(parent: &Scope) -> Scope {
+impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
+    /// 获取或者创建一个 root scope。若当前进程内已存在 root scope 则通过 Err
+    /// 返回已创建的 root scope
+    pub fn root<A>(
+        root_ptr: &'static AtomicPtr<ScopeInner<CELL_SIZE>>,
+        page_size: usize,
+        allocator: A,
+    ) -> Result<Self, Self>
+    where
+        A: 'static + Allocator,
+    {
+        let x = RootScope::try_init_default_root_scope_(
+            root_ptr,
+            page_size,
+            allocator,
+        );
+        x.map(Self::make_scope_)
+            .map_err(Self::make_scope_)
+    }
+
+    pub fn new_from_parent(parent: &Scope<CELL_SIZE>) -> Self {
         // SAFETY: parent.inner_ptr_ 来自一个仍然存活的 Scope
         let inner = ScopeInner::new_child_(parent.inner_ptr_).expect("分配子 Scope 失败");
         Scope { inner_ptr_: inner }
@@ -89,26 +101,9 @@ impl Scope {
         inner.reclaim_pending_();
     }
 
-    /// 关闭后仍放入的行为：默认忽略标记；开启 `strict-put-after-close` 时返回错误。
-    fn ensure_open_(&self) -> Result<(), ScopeError> {
-        // SAFETY: Scope 持有一个有效的 ScopeInner
-        let closed = unsafe { self.inner_ptr_.as_ref() }.is_closed_();
-        if !closed {
-            return Result::Ok(());
-        }
-        #[cfg(feature = "strict-put-after-close")]
-        {
-            Result::Err(ScopeError::ClosedScope)
-        }
-        #[cfg(not(feature = "strict-put-after-close"))]
-        {
-            Result::Ok(())
-        }
-    }
-
     /// 创建一个子域，该子域将拥有独立的内存池和自身的生命周期。
     #[inline]
-    pub fn child_scope(&self) -> Scope {
+    pub fn child_scope(&self) -> Self {
         Self::new_from_parent(self)
     }
 
@@ -268,9 +263,32 @@ impl Scope {
     ) -> Result<Retain<[MaybeUninit<T>]>, ScopeError> {
         todo!()
     }
+
+    /// 关闭后仍放入的行为：默认忽略标记；开启 `strict-put-after-close` 时返回错误。
+    fn ensure_open_(&self) -> Result<(), ScopeError> {
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let closed = unsafe { self.inner_ptr_.as_ref() }.is_closed_();
+        if !closed {
+            return Result::Ok(());
+        }
+        #[cfg(feature = "strict-put-after-close")]
+        {
+            Result::Err(ScopeError::ClosedScope)
+        }
+        #[cfg(not(feature = "strict-put-after-close"))]
+        {
+            Result::Ok(())
+        }
+    }
+
+    fn make_scope_(root_scope_ref: RootScopeRef<CELL_SIZE>) -> Self {
+        Scope {
+            inner_ptr_: NonNull::from(root_scope_ref),
+        }
+    }
 }
 
-impl TrScope for &mut Scope {
+impl<const CELL_SIZE: usize>  TrScope for &mut Scope<CELL_SIZE> {
     type Err = ScopeError;
 
     #[inline]
@@ -347,7 +365,7 @@ impl TrScope for &mut Scope {
     }
 }
 
-impl core::cmp::PartialEq for Scope {
+impl<const CELL_SIZE: usize> core::cmp::PartialEq for Scope<CELL_SIZE> {
     fn eq(&self, other: &Self) -> bool {
         let lhs = self.inner_ptr_.as_ptr();
         let rhs = other.inner_ptr_.as_ptr();
@@ -355,9 +373,9 @@ impl core::cmp::PartialEq for Scope {
     }
 }
 
-impl core::cmp::Eq for Scope {}
+impl<const CELL_SIZE: usize> core::cmp::Eq for Scope<CELL_SIZE> {}
 
-impl Drop for Scope {
+impl<const CELL_SIZE: usize> Drop for Scope<CELL_SIZE> {
     /// 按清盘方案 A：只把子树**标记关闭、摘链、挂进待回收名单**，再尝试回收已经静默的域。
     ///
     /// 真正的析构与内存回收发生在"句柄已析构 + 已关闭 + 静默"之后（可能很久以后），
