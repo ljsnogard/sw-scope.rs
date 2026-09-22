@@ -23,7 +23,7 @@ fn make_identity_() -> WeakChunk<()> {
     // 真实路径上这一步由分配流程完成
     let _ = slot
         .chunk_state_
-        .compare_exchange_state(DataState::Reclaimed, DataState::Created);
+        .try_transition_state(DataState::Reclaimed, DataState::Created);
     slot
 }
 

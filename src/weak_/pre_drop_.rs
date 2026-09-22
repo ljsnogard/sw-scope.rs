@@ -6,11 +6,13 @@
 //!   取引用"提升进静态内存；弱槽位只保存一个 `&'static PreDropRecord`；
 //! - 记录自身只含一个类型擦除入口，**不含**数据地址与 `?Sized` 元数据：前者由入口按 `T`
 //!   单态化重建，后者仍逐对象保存在弱槽位里；
-//! - 类型级钩子由 `RootScope` 上的 [`PreDropRegistry`] 按类型名查找，对象级钩子直接在放入点
-//!   生成记录并覆盖类型级；
+//! - 类型级钩子由整棵树共享的 [`PreDropRegistry`] 按类型名查找（物理位置见 D2d），对象级
+//!   钩子直接在放入点生成记录并覆盖类型级；
 //! - 钩子必须是**零尺寸类型**（函数项或非捕获闭包），捕获式闭包会在编译期被 `const` 断言拒绝。
 
 use core::{mem, ptr};
+
+use crate::atomic_::SpinMutex;
 
 use super::chunk_::data_ptr_of_;
 
@@ -94,6 +96,10 @@ impl PreDropRecord {
 ///
 /// 非捕获闭包与函数项都是零尺寸类型，只有一个值；零字节不承载任何位模式，因此"读未初始化
 /// 内存"得到的仍是那个唯一值。捕获式闭包不是零尺寸，会被下面的 `const` 断言在编译期拒绝。
+///
+/// clippy 的 `uninit_assumed_init` 看不到 `const` 断言，这里按 AGENTS §6 记录为已说明的例外：
+/// 断言保证 `Fin` 零尺寸，`assume_init` 不会读到任何未初始化字节。
+#[allow(clippy::uninit_assumed_init)]
 fn zst_value_<Fin>() -> Fin {
     const {
         assert!(
@@ -140,7 +146,7 @@ unsafe fn pre_drop_entry_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- 类型级注册表
 
-/// 类型级 `PreDrop` 钩子的注册表，挂在一个 `RootScope` 上，随整棵树回收。
+/// 类型级 `PreDrop` 钩子的注册表，挂在 root 树上、随整棵树回收。
 ///
 /// 存在的理由：不能为了 `PreDrop` 逼使用者给每个类型实现一个 trait；只对自己关心的类型
 /// 在这里登记一次即可，其余类型走"无钩子"的默认记录。
@@ -151,19 +157,12 @@ unsafe fn pre_drop_entry_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(
 /// 合并（例如 `u64` 与 `u32` 的无钩子记录），拿地址当键会让不同类型的钩子互相串味。
 #[cfg(feature = "core-alloc")]
 pub(crate) struct PreDropRegistry {
-    /// 自旋锁位：注册表跨 Scope 树共享，注册与查找都必须串行化。
-    locked_: core::sync::atomic::AtomicBool,
-    /// 只登记被显式注册过的类型，典型数量很小，线性扫描即可；仅由持锁者访问。
-    entries_: core::cell::UnsafeCell<alloc::vec::Vec<PreDropEntry>>,
+    /// 自旋锁直接锁住登记表：跨 Scope 树共享，注册与查找都必须串行化。
+    ///
+    /// "锁住的内容"由 [`SpinMutex`] 的泛型参数给出，因此这里不需要再手写
+    /// `UnsafeCell` 与 `unsafe impl Sync/Send`。
+    entries_: SpinMutex<alloc::vec::Vec<PreDropEntry>>,
 }
-
-// SAFETY: `entries_` 的一切访问都在 `locked_` 临界区内进行（见 `lock_`），等价于一把自旋锁；
-// `PreDropEntry` 只含 `&'static` 数据，本身没有内部可变性。
-#[cfg(feature = "core-alloc")]
-unsafe impl Sync for PreDropRegistry {}
-// SAFETY: 同上，所有权跨线程转移不会破坏临界区约定。
-#[cfg(feature = "core-alloc")]
-unsafe impl Send for PreDropRegistry {}
 
 #[cfg(feature = "core-alloc")]
 struct PreDropEntry {
@@ -173,57 +172,21 @@ struct PreDropEntry {
     record_: &'static PreDropRecord,
 }
 
-/// 持有注册表自旋锁的守卫：析构即解锁，临界区内 panic 也不会把锁落下。
-#[cfg(feature = "core-alloc")]
-struct PreDropRegistryGuard<'a> {
-    registry_: &'a PreDropRegistry,
-}
-
-#[cfg(feature = "core-alloc")]
-impl Drop for PreDropRegistryGuard<'_> {
-    fn drop(&mut self) {
-        self.registry_
-            .locked_
-            .store(false, core::sync::atomic::Ordering::Release);
-    }
-}
-
 #[cfg(feature = "core-alloc")]
 impl PreDropRegistry {
-    /// 建一张空表（不分配）。
-    pub(crate) const fn new_() -> Self {
+    /// 建一张空表（要分配，因此不是 `const fn`）。
+    pub(crate) fn new() -> Self {
         PreDropRegistry {
-            locked_: core::sync::atomic::AtomicBool::new(false),
-            entries_: core::cell::UnsafeCell::new(alloc::vec::Vec::new()),
+            entries_: SpinMutex::new(alloc::vec::Vec::new()),
         }
     }
 
-    /// 抢锁；锁被占用时自旋。抢到即返回守卫，守卫析构时解锁。
-    fn lock_(&self) -> PreDropRegistryGuard<'_> {
-        while self
-            .locked_
-            .compare_exchange_weak(
-                false,
-                true,
-                core::sync::atomic::Ordering::Acquire,
-                core::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        PreDropRegistryGuard { registry_: self }
-    }
-
-    /// 取出内部表。
+    /// 在持锁状态下访问内部表。
     ///
-    /// # Safety
-    ///
-    /// 调用方必须持有本注册表的锁（也即持有 [`PreDropRegistryGuard`]），否则会与别的线程
-    /// 形成别名 `&mut`。
-    fn entries_(&self) -> &mut alloc::vec::Vec<PreDropEntry> {
-        // SAFETY: 由调用方保证持锁，因而独占
-        unsafe { &mut *self.entries_.get() }
+    /// 把"抢锁 + 取可变引用"合成一次调用，调用方拿不到能脱离临界区的 `&mut`；解锁由
+    /// [`SpinMutex`] 的守卫在析构时完成，因此临界区内 panic 也不会把锁落下。
+    fn with_entries_<R>(&self, access: impl FnOnce(&mut alloc::vec::Vec<PreDropEntry>) -> R) -> R {
+        self.entries_.with_locked(access)
     }
 
     /// 为类型 `T` 注册（或覆盖）一个类型级钩子。
@@ -232,25 +195,24 @@ impl PreDropRegistry {
     pub(crate) fn register_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(&self, _hook: Fin) {
         let key = core::any::type_name::<T>();
         let record = PreDropRecord::of_with::<T, Fin>();
-        let _guard = self.lock_();
-        let entries = self.entries_();
-        match entries.iter_mut().find(|entry| entry.key_ == key) {
+        self.with_entries_(|entries| match entries.iter_mut().find(|entry| entry.key_ == key) {
             Option::Some(entry) => entry.record_ = record,
             Option::None => entries.push(PreDropEntry {
                 key_: key,
                 record_: record,
             }),
-        }
+        });
     }
 
     /// 查找类型 `T` 的类型级登记。
     pub(crate) fn lookup_<T: ?Sized>(&self) -> Option<&'static PreDropRecord> {
         let key = core::any::type_name::<T>();
-        let _guard = self.lock_();
-        self.entries_()
-            .iter()
-            .find(|entry| entry.key_ == key)
-            .map(|entry| entry.record_)
+        self.with_entries_(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.key_ == key)
+                .map(|entry| entry.record_)
+        })
     }
 }
 

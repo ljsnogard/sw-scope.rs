@@ -653,7 +653,7 @@ where
             .expect("分配 PreDrop 注册表失败");
         let registry_ptr = registry_mem.as_ptr() as *mut u8 as *mut PreDropRegistry;
         // SAFETY: registry_mem 是刚分配、尚无人共享的独占内存；new_ 不做任何分配
-        unsafe { registry_ptr.write(PreDropRegistry::new_()) };
+        unsafe { registry_ptr.write(PreDropRegistry::new()) };
         root_scope_mut.scope_inner_.pre_drop_registry_ =
             Option::Some(unsafe { NonNull::new_unchecked(registry_ptr) });
         // 初始化完成后才把真正的地址放入，以表示初始化已完成

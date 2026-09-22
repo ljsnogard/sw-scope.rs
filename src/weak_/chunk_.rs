@@ -6,41 +6,12 @@ use core::{
 };
 
 use crate::{
+    atomic_::{MsbAsMutexSignal, SpinFlag},
     scope_inner_::PoolIndex,
     strong_::{StrongChunk, StrongChunkBase},
 };
 
 use super::pre_drop_::PreDropRecord;
-
-/// 一次 CAS 的三种结局，语义对齐 `atomic_sync` 所用的 `atomex::CmpxchResult`。
-///
-/// 区分三者是为了让重试循环能判断"继续用旧值重试"还是"必须重新读状态"。本 crate 目前
-/// 零依赖，因此就地定义这一小块，而不是引入外部 crate。
-#[derive(Debug, Clone)]
-pub(crate) enum CmpxchResult<T> {
-    /// CAS 成功，携带比较时的旧值。
-    Succ(T),
-    /// 判据不成立，压根没发起 CAS；携带当前值。
-    Unexpected(T),
-    /// 判据成立但 CAS 失败——期间被别人改动过；携带观察到的当前值。
-    Fail(T),
-}
-
-impl<T> CmpxchResult<T> {
-    #[inline]
-    pub(crate) const fn is_succ(&self) -> bool {
-        matches!(self, CmpxchResult::Succ(_))
-    }
-
-    /// 成功时取出旧值。
-    #[inline]
-    pub(crate) fn succ(self) -> Option<T> {
-        match self {
-            CmpxchResult::Succ(t) => Option::Some(t),
-            _ => Option::None,
-        }
-    }
-}
 
 /// 弱引用槽位。它既是 `Retain<T>` 的持有对象，也是**对象的身份与生命周期上下文**。
 ///
@@ -155,6 +126,12 @@ impl DataState {
     }
 }
 
+/// 状态字使用的锁信号策略：最高位。
+type LockSignal = MsbAsMutexSignal<u32>;
+
+/// 状态字：锁位由 [`LockSignal`] 给出，其余位是状态与弱计数。
+type StateWord = SpinFlag<u32, AtomicU32, LockSignal>;
+
 /// 状态字的位布局：高 1 位锁、次 3 位 [`DataState`]、低 28 位**弱**引用计数。
 ///
 /// 强引用计数**不在这里**，它由 [`StrongChunkBase`] 自己管理：两者数的是完全不同的东西。
@@ -168,8 +145,8 @@ pub(crate) struct WeakChunkState {
     /// 协助 `WeakPool` 串联空闲槽位。
     pub(crate) next_freed_: PoolIndex,
 
-    /// 状态字，布局见本结构文档。
-    pub(crate) weak_state_: AtomicU32,
+    /// 状态字；锁位、状态位与弱计数的读写全部经由 [`SpinFlag`] 的操作。
+    pub(crate) weak_state_: StateWord,
 }
 
 /// 把状态与计数打包成一个字。
@@ -179,89 +156,34 @@ const fn pack_(state: DataState, count: u32) -> u32 {
 
 impl WeakChunkState {
     const DATA_ST_MASK: u32 = 0x7000_0000;
-    const LOCK_ST_MASK: u32 = 0x8000_0000;
     const WEAK_RC_MASK: u32 = 0x0FFF_FFFF;
     const DATA_SHIFT: u32 = 28;
 
     /// 槽位尚未被分配给任何对象时的初值。
-    pub(crate) const fn empty_() -> Self {
+    ///
+    /// 因为 [`SpinFlag::new`] 要构造原子字，所以本函数不是 `const fn`。
+    pub(crate) fn empty_() -> Self {
         WeakChunkState {
             pool_order_: 0,
             next_freed_: 0,
-            weak_state_: AtomicU32::new(0),
+            weak_state_: SpinFlag::new(0),
         }
     }
 
-    // -- 原子原语：所有"读—改—写"都经由 try_once_ ---------------------------
+    // -- 锁：语义操作由 `SpinFlag` 提供，CAS 不出现在本类型里 -----------------
 
-    /// 一次 `compare_exchange`。
-    ///
-    /// 这类操作在本文件出现多次（抢锁、释放、状态迁移、计数增减）。把 CAS 本身收口在
-    /// 这里，调用方只负责计算 `desired`，避免同一种样板代码散落各处。
-    fn try_once_(&self, current: u32, desired: u32) -> CmpxchResult<u32> {
-        match self.weak_state_.compare_exchange(
-            current,
-            desired,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Result::Ok(_) => CmpxchResult::Succ(current),
-            Result::Err(observed) => CmpxchResult::Fail(observed),
-        }
-    }
-
-    /// 循环调用 [`WeakChunkState::try_once_`]，直到闭包判定"无需再试"。
-    ///
-    /// 闭包接收当前值、返回期望的新值；期望值与当前值相同即表示"不需要改动"，循环结束。
-    /// 每次失败都用观察到的值重试，因此不会拿着过期状态空转。
-    fn update_<F>(&self, mut desire: F)
-    where
-        F: FnMut(u32) -> u32,
-    {
-        let mut current = self.weak_state_.load(Ordering::Acquire);
-        loop {
-            let desired = desire(current);
-            if desired == current {
-                return;
-            }
-            match self.try_once_(current, desired) {
-                CmpxchResult::Succ(_) => return,
-                CmpxchResult::Fail(observed) | CmpxchResult::Unexpected(observed) => {
-                    current = observed
-                }
-            }
-        }
-    }
-
-    /// 抢占状态锁：循环调用一次性 CAS，直到成功或达到重试上限。
-    ///
-    /// **这是本文件里唯一一处抢锁循环**，有界重试与忙等只是它的两种参数：`max_try == 0`
-    /// 表示不限次数。
+    /// 抢占状态锁：以最高位为锁信号，`max_try == 0` 表示忙等。
     ///
     /// **私有**：锁的释放只允许发生在 [`WeakChunkStateGuard`] 的 `Drop` 里，因此不提供
     /// 任何"手动解锁"入口，也不允许外部单独抢锁——否则就会出现"锁被抢到、却没人负责
     /// 释放"的状态。
     fn acquire_(&self, max_try: usize) -> bool {
-        let mut tried = 0usize;
-        loop {
-            let current = self.weak_state_.load(Ordering::Acquire);
-            if (current & Self::LOCK_ST_MASK) == 0 {
-                if self.try_once_(current, current | Self::LOCK_ST_MASK).is_succ() {
-                    return true;
-                }
-            } else {
-                core::hint::spin_loop();
-            }
-            tried += 1;
-            if max_try != 0 && tried >= max_try {
-                return false;
-            }
-        }
+        self.weak_state_.try_acquire(max_try)
     }
 
     /// 释放状态锁。**只应由 [`WeakChunkStateGuard`] 的 `Drop` 调用。**
     fn release_lock_(&self) {
-        self.update_(|current| current & !Self::LOCK_ST_MASK);
+        let _ = self.weak_state_.release();
     }
 
     // -- 读写 ---------------------------------------------------------------
@@ -274,76 +196,68 @@ impl WeakChunkState {
 
     #[inline]
     pub(crate) fn data_state(&self) -> DataState {
-        Self::state_of_(self.weak_state_.load(Ordering::Acquire))
+        Self::state_of_(self.weak_state_.read())
     }
 
     /// 弱引用计数。
     #[inline]
     pub(crate) fn weak_count(&self) -> usize {
-        (self.weak_state_.load(Ordering::Acquire) & Self::WEAK_RC_MASK) as usize
+        (self.weak_state_.read() & Self::WEAK_RC_MASK) as usize
     }
 
     #[inline]
     pub(crate) fn incr_weak_count(&self) -> usize {
-        let s = self.weak_state_.fetch_add(1, Ordering::AcqRel);
+        let s = self.weak_state_.fetch_add(1);
         ((s & Self::WEAK_RC_MASK) + 1) as usize
     }
 
     #[inline]
     pub(crate) fn decr_weak_count(&self) -> usize {
-        let s = self.weak_state_.fetch_sub(1, Ordering::AcqRel);
+        let s = self.weak_state_.fetch_sub(1);
         ((s & Self::WEAK_RC_MASK) - 1) as usize
     }
 
     /// 是否处于加锁状态。
     #[inline]
     pub(crate) fn is_locked(&self) -> bool {
-        (self.weak_state_.load(Ordering::Acquire) & Self::LOCK_ST_MASK) != 0
+        self.weak_state_.is_locked()
     }
 
-    // -- 状态迁移 -----------------------------------------------------------
+    // -- 状态迁移：CAS 隐藏在 `SpinFlag::try_update` 里 ----------------------
 
-    /// 比较并交换状态位，保持锁位与弱计数不变。
+    /// 把字里的状态位换成 `to`，保持锁位与弱计数不变。
+    fn with_state_(raw: u32, to: DataState) -> u32 {
+        (raw & !Self::DATA_ST_MASK) | ((to as u32) << Self::DATA_SHIFT)
+    }
+
+    /// 按状态位做一次条件迁移（无锁 CAS，锁位不受影响）。
+    ///
+    /// `desire` 返回 [`None`] 表示"不满足前提"，直接放弃；返回的目标状态与当前一致时视为
+    /// 已经就位，同样返回当前状态。
+    fn transition_<F>(&self, mut desire: F) -> Option<DataState>
+    where
+        F: FnMut(DataState) -> Option<DataState>,
+    {
+        self.weak_state_.try_update(|raw| {
+            let from = Self::state_of_(raw);
+            let to = desire(from)?;
+            if to == from {
+                return Option::Some((raw, from));
+            }
+            Option::Some((Self::with_state_(raw, to), from))
+        })
+    }
+
+    /// 仅当状态位当前为 `from` 时把它迁到 `to`，保持锁位与弱计数不变。
     ///
     /// 只有**真正由本次调用完成迁移**才返回 `Some`，"状态本来就已经是 `to`" 不算成功
     /// ——升级路径要靠这个返回值判断自己是不是赢家。
-    pub(crate) fn compare_exchange_state(
+    pub(crate) fn try_transition_state(
         &self,
         from: DataState,
         to: DataState,
     ) -> Option<DataState> {
-        loop {
-            let current = self.weak_state_.load(Ordering::Acquire);
-            if Self::state_of_(current) != from {
-                return Option::None;
-            }
-            let desired = (current & !Self::DATA_ST_MASK) | ((to as u32) << Self::DATA_SHIFT);
-            if self.try_once_(current, desired).is_succ() {
-                return Option::Some(from);
-            }
-        }
-    }
-
-    /// 在持有【未加锁】的前提下按状态位做一次迁移。
-    ///
-    /// `desire` 返回 [`None`] 表示"不满足前提"，直接放弃；返回的目标状态与当前一致时
-    /// 视为已经就位。迁移只改状态位，引用计数原样保留。
-    fn try_update_state_<F>(&self, mut desire: F) -> Option<DataState>
-    where
-        F: FnMut(DataState) -> Option<DataState>,
-    {
-        loop {
-            let current = self.weak_state_.load(Ordering::Acquire);
-            let from = Self::state_of_(current);
-            let to = desire(from)?;
-            if to == from {
-                return Option::Some(from);
-            }
-            let desired = (current & !Self::DATA_ST_MASK) | ((to as u32) << Self::DATA_SHIFT);
-            if self.try_once_(current, desired).is_succ() {
-                return Option::Some(from);
-            }
-        }
+        self.transition_(|current| (current == from).then_some(to))
     }
 
     /// 认领销毁：把状态从 `{Created, Owning, Sharing}` 搬到 [`DataState::Destroying`]。
@@ -353,38 +267,38 @@ impl WeakChunkState {
     /// 裁决点：`Owning::drop`、`Sharing::drop` 的最后一次减计数、以及清盘兜底，都只能
     /// 通过这里竞争。
     pub(crate) fn try_claim_destroy(&self) -> Option<DataState> {
-        self.try_update_state_(|from| {
+        self.transition_(|from| {
             from.is_claimable().then_some(DataState::Destroying)
         })
     }
 
     /// 标记数据已析构完成。只有成功认领过销毁的线程应当调用。
     pub(crate) fn mark_destroyed(&self) {
-        let _ = self.try_update_state_(|from| (from == DataState::Destroying).then_some(DataState::Destroyed));
+        let _ = self.transition_(|from| (from == DataState::Destroying).then_some(DataState::Destroyed));
     }
 
     /// 标记已退出存活链、可随池回收。只有弱引用计数归零后才应调用。
     pub(crate) fn mark_finalized(&self) {
-        let _ = self.try_update_state_(|_| Option::Some(DataState::Finalized));
+        let _ = self.transition_(|_| Option::Some(DataState::Finalized));
     }
 
     /// 把状态置为 `Created`。分配路径在数据就位、槽位正式投入使用之后调用。
     pub(crate) fn init_created(&self) {
-        let _ = self.try_update_state_(|_| Option::Some(DataState::Created));
+        let _ = self.transition_(|_| Option::Some(DataState::Created));
     }
 
     /// 只在当前为 `Created` 时把状态置为 `to`；返回先前状态。
     ///
     /// 这个条件迁移同时充当"无强引用"这一前提的判据与上锁动作，因此不需要额外的锁位。
     pub(crate) fn try_set_state(&self, to: DataState) -> Option<DataState> {
-        self.try_update_state_(|from| (from == DataState::Created).then_some(to))
+        self.transition_(|from| (from == DataState::Created).then_some(to))
     }
 
     /// 把状态无条件搬到 `to`（保持锁位与两个计数不变）。
     pub(crate) fn mark_state(&self, to: DataState) {
-        self.update_(|current| {
-            (current & !Self::DATA_ST_MASK) | ((to as u32) << Self::DATA_SHIFT)
-        });
+        let _ = self
+            .weak_state_
+            .try_update(|raw| Option::Some((Self::with_state_(raw, to), ())));
     }
 
     pub(crate) fn pool_order(&self) -> PoolIndex {
@@ -406,7 +320,7 @@ impl WeakChunkState {
     pub(crate) fn reset_all(&mut self) {
         // 归还时还锁着，说明有线程卡在升级/初始化路径里，这属于逻辑错误
         debug_assert!(!self.is_locked(), "归还槽位时状态锁应当已经释放");
-        self.weak_state_.store(0, Ordering::Release);
+        self.weak_state_ = SpinFlag::new(0);
     }
 
     /// 首次初始化一个从未使用过的槽位的状态字：无条件写入初值。
@@ -414,7 +328,7 @@ impl WeakChunkState {
     /// 与 [`WeakChunkState::reset_all`] 的区别是这里不做任何断言——此刻内存里是分配器
     /// 给的随机字节，没有"上一个使用者"可言。
     pub(crate) fn init_unallocated(&mut self) {
-        self.weak_state_ = AtomicU32::new(0);
+        self.weak_state_ = SpinFlag::new(0);
     }
 }
 
@@ -596,7 +510,7 @@ where
         };
         match self
             .chunk_state_
-            .compare_exchange_state(DataState::Created, DataState::Owning)
+            .try_transition_state(DataState::Created, DataState::Owning)
         {
             Option::Some(_) => Result::Ok(chunk),
             Option::None => Result::Err(self.data_state()),
@@ -618,7 +532,7 @@ where
         };
         if self
             .chunk_state_
-            .compare_exchange_state(DataState::Created, DataState::Sharing)
+            .try_transition_state(DataState::Created, DataState::Sharing)
             .is_some()
         {
             // SAFETY: 强块与身份槽位互相绑定，chunk 有效

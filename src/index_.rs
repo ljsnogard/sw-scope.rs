@@ -106,7 +106,7 @@ where
         );
         let _ = weak
             .chunk_state_
-            .compare_exchange_state(DataState::Owning, DataState::Created);
+            .try_transition_state(DataState::Owning, DataState::Created);
         // 正常路径下弱计数 > 0，这里不会触发；保留判断以覆盖泄漏 / unsafe 组合
         let _ = claim_and_destroy_if_unreachable_(weak);
     }
@@ -180,7 +180,7 @@ where
         let weak = unsafe { chunk.weak_chunk().as_ref() };
         let _ = weak
             .chunk_state_
-            .compare_exchange_state(DataState::Sharing, DataState::Created);
+            .try_transition_state(DataState::Sharing, DataState::Created);
         let _ = claim_and_destroy_if_unreachable_(weak);
     }
 }

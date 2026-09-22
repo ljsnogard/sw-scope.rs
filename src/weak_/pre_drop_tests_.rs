@@ -47,7 +47,7 @@ fn pre_drop_record_is_shared_per_type() {
 /// - 判断：`lookup_::<u64>` 命中且不是空操作。
 #[test]
 fn pre_drop_registry_hits_registered_type() {
-    let registry = PreDropRegistry::new_();
+    let registry = PreDropRegistry::new();
     registry.register_::<u64, _>(|value: &mut u64| *value += 1);
 
     let record = registry
@@ -74,7 +74,7 @@ fn pre_drop_registry_key_does_not_leak_across_types() {
         "本测试要求两者同尺寸，才足以复现常量合并的风险"
     );
 
-    let registry = PreDropRegistry::new_();
+    let registry = PreDropRegistry::new();
     registry.register_::<A, _>(|value: &mut A| value.0 += 1);
 
     assert!(registry.lookup_::<A>().is_some(), "注册过的类型必须命中");
@@ -94,7 +94,7 @@ fn pre_drop_registry_key_does_not_leak_across_types() {
 ///   `PreDropRecord::of::<String>()`。
 #[test]
 fn object_level_record_overrides_type_level() {
-    let registry = PreDropRegistry::new_();
+    let registry = PreDropRegistry::new();
     registry.register_::<String, _>(|text: &mut String| text.clear());
     let type_level = registry
         .lookup_::<String>()
@@ -187,7 +187,7 @@ fn pre_drop_registry_is_thread_safe() {
     use std::sync::Arc;
     use std::thread;
 
-    let registry = Arc::new(PreDropRegistry::new_());
+    let registry = Arc::new(PreDropRegistry::new());
     let mut handles = alloc::vec::Vec::new();
     for _ in 0..4usize {
         let worker_registry = Arc::clone(&registry);

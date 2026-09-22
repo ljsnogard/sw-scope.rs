@@ -8,6 +8,7 @@
 #![no_std]
 
 mod abs_;
+mod atomic_;
 
 #[cfg(any(test, feature = "std"))]
 extern crate std;

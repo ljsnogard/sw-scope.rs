@@ -849,7 +849,7 @@ fn weak_chunk_data_state_full_transition_path() {
 
     // Owning 之后不能再被认领成 Sharing / Created
     assert!(state.try_set_state(DataState::Sharing).is_none());
-    assert!(state.compare_exchange_state(DataState::Created, DataState::Sharing).is_none());
+    assert!(state.try_transition_state(DataState::Created, DataState::Sharing).is_none());
 
     // Owning → Destroying → Destroyed → Finalized
     assert_eq!(state.try_claim_destroy(), Some(DataState::Owning));
