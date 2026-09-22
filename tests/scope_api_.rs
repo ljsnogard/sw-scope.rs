@@ -15,8 +15,11 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 static STR_HOOKED: AtomicUsize = AtomicUsize::new(0);
 static EMPLACE_HOOKED: AtomicUsize = AtomicUsize::new(0);
 
-fn str_hook(text: &mut ScopeStr) {
-    assert_eq!(&**text, "hooked str", "钩子里应当看到完整内容");
+/// 类型级钩子：只计数。
+///
+/// 刻意不在钩子里断言具体内容——类型级钩子按类型注册、挂在全局 root 上，本文件里所有
+/// `put_str` 用例的 `ScopeStr` 都会触发它；断言内容会打到别的用例。
+fn str_hook(_text: &mut ScopeStr) {
     STR_HOOKED.fetch_add(1, Ordering::AcqRel);
 }
 

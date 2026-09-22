@@ -22,6 +22,11 @@ pub enum ScopeError {
 
     /// Error occurs during init
     MalformedInit,
+
+    /// 目标 Scope（或其祖先）已被标记清盘，而 `strict-put-after-close` feature 要求报错。
+    ///
+    /// 未开启该 feature 时，关闭标记会被忽略，放入照常成功。
+    ClosedScope,
 }
 
 /// 一个自包含结构，位于 Root 树，其生命周期由其分配的所有 Retain<T> 共同决定。
@@ -85,6 +90,25 @@ impl Scope {
         let inner = unsafe { self.inner_ptr_.as_mut() };
         // SAFETY: 同上
         unsafe { inner.flush_() };
+        // 顺带回收已经静默的关闭域
+        inner.reclaim_pending_();
+    }
+
+    /// 关闭后仍放入的行为：默认忽略标记；开启 `strict-put-after-close` 时返回错误。
+    fn ensure_open_(&self) -> Result<(), ScopeError> {
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let closed = unsafe { self.inner_ptr_.as_ref() }.is_closed_();
+        if !closed {
+            return Result::Ok(());
+        }
+        #[cfg(feature = "strict-put-after-close")]
+        {
+            Result::Err(ScopeError::ClosedScope)
+        }
+        #[cfg(not(feature = "strict-put-after-close"))]
+        {
+            Result::Ok(())
+        }
     }
 
     /// 创建一个子域，该子域将拥有独立的内存池和自身的生命周期。
@@ -105,6 +129,7 @@ impl Scope {
     where
         F: FnOnce() -> T,
     {
+        self.ensure_open_()?;
         let value = factory();
         // SAFETY: Scope 持有一个有效的 ScopeInner
         let inner = unsafe { self.inner_ptr_.as_mut() };
@@ -149,6 +174,7 @@ impl Scope {
         F: FnOnce() -> T,
         Fin: FnOnce(&mut T) + 'static,
     {
+        self.ensure_open_()?;
         let value = factory();
         // 钩子是零尺寸的：这里只借用它的类型作为登记键
         let record = PreDropRecord::of_with::<T, Fin>();
@@ -169,6 +195,7 @@ impl Scope {
     ///
     /// 弱池已满或强池分配失败时返回 [`ScopeError::MallocFailed`]。
     pub fn try_put_str(&mut self, str: &str) -> Result<Retain<ScopeStr>, ScopeError> {
+        self.ensure_open_()?;
         let len = str.len();
         let layout = Layout::for_value(str);
         // 元数据就是长度；闭包在 arena 给出的位置写入字节
@@ -207,6 +234,7 @@ impl Scope {
     where
         TyEmp: TrEmplace,
     {
+        self.ensure_open_()?;
         // SAFETY: Scope 持有一个有效的 ScopeInner
         let inner = unsafe { self.inner_ptr_.as_mut() };
         // SAFETY: 由调用方满足 TrEmplace::emplace 的安全契约
@@ -229,6 +257,7 @@ impl Scope {
         TyEmp: TrEmplace,
         Fin: FnOnce(&mut TyEmp::Target) + 'static,
     {
+        self.ensure_open_()?;
         let record = PreDropRecord::of_with::<TyEmp::Target, Fin>();
         core::mem::drop(pre_drop);
         // SAFETY: Scope 持有一个有效的 ScopeInner
@@ -332,3 +361,24 @@ impl core::cmp::PartialEq for Scope {
 }
 
 impl core::cmp::Eq for Scope {}
+
+impl Drop for Scope {
+    /// 按清盘方案 A：只把子树**标记关闭、摘链、挂进待回收名单**，再尝试回收已经静默的域。
+    ///
+    /// 真正的析构与内存回收发生在"句柄已析构 + 已关闭 + 静默"之后（可能很久以后），
+    /// 所以 `Drop` 保持 **safe**：它不会让 `Retain` 或子 `Scope` 句柄悬空。
+    fn drop(&mut self) {
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let inner = unsafe { self.inner_ptr_.as_mut() };
+        // 根域没有 Scope 句柄，不应走到这里；防御性跳过
+        if !inner.has_parent_() {
+            return;
+        }
+        inner.mark_handle_dropped_();
+        if !inner.is_closed_() {
+            // 非递归地把整棵子树标记关闭并挂进名单
+            inner.close_subtree_();
+        }
+        inner.reclaim_pending_();
+    }
+}

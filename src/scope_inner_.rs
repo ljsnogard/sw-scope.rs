@@ -31,10 +31,21 @@ pub(crate) static DEFAULT_ROOT_SCOPE: AtomicPtr<ScopeInner<DEFAULT_CELL_SIZE>> =
 /// 在 `Scope` 这一侧已被擦除，指不到它的字段）。
 #[repr(C)]
 pub(crate) struct ScopeInner<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
-    /// 子域数量
-    children_num_: AtomicUsize,
+    /// 域标志位：`CLOSED` / `HANDLE_DROPPED`（取代原先的"子域数量"计数）
+    flags_: AtomicUsize,
     /// 父域指针
     parent_scope_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
+    /// 同父下的兄弟双向链
+    prev_sibling_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
+    next_sibling_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
+    /// 自己派生的子域双向链
+    first_child_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
+    last_child_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
+    /// 整棵树共享的"待回收名单"（只在 root 上有意义）：域被关闭后挂到这里，静默即可回收
+    pending_head_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
+    pending_tail_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
+    /// 名单内下一个；只在域已被关闭、挂在名单上时有效
+    pending_next_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
     /// 指向 Scope 所持有的第一块内存池
     chain_head_: Option<NonNull<StrongPool<CELL_SIZE>>>,
     /// 指向 Scope 所持有的最新一块内存池
@@ -53,6 +64,11 @@ pub(crate) struct ScopeInner<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
 }
 
 impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
+    /// 标志位：该域（及其子树）已被标记清盘。
+    pub(crate) const FLAG_CLOSED: usize = 1 << 0;
+    /// 标志位：指向本域的 `Scope` 句柄已经析构。回收要求这一位置位（见 A 方案）。
+    pub(crate) const FLAG_HANDLE_DROPPED: usize = 1 << 1;
+
     pub const fn root_scope(&self) -> NonNull<ScopeInner<CELL_SIZE>> {
         let p = self.allocator_ as *const dyn Allocator as *const u8;
         unsafe {
@@ -62,11 +78,37 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         }
     }
 
-    /// 造一个子域的内部状态；分配与就地写入由 [`ScopeInner::new_child_`] 负责。
+    /// 是否已被标记清盘。
+    #[inline]
+    pub(crate) fn is_closed_(&self) -> bool {
+        self.flags_.load(Ordering::Acquire) & Self::FLAG_CLOSED != 0
+    }
+
+    /// 是否有父域（没有父域的是 root，root 没有 `Scope` 句柄）。
+    #[inline]
+    pub(crate) const fn has_parent_(&self) -> bool {
+        self.parent_scope_.is_some()
+    }
+
+    /// 打上"句柄已析构"标记，并返回本域此刻是否可回收（还要看静默判据）。
+    #[inline]
+    pub(crate) fn mark_handle_dropped_(&self) {
+        self.flags_
+            .fetch_or(Self::FLAG_HANDLE_DROPPED, Ordering::AcqRel);
+    }
+
+    /// 造一个子域的内部状态；分配、就地写入与入父链由 [`ScopeInner::new_child_`] 负责。
     pub(crate) fn child_of_(parent: &Self) -> Self {
         ScopeInner {
-            children_num_: AtomicUsize::new(0),
+            flags_: AtomicUsize::new(0),
             parent_scope_: Option::Some(NonNull::from(parent)),
+            prev_sibling_: Option::None,
+            next_sibling_: Option::None,
+            first_child_: Option::None,
+            last_child_: Option::None,
+            pending_head_: Option::None,
+            pending_tail_: Option::None,
+            pending_next_: Option::None,
             chain_head_: Option::None,
             chain_tail_: Option::None,
             live_head_: Option::None,
@@ -77,21 +119,32 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         }
     }
 
-    /// 用本域分配器申请并就地构造一个子域，同时把父域的子域计数加 1。
+    /// 用本域分配器申请并就地构造一个子域，并把它追加到父域的子链尾（O(1)）。
     ///
     /// # Errors
     ///
     /// 分配器无法提供 `ScopeInner` 所需内存时返回 [`AllocError`]。
     pub(crate) fn new_child_(parent: NonNull<Self>) -> Result<NonNull<Self>, AllocError> {
-        // SAFETY: 由调用方保证 parent 有效
-        let parent_ref = unsafe { parent.as_ref() };
-        let mem = parent_ref.allocator_.allocate(Layout::new::<Self>())?;
+        // SAFETY: 由调用方保证 parent 有效；只取一次分配器就结束借用
+        let alloc = unsafe { parent.as_ref() }.allocator_;
+        let mem = alloc.allocate(Layout::new::<Self>())?;
         let inner = mem.as_ptr() as *mut u8 as *mut Self;
-        // SAFETY: mem 是刚分配、尚无人共享的独占内存
-        unsafe { inner.write(Self::child_of_(parent_ref)) };
-        parent_ref.children_num_.fetch_add(1, Ordering::AcqRel);
-        // SAFETY: inner 来自成功分配，必然非空
-        Result::Ok(unsafe { NonNull::new_unchecked(inner) })
+        // SAFETY: mem 是刚分配、尚无人共享的独占内存；parent 有效且此刻独占地链接
+        unsafe {
+            let parent_ref = parent.as_ref();
+            inner.write(Self::child_of_(parent_ref));
+            let child = NonNull::new_unchecked(inner);
+            let parent_ptr = parent.as_ptr();
+            match (*parent_ptr).last_child_ {
+                Option::Some(last) => {
+                    (*last.as_ptr()).next_sibling_ = Option::Some(child);
+                    (*inner).prev_sibling_ = Option::Some(last);
+                }
+                Option::None => (*parent_ptr).first_child_ = Option::Some(child),
+            }
+            (*parent_ptr).last_child_ = Option::Some(child);
+            Result::Ok(child)
+        }
     }
 
     /// 只统计最新的一个内存链中可分配空间大小，因为其他空间默认不会被提前释放，
@@ -218,6 +271,8 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         value: T,
         object_level: Option<&'static PreDropRecord>,
     ) -> Result<Retain<T>, AllocError> {
+        // 先尝试回收已经静默的关闭域，再分配新对象
+        self.reclaim_pending_();
         // 先定好记录（只读借用），再做需要 &mut self 的分配
         let record = resolve_::<T>(self.root_registry_(), object_level);
         let weak = self.allocate_weak_().ok_or(AllocError)?;
@@ -253,6 +308,8 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         TyEmp: TrEmplace,
     {
         let meta: <TyEmp::Target as ptr::Pointee>::Metadata = emplace.meta_().into();
+        // 先尝试回收已经静默的关闭域，再分配新对象
+        self.reclaim_pending_();
         let record = resolve_::<TyEmp::Target>(self.root_registry_(), object_level);
         let weak = self.allocate_weak_().ok_or(AllocError)?;
         // StrongChunk<T> = { base_: StrongChunkBase, data_: T }；Layout::extend 给出与
@@ -356,6 +413,141 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         self.live_tail_ = Option::None;
         self.reclaim_strong_pools_();
     }
+
+    // -- 代际结构 / 清盘方案 A ----------------------------------------------
+
+    /// 本域是否**静默**：存活链上没有任何仍然活着的数据。
+    ///
+    /// 关闭子树时子域已被逐个摘下并单独入名单，所以这里不用再看 `first_child_`。
+    pub(crate) fn is_quiescent_(&self) -> bool {
+        let mut cursor = self.live_head_;
+        while let Option::Some(weak) = cursor {
+            // SAFETY: 链上的槽位都由本域分配且仍然有效
+            let weak_ref = unsafe { weak.as_ref() };
+            if weak_ref.data_state().is_data_alive() {
+                return false;
+            }
+            cursor = NonNull::new(weak_ref.next_live());
+        }
+        true
+    }
+
+    /// 本域是否可以被真正回收：**句柄已析构 + 已标记关闭 + 静默**。
+    pub(crate) fn is_reclaimable_(&self) -> bool {
+        let wanted = Self::FLAG_CLOSED | Self::FLAG_HANDLE_DROPPED;
+        let flags = self.flags_.load(Ordering::Acquire);
+        flags & wanted == wanted && self.is_quiescent_()
+    }
+
+    /// 把 `node` 追加到 root 的待回收名单尾。
+    ///
+    /// # Safety
+    ///
+    /// `root` 必须是本树的根域，`node` 必须有效且此刻不在名单里。
+    unsafe fn push_pending_(root: NonNull<Self>, node: NonNull<Self>) {
+        // SAFETY: 由调用方保证两个指针有效
+        unsafe {
+            (*node.as_ptr()).pending_next_ = Option::None;
+            match (*root.as_ptr()).pending_tail_ {
+                Option::Some(tail) => (*tail.as_ptr()).pending_next_ = Option::Some(node),
+                Option::None => (*root.as_ptr()).pending_head_ = Option::Some(node),
+            }
+            (*root.as_ptr()).pending_tail_ = Option::Some(node);
+        }
+    }
+
+    /// 非递归地把以 `self` 为根的子树标记关闭、逐个从父链摘下、挂进待回收名单。
+    ///
+    /// 顺序是**子先父后、弟先兄后**（后加入的先入名单）：从 `last_child_` 一路下潜到叶子，
+    /// 摘掉"尾子节点"后再决定回父还是继续下潜。O(节点数) 时间、O(1) 栈，不递归。
+    pub(crate) fn close_subtree_(&mut self) {
+        let root = self.root_scope();
+        let mut cur: *mut Self = self;
+        loop {
+            // 下潜到最"幼"的叶子
+            // SAFETY: cur 始终是子树内的有效节点
+            while let Option::Some(child) = unsafe { (*cur).last_child_ } {
+                cur = child.as_ptr();
+            }
+            // SAFETY: cur 有效
+            let parent = unsafe { (*cur).parent_scope_ };
+            match parent {
+                Option::None => {
+                    // SAFETY: cur 是子树根
+                    unsafe {
+                        (*cur).flags_.fetch_or(Self::FLAG_CLOSED, Ordering::AcqRel);
+                        Self::push_pending_(root, NonNull::new_unchecked(cur));
+                    }
+                    break;
+                }
+                Option::Some(parent) => {
+                    // SAFETY: cur 与 parent 都有效；摘掉尾子节点
+                    unsafe {
+                        let prev = (*cur).prev_sibling_;
+                        (*parent.as_ptr()).last_child_ = prev;
+                        match prev {
+                            Option::Some(prev) => (*prev.as_ptr()).next_sibling_ = Option::None,
+                            Option::None => (*parent.as_ptr()).first_child_ = Option::None,
+                        }
+                        (*cur).prev_sibling_ = Option::None;
+                        (*cur).next_sibling_ = Option::None;
+                        (*cur).parent_scope_ = Option::None;
+                        (*cur).flags_.fetch_or(Self::FLAG_CLOSED, Ordering::AcqRel);
+                        Self::push_pending_(root, NonNull::new_unchecked(cur));
+                    }
+                    // 父还有孩子就继续下潜，否则回父（它现在成了叶子）
+                    cur = match unsafe { (*parent.as_ptr()).last_child_ } {
+                        Option::Some(child) => child.as_ptr(),
+                        Option::None => parent.as_ptr(),
+                    };
+                }
+            }
+        }
+    }
+
+    /// 尝试回收待回收名单里已经可回收的域。可在任意 `put` 之前或 `collect` 时调用。
+    pub(crate) fn reclaim_pending_(&mut self) {
+        let root = self.root_scope();
+        let mut prev: Option<NonNull<Self>> = Option::None;
+        // SAFETY: root 有效；名单上的链接都指向有效节点
+        let mut cursor = unsafe { (*root.as_ptr()).pending_head_ };
+        while let Option::Some(node) = cursor {
+            // SAFETY: node 有效
+            let next = unsafe { (*node.as_ptr()).pending_next_ };
+            if unsafe { node.as_ref() }.is_reclaimable_() {
+                // SAFETY: prev / root / node 都有效；摘下后立刻释放
+                unsafe {
+                    match prev {
+                        Option::Some(prev) => (*prev.as_ptr()).pending_next_ = next,
+                        Option::None => (*root.as_ptr()).pending_head_ = next,
+                    }
+                    if (*root.as_ptr()).pending_tail_ == Option::Some(node) {
+                        (*root.as_ptr()).pending_tail_ = prev;
+                    }
+                    (*node.as_ptr()).pending_next_ = Option::None;
+                    Self::destroy_scope_(node);
+                }
+            } else {
+                prev = Option::Some(node);
+            }
+            cursor = next;
+        }
+    }
+
+    /// 释放一个已经可回收的域：`flush_` 归还弱槽位并回收强池，再把 `ScopeInner` 还给分配器。
+    ///
+    /// # Safety
+    ///
+    /// `node` 必须已经静默（没有存活对象），否则会强制析构仍被引用的数据。
+    unsafe fn destroy_scope_(mut node: NonNull<Self>) {
+        // SAFETY: 由调用方保证静默
+        let node_ref = unsafe { node.as_mut() };
+        // SAFETY: 已静默，flush_ 不会析构仍被引用的数据
+        unsafe { node_ref.flush_() };
+        let alloc = node_ref.allocator_;
+        // SAFETY: node 由同一个分配器按 `Layout::new::<Self>()` 分配
+        unsafe { alloc.deallocate(node.cast::<u8>(), Layout::new::<Self>()) };
+    }
 }
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -433,8 +625,15 @@ where
         root_scope_mut.allocator_ = allocator;
         let alloc: &'static dyn Allocator = &mut root_scope_mut.allocator_;
         root_scope_mut.scope_inner_ = ScopeInner {
-            children_num_: AtomicUsize::new(0usize),
+            flags_: AtomicUsize::new(0usize),
             parent_scope_: Option::None,
+            prev_sibling_: Option::None,
+            next_sibling_: Option::None,
+            first_child_: Option::None,
+            last_child_: Option::None,
+            pending_head_: Option::None,
+            pending_tail_: Option::None,
+            pending_next_: Option::None,
             chain_head_: Option::None,
             chain_tail_: Option::None,
             live_head_: Option::None,

@@ -9,6 +9,10 @@ description = "支持分区和依靠强弱引用管理的 Arena 分配器"
 core-alloc = []
 std = []
 
+# 开启后，向已被标记清盘的 Scope 放入数据会返回 `ScopeError::ClosedScope`；
+# 默认（不开启）则忽略清盘标记、照常放入。
+strict-put-after-close = []
+
 default = ["core-alloc"]
 
 # 对照实验 crate：独立 workspace，引用 bumpalo 以实证析构语义。
