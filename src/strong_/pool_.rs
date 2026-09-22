@@ -89,6 +89,9 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
     }
 
     /// 本池已经用掉的 cell 数。
+    ///
+    /// 目前只有单元测试读它；留着作为池占用量的诊断入口。
+    #[allow(dead_code)]
     pub(crate) const fn used_count_(&self) -> PoolIndex {
         self.used_count_
     }

@@ -120,3 +120,42 @@ fn registry_is_shared_across_child_scopes() {
         "子域注册的类型级钩子对父域对象也必须生效"
     );
 }
+
+/// 清盘用例的类型级钩子与析构探针计数。
+static C_HOOKED: AtomicUsize = AtomicUsize::new(0);
+static C_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+struct TypeLevelC;
+impl Drop for TypeLevelC {
+    fn drop(&mut self) {
+        C_DROPPED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+fn hook_c(_: &mut TypeLevelC) {
+    C_HOOKED.fetch_add(1, Ordering::AcqRel);
+}
+
+/// 验证清盘的保证路径：对象仍被句柄持有时，`collect()` 也会强制跑 `PreDrop` 并析构它。
+/// - 手段：注册类型级钩子，放入一个实例并用 `ManuallyDrop` 扣住其句柄，然后调用 `collect()`。
+/// - 判断：钩子与 `Drop` 计数都恰为 1。若没有来源 (b)，句柄被扣住就永远等不到"最后一个引用
+///   释放"，两个计数都会是 0。
+#[test]
+fn collect_forces_pre_drop_for_still_alive_objects() {
+    let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
+    C_HOOKED.store(0, Ordering::Release);
+    C_DROPPED.store(0, Ordering::Release);
+
+    let mut scope = Scope::new();
+    scope
+        .set_pre_drop::<TypeLevelC, _>(hook_c)
+        .expect("注册类型级钩子应当成功");
+    // 用 ManuallyDrop 扣住句柄，模拟"引用一直不放"的情形
+    let _leaked = core::mem::ManuallyDrop::new(scope.put(TypeLevelC));
+    assert_eq!(C_HOOKED.load(Ordering::Acquire), 0);
+
+    // SAFETY: 清盘之后不再使用 _leaked
+    unsafe { scope.collect() };
+
+    assert_eq!(C_HOOKED.load(Ordering::Acquire), 1, "清盘必须强制跑 PreDrop");
+    assert_eq!(C_DROPPED.load(Ordering::Acquire), 1, "清盘必须强制析构数据");
+}

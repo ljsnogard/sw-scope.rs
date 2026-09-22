@@ -71,6 +71,22 @@ impl Scope {
         Scope { inner_ptr_: inner }
     }
 
+    /// 显式清盘：遍历本域存活链，把仍然活着的数据逐个 `PreDrop` + 析构，再整块回收强池。
+    ///
+    /// 这是"清理列表"的保证来源 (b)：环、`mem::forget`、泄漏句柄导致的"永远等不到最后一个
+    /// 引用释放"都由它兜底。
+    ///
+    /// # Safety
+    ///
+    /// 调用后本域所有对象的句柄（`Retain` / `Owning` / `Sharing`）都会悬空；调用方必须保证
+    /// 此后不再使用它们。见 `dev-notes/weak-20260922-1135.md` §2.4。
+    pub unsafe fn collect(&mut self) {
+        // SAFETY: 由调用方保证清盘后不再使用本域的句柄
+        let inner = unsafe { self.inner_ptr_.as_mut() };
+        // SAFETY: 同上
+        unsafe { inner.flush_() };
+    }
+
     /// 创建一个子域，该子域将拥有独立的内存池和自身的生命周期。
     #[inline]
     pub fn child_scope(&self) -> Scope {

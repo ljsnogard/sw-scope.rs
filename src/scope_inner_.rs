@@ -167,11 +167,6 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         self.live_tail_ = Option::Some(weak);
     }
 
-    /// 存活链链头。
-    pub(crate) const fn live_head_(&self) -> Option<NonNull<WeakChunk<()>>> {
-        self.live_head_
-    }
-
     /// 整棵树共享的类型级 `PreDrop` 注册表（只读）。
     pub(crate) fn root_registry_(&self) -> Option<&'static PreDropRegistry> {
         let root = self.root_scope();
@@ -253,6 +248,36 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         }
         self.chain_head_ = Option::None;
         self.chain_tail_ = Option::None;
+    }
+
+    /// 清盘的保证路径（来源 (b)）：遍历存活链，把**仍然活着**的对象逐个 `PreDrop` + 析构，
+    /// 然后整块回收强池。
+    ///
+    /// 与来源 (a) 共用同一个 `try_claim_destroy` 认领 CAS：级联析构或并发 `drop` 已经处理过
+    /// 的槽位会认领失败，这里直接跳过，因此"恰好一次"仍然成立。弱槽位本身留在树共享的弱池里
+    /// （归还槽位待后续补）。
+    ///
+    /// # Safety
+    ///
+    /// 调用后本域中所有对象的句柄都会悬空；调用方必须保证此后不再使用它们。
+    pub(crate) unsafe fn flush_(&mut self) {
+        let mut cursor = self.live_head_;
+        while let Option::Some(weak) = cursor {
+            // SAFETY: 链上的槽位都由本域分配且仍然有效
+            let weak_ref = unsafe { weak.as_ref() };
+            cursor = NonNull::new(weak_ref.next_live());
+            if weak_ref.chunk_state_.try_claim_destroy().is_some() {
+                // SAFETY: 刚由本调用认领成功，恰好执行一次
+                unsafe { weak_ref.drop_data() };
+                weak_ref.chunk_state_.mark_destroyed();
+            }
+            weak_ref.chunk_state_.mark_finalized();
+            weak_ref.set_prev_live(ptr::null_mut());
+            weak_ref.set_next_live(ptr::null_mut());
+        }
+        self.live_head_ = Option::None;
+        self.live_tail_ = Option::None;
+        self.reclaim_strong_pools_();
     }
 }
 
