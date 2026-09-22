@@ -874,7 +874,7 @@ pub(crate) fn meta_to_raw_<M>(meta: M) -> *const () {
 /// # Safety
 ///
 /// `raw` 必须是用同一个 `T` 经 [`meta_to_raw_`] 得到的值。
-unsafe fn raw_to_meta_<T: ?Sized + ptr::Pointee>(raw: *const ()) -> T::Metadata {
+pub(crate) unsafe fn raw_to_meta_<T: ?Sized + ptr::Pointee>(raw: *const ()) -> T::Metadata {
     if mem::size_of::<T::Metadata>() == 0 {
         // 与 meta_to_raw_ 对称：零宽元数据不必搬运
         return unsafe { mem::MaybeUninit::<T::Metadata>::zeroed().assume_init() };
