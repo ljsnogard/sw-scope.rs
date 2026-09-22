@@ -121,6 +121,18 @@ where
         self.base_.strong_count()
     }
 
+    /// 增加强引用计数（`Sharing::clone`）。
+    #[inline]
+    pub(crate) fn incr_strong_count(&self) -> u32 {
+        self.base_.incr_strong_count()
+    }
+
+    /// 减少强引用计数并返回减少后的值（`Sharing::drop`）。
+    #[inline]
+    pub(crate) fn decr_strong_count(&self) -> u32 {
+        self.base_.decr_strong_count()
+    }
+
     /// 数据仍然活着时返回其引用。
     ///
     /// 数据区地址与 `?Sized` 的元数据都记在身份槽位上，因此这里经由它重建引用。

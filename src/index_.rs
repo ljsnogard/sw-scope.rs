@@ -5,8 +5,11 @@ use core::{
 
 use crate::{
     strong_::StrongChunk,
-    weak_::WeakChunk,
+    weak_::{DataState, WeakChunk},
 };
+
+#[cfg(test)]
+mod tests_;
 
 /// Like Box<T> but scoped.
 pub struct Owning<'a, T>
@@ -43,7 +46,7 @@ impl<'a, T> Owning<'a, T>
 where
     T: 'a + ?Sized,
 {
-    const fn new(chunk: NonNull<StrongChunk<T>>) -> Self {
+    pub(crate) const fn new(chunk: NonNull<StrongChunk<T>>) -> Self {
         Owning {
             strong_chunk_: chunk,
             _lifetime_a_: PhantomData,
@@ -83,6 +86,32 @@ where
     U: ?Sized,
 {}
 
+impl<'a, T> Drop for Owning<'a, T>
+where
+    T: 'a + ?Sized,
+{
+    /// `Owning` 析构只**归还访问权**，不析构数据。
+    ///
+    /// 这样 README 的"`Owning` 析构后还能再次 `try_owning`"才成立：只要 `Retain` 还在，
+    /// 数据就仍然活着。真正终结数据要等"最后一个 `Retain` 也消失"（确定性来源 (a)）或清盘
+    /// （保证来源 (b)），见 `dev-notes/weak-20260922-1135.md` §2。
+    fn drop(&mut self) {
+        // SAFETY: Owning 持有强块指针，强块活着时身份槽位也活着
+        let chunk = unsafe { self.strong_chunk_.as_ref() };
+        // SAFETY: 同上
+        let weak = unsafe { chunk.weak_chunk().as_ref() };
+        debug_assert!(
+            weak.weak_count() > 0,
+            "Owning 必然借用自某个 Retain，弱计数不该是 0"
+        );
+        let _ = weak
+            .chunk_state_
+            .compare_exchange_state(DataState::Owning, DataState::Created);
+        // 正常路径下弱计数 > 0，这里不会触发；保留判断以覆盖泄漏 / unsafe 组合
+        let _ = claim_and_destroy_if_unreachable_(weak);
+    }
+}
+
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
@@ -90,7 +119,7 @@ impl<'a, T> Sharing<'a, T>
 where
     T: 'a + ?Sized,
 {
-    const fn new(chunk: NonNull<StrongChunk<T>>) -> Self {
+    pub(crate) const fn new(chunk: NonNull<StrongChunk<T>>) -> Self {
         Sharing {
             strong_chunk_: chunk,
             _lifetime_a_: PhantomData,
@@ -121,8 +150,15 @@ impl<'a, T> Clone for Sharing<'a, T>
 where
     T: 'a + ?Sized,
 {
+    /// 复制一个共享句柄：只把强计数加 1。
     fn clone(&self) -> Self {
-        todo!("increase strong count")
+        // SAFETY: Sharing 持有强块指针，强块活着时它有效
+        let chunk = unsafe { self.strong_chunk_.as_ref() };
+        chunk.incr_strong_count();
+        Sharing {
+            strong_chunk_: self.strong_chunk_,
+            _lifetime_a_: PhantomData,
+        }
     }
 }
 
@@ -130,8 +166,22 @@ impl<'a, T> Drop for Sharing<'a, T>
 where
     T: 'a + ?Sized,
 {
+    /// 释放一个共享句柄：强计数减 1。
+    ///
+    /// **归零不析构数据**，只把状态还给 `Created`（`Retain` 还在，数据仍应活着）；
+    /// 只有"强计数归零且弱计数也为 0"这种组合才顺带走确定性析构。
     fn drop(&mut self) {
-        todo!()
+        // SAFETY: 同上
+        let chunk = unsafe { self.strong_chunk_.as_ref() };
+        if chunk.decr_strong_count() != 0 {
+            return;
+        }
+        // SAFETY: 同上
+        let weak = unsafe { chunk.weak_chunk().as_ref() };
+        let _ = weak
+            .chunk_state_
+            .compare_exchange_state(DataState::Sharing, DataState::Created);
+        let _ = claim_and_destroy_if_unreachable_(weak);
     }
 }
 
@@ -142,6 +192,8 @@ impl<T> Retain<T>
 where
     T: ?Sized,
 {
+    /// 构造一个句柄。分配管线（Batch 2）落地前，生产路径还没有调用点。
+    #[allow(dead_code)]
     pub(crate) const fn new(chunk: NonNull<WeakChunk<T>>) -> Self {
         Retain { weak_chunk_: chunk }
     }
@@ -167,8 +219,14 @@ impl<T> Clone for Retain<T>
 where
     T: ?Sized,
 {
+    /// 复制一个句柄：弱计数加 1。
     fn clone(&self) -> Self {
-        todo!("increase weak count")
+        // SAFETY: Retain 自己保证 WeakChunk 活着
+        let weak = unsafe { self.weak_chunk_.as_ref() };
+        weak.incr_weak_count();
+        Retain {
+            weak_chunk_: self.weak_chunk_,
+        }
     }
 }
 
@@ -176,9 +234,34 @@ impl<T> Drop for Retain<T>
 where
     T: ?Sized,
 {
+    /// 释放一个句柄：弱计数减 1；减到 0 时尝试走"确定性析构"。
     fn drop(&mut self) {
-        todo!()
+        // SAFETY: Retain 自己保证 WeakChunk 活着；T 只影响类型，不影响槽位布局
+        let weak = unsafe { self.weak_chunk_.cast::<WeakChunk<()>>().as_ref() };
+        if weak.decr_weak_count() != 0 {
+            return;
+        }
+        // 弱计数归零：若此刻没有强引用（状态为 Created），立即走来源 (a)。
+        // 若状态仍是 Owning / Sharing（只可能来自泄漏或 unsafe），留给清盘。
+        let _ = claim_and_destroy_if_unreachable_(weak);
     }
+}
+
+/// 走"确定性析构"来源 (a)：当且仅当"弱计数为 0 且状态为 `Created`"时认领并执行清理。
+///
+/// 这是三处引用计数收尾（`Owning::drop` / `Sharing::drop` / `Retain::drop`）共用的判断，
+/// 保证"恰好销毁一次"只由 `try_claim_destroy` 的 CAS 裁决。返回本次是否完成了析构。
+fn claim_and_destroy_if_unreachable_(weak: &WeakChunk<()>) -> bool {
+    if weak.weak_count() != 0 || weak.data_state() != DataState::Created {
+        return false;
+    }
+    if weak.chunk_state_.try_claim_destroy().is_none() {
+        return false;
+    }
+    // SAFETY: 刚由本调用认领成功，且本路径恰好执行一次
+    unsafe { weak.drop_data() };
+    weak.chunk_state_.mark_destroyed();
+    true
 }
 
 /// 把"类型擦除后的强块头部指针"还原成 `NonNull<StrongChunk<T>>`。

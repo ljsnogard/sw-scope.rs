@@ -13,6 +13,7 @@ fn demo() {
     fn owning_somewhere(retain: Retain<usize>) -> Retain<usize> {
         let mut x = retain.try_owning().unwrap();
         *x = 58;
+        drop(x); // `Owning` 实现了 Drop，借用持续到它被析构
         retain
     }
 

@@ -9,6 +9,8 @@ fn demo() {
     fn owning_somewhere(retain: Retain<usize>) -> Retain<usize> {
         let mut x = retain.try_owning().unwrap();
         *x = 58;
+        // `Owning` 现在实现了 Drop，因此借用持续到它被析构；要归还 retain 必须先放手
+        drop(x);
         retain
     }
 

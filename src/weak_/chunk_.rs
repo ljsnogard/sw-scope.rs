@@ -603,26 +603,34 @@ where
         }
     }
 
-    /// 尝试把 `Retain` 的持有关系升级为 `Sharing`，并把强引用计数置 1。
+    /// 尝试把 `Retain` 的持有关系升级为 `Sharing`。
+    ///
+    /// - 状态为 `Created`：置为 `Sharing` 并把强计数置 1；
+    /// - 状态已经是 `Sharing`：只把强计数加 1。这条**幂等增量**是 README 使用思路里
+    ///   "泄漏一个 `Sharing` 之后仍能继续共享"的依据。
     ///
     /// # Errors
     ///
-    /// 状态不是 `Created` 时返回当前状态。
+    /// 数据已被 `Owning` 独占、或已被销毁 / 回收时返回当前状态。
     pub fn try_sharing(&self) -> Result<NonNull<StrongChunkBase>, DataState> {
         let Some(chunk) = self.strong_chunk() else {
             return Result::Err(self.data_state());
         };
-        match self
+        if self
             .chunk_state_
             .compare_exchange_state(DataState::Created, DataState::Sharing)
+            .is_some()
         {
-            Option::Some(_) => {
-                // SAFETY: 强块与身份槽位互相绑定，chunk 有效
-                unsafe { &*chunk.as_ptr() }.incr_strong_count();
-                Result::Ok(chunk)
-            }
-            Option::None => Result::Err(self.data_state()),
+            // SAFETY: 强块与身份槽位互相绑定，chunk 有效
+            unsafe { &*chunk.as_ptr() }.incr_strong_count();
+            return Result::Ok(chunk);
         }
+        if self.data_state() == DataState::Sharing {
+            // SAFETY: 同上
+            unsafe { &*chunk.as_ptr() }.incr_strong_count();
+            return Result::Ok(chunk);
+        }
+        Result::Err(self.data_state())
     }
 
     // -- 池的维护 -----------------------------------------------------------
