@@ -10,6 +10,8 @@ use crate::{
     strong_::{StrongChunk, StrongChunkBase},
 };
 
+use super::pre_drop_::PreDropRecord;
+
 /// 一次 CAS 的三种结局，语义对齐 `atomic_sync` 所用的 `atomex::CmpxchResult`。
 ///
 /// 区分三者是为了让重试循环能判断"继续用旧值重试"还是"必须重新读状态"。本 crate 目前
@@ -40,49 +42,6 @@ impl<T> CmpxchResult<T> {
     }
 }
 
-/// 重建并析构某个 `T` 所需的元数据。
-///
-/// 弱槽位是**生命周期最长**的一环（见 [`WeakChunk`] 的文档），因此把"如何析构一块数据"
-/// 这类用户日常访存不会接触的信息放在这里：既不占用 `StrongPool` 里的 arena 空间，
-/// 也不会因为强块数据区消失而失效。
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct DropVtable {
-    /// 单态化的析构入口，接收"数据区裸地址 + 类型元数据"。
-    ///
-    /// 类型元数据在 `T: Sized` 时为空指针；`?Sized` 时是虚表指针或切片长度，
-    /// 由入口内部还原成胖指针后 `drop_in_place`。
-    pub(crate) drop_fn_: Option<unsafe fn(*mut u8, *const ())>,
-    /// 数据区起址。
-    pub(crate) data_: *mut u8,
-    /// `T: ?Sized` 的类型元数据；`Sized` 时为空。
-    pub(crate) meta_: *const (),
-}
-
-impl DropVtable {
-    /// 空登记：表示该槽位还没有承载任何需要析构的数据。
-    pub(crate) const fn empty_() -> Self {
-        DropVtable {
-            drop_fn_: Option::None,
-            data_: ptr::null_mut(),
-            meta_: ptr::null(),
-        }
-    }
-
-    /// 登记一块需要（或不需要）析构的数据。
-    pub(crate) const fn new_(
-        drop_fn_: Option<unsafe fn(*mut u8, *const ())>,
-        data_: *mut u8,
-        meta_: *const (),
-    ) -> Self {
-        DropVtable {
-            drop_fn_,
-            data_,
-            meta_,
-        }
-    }
-}
-
 /// 弱引用槽位。它既是 `Retain<T>` 的持有对象，也是**对象的身份与生命周期上下文**。
 ///
 /// # 为什么它是最长寿的一环
@@ -94,8 +53,8 @@ impl DropVtable {
 /// > 数据还活着 ⇒ 至少有一个 `Retain` 活着 ⇒ 这个 `WeakChunk` 还活着。
 ///
 /// 这条不等式是后续所有设计的地基：
-/// - 存活链的链接、类型擦除析构的登记都可以安全地放在弱槽位里——强块的数据区活着的整个
-///   期间，弱槽位都不可能被回收复用；
+/// - 存活链的链接、清理登记都可以安全地放在弱槽位里——强块的数据区活着的整个期间，
+///   弱槽位都不可能被回收复用；
 /// - `?Sized` 的析构也因此可行：重建胖指针所需的元数据有地方长期保存。
 ///
 /// # 何时可以被回收
@@ -121,8 +80,14 @@ where
     pub(crate) next_live_: AtomicPtr<WeakChunk<()>>,
     /// 本槽位对应的强块。数据的析构与访问都要经过它。
     pub(crate) strong_chunk_: AtomicPtr<StrongChunkBase>,
-    /// 类型擦除析构登记。
-    pub(crate) drop_: DropVtable,
+    /// 类型擦除的清理登记，指向**每类型一份**的 [`PreDropRecord`]；空闲槽位为 [`None`]。
+    ///
+    /// 记录里不含数据区地址：它由 `strong_chunk_` 首址加上单态化入口自己算出的偏移重建。
+    pub(crate) record_: Option<&'static PreDropRecord>,
+    /// `T: ?Sized` 的类型元数据（切片长度 / 虚表）；`Sized` 时为空。
+    ///
+    /// 这是**逐对象**信息，所以不能进"每类型一份"的记录里，只能留在槽位上。
+    pub(crate) meta_: *const (),
     /// `T` 只在类型上区分，不参与布局。
     pub(crate) _unused_t_: PhantomData<NonNull<StrongChunk<T>>>,
 }
@@ -534,70 +499,50 @@ where
         self.strong_chunk_.store(chunk, Ordering::Release);
     }
 
-    /// 登记类型擦除析构所需的信息。
+    /// 登记类型擦除的清理信息：调用方已经算好了有效登记与 `?Sized` 元数据。
     ///
-    /// `data` 是刚就地构造好的真实引用，因此这里能安全地取出 `?Sized` 的类型元数据，
-    /// 让清盘流程之后能重建胖指针并把数据析构掉。
-    pub fn set_drop_info(&mut self, data: *mut T) {
-        let drop_fn_ = if mem::needs_drop::<T>() {
-            Option::Some(drop_in_place_entry_::<T> as unsafe fn(*mut u8, *const ()))
-        } else {
-            Option::None
-        };
-        self.drop_ = DropVtable::new_(
-            drop_fn_,
-            data.cast::<u8>(),
-            meta_to_raw_(ptr::metadata(data as *const T)),
-        );
-    }
-
-    /// 登记类型擦除析构信息：调用方已经算好了数据区地址与类型元数据。
-    ///
-    /// 类型无关的调用方（例如 `StrongChunk`）走这个入口：在那里有具体的 `T`，可以算出
-    /// 单态化的析构入口与元数据。
-    pub(crate) fn set_drop_info_erased_(
+    /// 类型相关的调用方（例如 `StrongChunk`）走这个入口：在那里有具体的 `T`，可以算出
+    /// 每类型一份的 [`PreDropRecord`] 与元数据。
+    pub(crate) fn set_record_erased_(
         &mut self,
-        drop_fn_: Option<unsafe fn(*mut u8, *const ())>,
-        data_: *mut u8,
+        record_: Option<&'static PreDropRecord>,
         meta_: *const (),
     ) {
-        self.drop_ = DropVtable::new_(drop_fn_, data_, meta_);
+        self.record_ = record_;
+        self.meta_ = meta_;
     }
 
-    /// 本槽位的析构登记。
-    #[inline]
-    pub(crate) fn drop_vtable(&self) -> DropVtable {
-        self.drop_
-    }
-
-    /// 从登记信息就地析构数据。只有状态机认领成功后才允许调用。
+    /// 按登记执行清理：先跑 `PreDrop` 钩子，再析构数据。
     ///
     /// # Safety
     ///
     /// 必须先由状态机认领销毁，且恰好调用一次。
     pub(crate) unsafe fn drop_data(&self) {
-        let Option::Some(drop_fn) = self.drop_.drop_fn_ else {
+        let Option::Some(record) = self.record_ else {
             return;
         };
-        // SAFETY: 由调用方保证已认领且尚未析构；登记信息来自同一块数据
-        unsafe { drop_fn(self.drop_.data_, self.drop_.meta_) };
+        let base = self.strong_chunk_.load(Ordering::Acquire);
+        debug_assert!(!base.is_null(), "清理时强块指针必须已经绑定");
+        // SAFETY: 由调用方保证已认领且尚未析构；登记与元数据来自同一块数据
+        unsafe { record.run_(base.cast::<u8>(), self.meta_) };
     }
 
     // -- 数据访问（按 U 重建，支持 ?Sized）---------------------------------
 
     /// 按 `U` 重建数据引用。调用方必须保证数据仍然活着。
     ///
-    /// 之所以能从"对 `T` 一无所知"的槽位上重建任意 `U`：数据区地址与 `?Sized` 的元数据
-    /// 都由槽位的析构登记给出，两者合起来就是当初那块数据的胖指针。
+    /// 数据区地址不再单独保存：由强块首址 + 单态化入口自己算出的偏移重建；`?Sized` 的元数据
+    /// 则来自槽位自己的 `meta_`。
     ///
     /// # Safety
     ///
     /// 数据必须尚未析构，且 `U` 必须与当初分配的 `T` 是同一个类型。
     pub(crate) unsafe fn data_ref_as<U: ?Sized + ptr::Pointee>(&self) -> &U {
-        let data = self.drop_.data_;
-        let meta = unsafe { raw_to_meta_::<U>(self.drop_.meta_) };
+        let base = self.strong_chunk_.load(Ordering::Acquire);
         // SAFETY: 由调用方保证数据尚未析构；元数据来自同一次分配的登记
-        unsafe { &*ptr::from_raw_parts::<U>(data as *const (), meta) }
+        let data = unsafe { data_ptr_of_::<U>(base.cast::<u8>(), self.meta_) };
+        // SAFETY: 由调用方保证数据尚未析构
+        unsafe { &*data }
     }
 
     /// 按 `U` 重建数据可变引用。
@@ -606,10 +551,11 @@ where
     ///
     /// 同 [`WeakChunk::data_ref_as`]，且调用方必须保证独占访问。
     pub(crate) unsafe fn data_ref_mut_as<U: ?Sized + ptr::Pointee>(&mut self) -> &mut U {
-        let data = self.drop_.data_;
-        let meta = unsafe { raw_to_meta_::<U>(self.drop_.meta_) };
+        let base = self.strong_chunk_.load(Ordering::Acquire);
         // SAFETY: 由调用方保证数据尚未析构且独占
-        unsafe { &mut *ptr::from_raw_parts_mut::<U>(data as *mut (), meta) }
+        let data = unsafe { data_ptr_of_::<U>(base.cast::<u8>(), self.meta_) };
+        // SAFETY: 由调用方保证数据尚未析构且独占
+        unsafe { &mut *data }
     }
 
     // -- 存活链 -------------------------------------------------------------
@@ -681,7 +627,7 @@ where
 
     // -- 池的维护 -----------------------------------------------------------
 
-    /// 把槽位串成空闲链的一环，并清掉上一轮使用留下的状态与析构登记。
+    /// 把槽位串成空闲链的一环，并清掉上一轮使用留下的状态与清理登记。
     ///
     /// 仅供 `WeakPool` 在归还槽位时调用。
     pub(crate) fn link_as_freed(&mut self, next: PoolIndex) {
@@ -690,7 +636,8 @@ where
         self.set_strong_chunk(ptr::null_mut());
         self.set_prev_live(ptr::null_mut());
         self.set_next_live(ptr::null_mut());
-        self.drop_ = DropVtable::empty_();
+        self.record_ = Option::None;
+        self.meta_ = ptr::null();
     }
 
     /// 初始化一整段从未使用过的槽位，是 `WeakPool` 构造期唯一的槽位入口。
@@ -698,7 +645,7 @@ where
     /// - 按数组下标写死 `pool_order_`，此后终生只读；
     /// - 把空闲链接串成顺序链：`i` 指向 `i + 1`，末位指向 `capacity`，于是分配路径
     ///   无须区分「从未分配过的槽位」与「归还回来的槽位」；
-    /// - 把状态、计数、存活链链接与析构登记一律拉到干净初值（分配器给的是未初始化内存）。
+    /// - 把状态、计数、存活链链接与清理登记一律拉到干净初值（分配器给的是未初始化内存）。
     ///
     /// # Panics
     ///
@@ -724,7 +671,8 @@ where
             slot.set_strong_chunk(ptr::null_mut());
             slot.set_prev_live(ptr::null_mut());
             slot.set_next_live(ptr::null_mut());
-            slot.drop_ = DropVtable::empty_();
+            slot.record_ = Option::None;
+            slot.meta_ = ptr::null();
         }
     }
 }
@@ -737,7 +685,7 @@ where
 /// # 它与状态 CAS 的分工
 ///
 /// `weak_state_` 里的状态迁移 CAS 只保证**"状态迁移唯一"**；而升级/初始化路径要保护的
-/// 是一组彼此相关的写：弱引用计数、`strong_chunk_`、`drop_` 登记、以及强块的强计数。
+/// 是一组彼此相关的写：弱引用计数、`strong_chunk_`、清理登记 `record_`、以及强块的强计数。
 /// 这些字段不在同一个字里，CAS 管不住它们的组合，于是需要本守卫把"读判据 + 一组写"
 /// 合成一个临界区：
 ///
@@ -893,7 +841,7 @@ pub(crate) unsafe fn raw_to_meta_<T: ?Sized + ptr::Pointee>(raw: *const ()) -> T
 
 /// 读取弱槽位登记的 `?Sized` 类型元数据（`Sized` 时为空）。
 pub(crate) fn meta_of_(weak: &WeakChunk<()>) -> *const () {
-    weak.drop_.meta_
+    weak.meta_
 }
 
 /// [`meta_of_`] 的逆操作：把裸元数据还原成 `T` 的元数据。
@@ -906,22 +854,18 @@ pub(crate) unsafe fn meta_from_raw_<T: ?Sized + ptr::Pointee>(raw: *const ()) ->
     unsafe { raw_to_meta_::<T>(raw) }
 }
 
-/// 取出 `T` 的单态化析构入口，供类型无关的持有者在登记析构信息时使用。
-pub(crate) fn drop_entry_<T: ?Sized>() -> unsafe fn(*mut u8, *const ()) {
-    drop_in_place_entry_::<T> as unsafe fn(*mut u8, *const ())
-}
-
-/// 单态化的析构入口：把类型擦除掉的地址与元数据还原成 `*mut T` 再 `drop_in_place`。
+/// 由"强块首址 + `?Sized` 元数据"还原数据区指针。
 ///
-/// `?Sized` 的 `T` 需要重建胖指针，这正是把元数据一起存进弱槽位的原因。
+/// `StrongChunk<T>` 的 `base_` 在偏移 0，因此强块首址与 `StrongChunk<T>` 首址相同；数据区
+/// 偏移交给编译器在这个单态化里算，所以清理登记里不必保存数据地址。
 ///
 /// # Safety
 ///
-/// `data` 与 `meta` 必须来自同一块 `StrongChunk<T>` 的数据区，且该数据的 `Drop` 尚未执行。
-unsafe fn drop_in_place_entry_<T: ?Sized>(data: *mut u8, meta: *const ()) {
+/// `base` 必须是 `StrongChunk<T>` 的首地址，`meta` 必须来自同一次分配登记。
+pub(crate) unsafe fn data_ptr_of_<T: ?Sized>(base: *mut u8, meta: *const ()) -> *mut T {
     let meta = unsafe { raw_to_meta_::<T>(meta) };
-    // SAFETY: 由调用方保证地址与元数据匹配
-    let ptr = unsafe { ptr::from_raw_parts_mut::<T>(data as *mut (), meta) };
-    // SAFETY: 由调用方保证该数据尚未析构
-    unsafe { ptr::drop_in_place(ptr) };
+    // SAFETY: base 是 StrongChunk<T> 的首地址，meta 与之一致
+    let chunk = ptr::from_raw_parts_mut::<StrongChunk<T>>(base.cast::<()>(), meta);
+    // SAFETY: 同上
+    unsafe { (*chunk).data_ptr() }
 }

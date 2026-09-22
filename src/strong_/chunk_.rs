@@ -177,14 +177,14 @@ where
         // SAFETY: weak_chunk 是本对象的身份槽位，且此刻独占使用
         let weak = unsafe { &mut *(weak_chunk.as_ptr() as *mut WeakChunk<T>) };
         weak.set_strong_chunk(base);
-        // 在这里（有具体 T 的地方）算出析构入口与元数据，再交给类型无关的弱槽位保管
-        let drop_fn_ = if mem::needs_drop::<T>() {
-            Option::Some(crate::weak_::drop_entry_::<T>())
+        // 在这里（有具体 T 的地方）取到"每类型一份"的清理登记，再交给类型无关的弱槽位保管
+        let record_ = if mem::needs_drop::<T>() {
+            Option::Some(crate::weak_::PreDropRecord::of::<T>())
         } else {
             Option::None
         };
         let meta_ = crate::weak_::meta_to_raw_(ptr::metadata(data as *const T));
-        weak.set_drop_info_erased_(drop_fn_, data.cast::<u8>(), meta_);
+        weak.set_record_erased_(record_, meta_);
     }
 }
 

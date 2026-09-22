@@ -12,9 +12,7 @@
 
 use core::{mem, ptr};
 
-use crate::strong_::StrongChunk;
-
-use super::chunk_::raw_to_meta_;
+use super::chunk_::data_ptr_of_;
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- 记录
@@ -115,10 +113,8 @@ fn zst_value_<Fin>() -> Fin {
 ///
 /// `base` 必须是 `StrongChunk<T>` 的首地址，`meta` 必须来自同一次分配，数据尚未析构。
 unsafe fn drop_entry_<T: ?Sized>(base: *mut u8, meta: *const ()) {
-    let meta = unsafe { raw_to_meta_::<T>(meta) };
-    // SAFETY: base 是 StrongChunk<T> 首地址（base_ 在偏移 0），meta 来自同一次分配
-    let chunk = ptr::from_raw_parts_mut::<StrongChunk<T>>(base.cast::<()>(), meta);
-    let data = unsafe { (*chunk).data_ptr() };
+    // SAFETY: 调用方保证 base/meta 来自同一块 StrongChunk<T>，且数据尚未析构
+    let data = unsafe { data_ptr_of_::<T>(base, meta) };
     // SAFETY: 调用方保证数据尚未析构
     unsafe { ptr::drop_in_place(data) };
 }
@@ -132,10 +128,8 @@ unsafe fn pre_drop_entry_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(
     base: *mut u8,
     meta: *const (),
 ) {
-    let meta = unsafe { raw_to_meta_::<T>(meta) };
-    // SAFETY: base 是 StrongChunk<T> 首地址，meta 来自同一次分配
-    let chunk = ptr::from_raw_parts_mut::<StrongChunk<T>>(base.cast::<()>(), meta);
-    let data = unsafe { (*chunk).data_ptr() };
+    // SAFETY: 调用方保证 base/meta 来自同一块 StrongChunk<T>，且数据尚未析构
+    let data = unsafe { data_ptr_of_::<T>(base, meta) };
     let hook = zst_value_::<Fin>();
     // SAFETY: 调用方保证数据尚未析构
     hook(unsafe { &mut *data });

@@ -6,7 +6,7 @@ use core::{
 };
 
 use super::*;
-use crate::weak_::{DataState, DropVtable, WeakChunk, WeakChunkState};
+use crate::weak_::{DataState, WeakChunk, WeakChunkState};
 
 /// 造一个仅用于测试的"身份槽位"：栈上的 `WeakChunk<()>`，并推进到 `Created`，
 /// 模拟一次成功分配之后的状态。
@@ -16,7 +16,8 @@ fn make_identity_() -> WeakChunk<()> {
         prev_live_: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         next_live_: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         strong_chunk_: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        drop_: DropVtable::empty_(),
+        record_: Option::None,
+        meta_: core::ptr::null(),
         _unused_t_: core::marker::PhantomData,
     };
     // 真实路径上这一步由分配流程完成
@@ -89,8 +90,8 @@ fn strong_chunk_binds_identity_both_ways() {
     assert!(chunk.is_data_alive(), "绑定后数据应当活着");
     assert_eq!(chunk.strong_count(), 0, "新建的强块强计数从 0 开始");
     assert!(
-        weak.drop_vtable().drop_fn_.is_none(),
-        "u64 不需要析构，因此不该登记析构入口"
+        weak.record_.is_none(),
+        "u64 不需要析构，因此不该登记清理入口"
     );
 }
 
@@ -120,10 +121,10 @@ fn strong_chunk_drop_is_type_erased_but_effective() {
         this.init_with_(NonNull::from(&mut weak).cast(), Probe);
     }
 
-    // 登记的析构入口必须能就地析构数据，这正是清盘流程依赖的路径
+    // 登记的清理入口必须能就地析构数据，这正是清盘流程依赖的路径
     assert!(
-        weak.drop_vtable().drop_fn_.is_some(),
-        "带 Drop 的数据必须登记析构入口"
+        weak.record_.is_some_and(|record| !record.is_noop_()),
+        "带 Drop 的数据必须登记清理入口"
     );
     assert_eq!(DROPPED.load(Ordering::Acquire), 0);
     // SAFETY: 数据刚构造好、尚未析构
@@ -175,15 +176,11 @@ fn weak_chunk_rebuilds_unsized_data_from_metadata() {
     let (repr_data, repr_meta) = (repr as *const (), core::ptr::metadata(repr));
 
     let mut weak = make_identity_();
-    weak.set_drop_info_erased_(
-        Option::None,
-        repr_data as *mut u8,
-        crate::weak_::meta_to_raw_(repr_meta),
-    );
+    weak.set_record_erased_(Option::None, crate::weak_::meta_to_raw_(repr_meta));
 
     // 从槽位取回元数据：`?Sized` 的虚表指针必须被原样保存
     let roundtrip: core::ptr::DynMetadata<dyn core::fmt::Debug> =
-        unsafe { crate::weak_::meta_from_raw_::<dyn core::fmt::Debug>(weak.drop_vtable().meta_) };
+        unsafe { crate::weak_::meta_from_raw_::<dyn core::fmt::Debug>(weak.meta_) };
     assert_eq!(roundtrip, repr_meta, "虚表元数据必须逐位保存");
 
     // 用取回的元数据重建胖指针，内容必须与原始引用一致

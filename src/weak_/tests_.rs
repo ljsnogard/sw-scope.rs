@@ -37,6 +37,14 @@ fn weak_chunk_size_is_type_agnostic() {
     assert_eq!(base_align, align_of::<WeakChunk<u8>>());
     assert_eq!(base_align, align_of::<WeakChunk<u128>>());
     assert_eq!(base_align, align_of::<WeakChunk<[u8]>>());
+
+    // 64 位平台上的目标布局（Batch B 之后）：
+    // 8(状态) + 8(prev_live) + 8(next_live) + 8(strong_chunk) + 8(record) + 8(meta) = 48
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(
+        base_size, 48,
+        "64 位平台上弱槽位应为 48 字节（原先每槽一份 24 字节的 DropVtable，现为一个记录指针 + 元数据）"
+    );
 }
 
 /// 验证 `WeakPool` 的容量换算与其"池头按槽位取整"的布局一致。
