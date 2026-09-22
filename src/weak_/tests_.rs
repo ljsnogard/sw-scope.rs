@@ -819,13 +819,14 @@ fn weak_chunk_lock_is_released_when_guard_drops_during_panic() {
     );
 }
 
-/// 验证 `DataState` 的完整 7 态迁移路径与"认领唯一"。
+/// 验证 `DataState` 的完整 8 态迁移路径与"认领唯一"。
 /// - 手段：造一个 `Created` 槽位，依次走
-///   `Created → Owning → Destroying → Destroyed → Finalized`，并在每一步检查状态与
-///   重复调用的结果。
+///   `Created → Owning → Destroying → Destroyed → Zombie → Finalized`，并在每一步
+///   检查状态与重复调用的结果。
 /// - 判断：`Owning` 之后再次升级必须失败；`Destroying` 之后再次 `try_claim_destroy`
-///   必须失败（认领唯一，保证恰好析构一次）；`Destroyed` / `Finalized` 的状态值必须
-///   与定义一致；整个过程中弱计数不受影响。
+///   必须失败（认领唯一，保证恰好析构一次）；`Destroyed` 只有在仍有逃逸 `Retain` 时
+///   才进入 `Zombie`，且 `Zombie -> Finalized` 也必须是 CAS 唯一的；整个过程中弱计数
+///   不受影响。
 #[test]
 fn weak_chunk_data_state_full_transition_path() {
     let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
@@ -859,8 +860,18 @@ fn weak_chunk_data_state_full_transition_path() {
 
     state.mark_destroyed();
     assert_eq!(state.data_state(), DataState::Destroyed);
-    state.mark_finalized();
+    assert!(!state.data_state().is_data_alive(), "Destroyed 不算存活");
+
+    // Destroyed → Zombie：数据已析构但仍有逃逸 Retain，槽位不能复用。
+    assert!(state.mark_zombie(), "Destroyed 应当能进入 Zombie");
+    assert_eq!(state.data_state(), DataState::Zombie);
+    assert!(!state.data_state().is_data_alive(), "Zombie 不算存活");
+    assert!(!state.mark_zombie(), "重复 mark_zombie 必须失败");
+
+    // Zombie → Finalized：最后一个逃逸 Retain 消失后由 CAS 认领终态。
+    assert!(state.try_finalize_from(DataState::Zombie));
     assert_eq!(state.data_state(), DataState::Finalized);
+    assert!(!state.try_finalize_from(DataState::Zombie), "终态认领必须唯一");
 
     // 全程不影响弱计数
     assert_eq!(state.weak_count(), 0);

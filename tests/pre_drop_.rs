@@ -7,9 +7,10 @@
 //! 见 `pre_drop_registry_is_thread_safe`。）
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::RefCell;
 use std::sync::Mutex;
 
-use sw_scope::{Scope, TrScope};
+use sw_scope::{Retain, Scope, TrScope};
 
 /// 串行化本文件里的用例：它们共享全局 root 与其注册表。
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -195,4 +196,95 @@ fn scope_is_reusable_after_collect() {
 
     let retain = scope.put(7u64);
     assert_eq!(*retain.try_owning().expect("清盘后应仍可用"), 7);
+}
+
+/// 验证 `collect` 清盘后，只要还有逃逸的 `Retain`，其 `WeakChunk` 就不能被复用。
+///
+/// - 手段：让对象在数据里持有自己的一个 `Retain`；PreDrop 钩子把这个 `Retain`
+///   挪到 thread-local，保证清盘后 `weak_count` 仍大于 0；随后对同一个 Scope 再放入
+///   一个新对象。
+/// - 判断：数据本身仍然会被清盘析构（`try_owning` / `try_sharing` 必须失败），但旧
+///   `Retain` 不能认领新对象；新对象也不能复用旧 `WeakChunk`。这验证了
+///   “weak_count 不妨碍清盘，但决定 WeakChunk 能否回收复用”。
+struct EscapedHandle {
+    value: u64,
+    self_retain: Option<Retain<EscapedHandle>>,
+}
+
+thread_local! {
+    static ESCAPED_HANDLE: RefCell<Option<Retain<EscapedHandle>>> = RefCell::new(None);
+}
+
+fn escape_handle_hook(obj: &mut EscapedHandle) {
+    if let Some(retain) = obj.self_retain.take() {
+        ESCAPED_HANDLE.with(|slot| *slot.borrow_mut() = Some(retain));
+    }
+}
+
+#[test]
+fn collect_keeps_weak_slot_alive_while_escaped_retain_exists() {
+    let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
+    ESCAPED_HANDLE.with(|slot| *slot.borrow_mut() = None);
+
+    let mut scope = Scope::new();
+    scope
+        .set_pre_drop::<EscapedHandle, _>(escape_handle_hook)
+        .expect("注册类型级钩子应当成功");
+
+    let handle = scope.put(EscapedHandle {
+        value: 7,
+        self_retain: None,
+    });
+
+    // 让对象持有自己的 Retain；随后只留下对象内部那个 self_retain。
+    {
+        let mut owning = handle.try_owning().expect("应能独占");
+        owning.self_retain = Some(handle.clone());
+    }
+    drop(handle);
+
+    // SAFETY: 清盘后不再访问旧数据；逃逸的 Retain 只用于验证失败语义。
+    unsafe { scope.collect() };
+
+    let escaped = ESCAPED_HANDLE
+        .with(|slot| slot.borrow_mut().take())
+        .expect("PreDrop 应当把 self_retain 挪到外部");
+
+    assert!(
+        escaped.is_zombie(),
+        "数据已经析构但句柄仍在，逃逸 Retain 应处于 Zombie 状态"
+    );
+    assert!(
+        escaped.try_owning().is_none(),
+        "数据已经析构，逃逸 Retain 只能升级失败"
+    );
+    assert!(
+        escaped.try_sharing().is_none(),
+        "数据已经析构，逃逸 Retain 不能重新共享"
+    );
+
+    // 新对象必须成功；旧 Retain 不得通过复用槽位认领它。
+    let fresh = scope.put(EscapedHandle {
+        value: 99,
+        self_retain: None,
+    });
+    assert!(!fresh.is_zombie(), "新对象不应处于 Zombie 状态");
+    assert_eq!(fresh.try_owning().expect("新对象应能独占").value, 99);
+    assert!(
+        escaped.try_owning().is_none(),
+        "旧 Retain 不能认领复用槽位里的新对象"
+    );
+    assert!(
+        escaped.try_sharing().is_none(),
+        "旧 Retain 不能共享复用槽位里的新对象"
+    );
+
+    // 最后一个僵尸句柄析构后，WeakChunk 应走 Retain::drop 的归还路径；
+    // 这里主要验证该路径不 panic，并且后续分配仍可正常使用。
+    drop(escaped);
+    let after = scope.put(EscapedHandle {
+        value: 123,
+        self_retain: None,
+    });
+    assert_eq!(after.try_owning().expect("僵尸槽位归还后仍可分配").value, 123);
 }

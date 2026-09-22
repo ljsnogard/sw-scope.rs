@@ -4,7 +4,7 @@
 
 use core::{alloc::Layout, ptr::NonNull, sync::atomic::Ordering};
 
-use crate::{strong_::StrongPool, weak_::{WeakChunk, WeakPool}};
+use crate::{strong_::StrongPool, weak_::{DataState, WeakChunk, WeakPool}};
 
 use super::{PoolIndex, RootExtension, ScopeInner};
 
@@ -38,28 +38,62 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
     /// 与来源 (a) 共用同一个 `try_claim_destroy` 认领 CAS：级联析构或并发 `drop` 已经处理过
     /// 的槽位会认领失败，这里直接跳过，因此"恰好一次"仍然成立。
     ///
+    /// # 为什么 `weak_count` 不妨碍清盘
+    ///
+    /// 清盘由 `Scope` 发起，是"保证路径"：环、`mem::forget`、泄漏句柄都不能阻止数据被
+    /// `PreDrop` + `drop_in_place`。因此这里不能因为 `weak_count > 0` 就跳过析构。
+    ///
+    /// 但 `weak_count` 决定**弱槽位能不能回收复用**：只要还有 `Retain` 活着，它仍可能
+    /// 在之后的任意时刻调用 `try_owning` / `try_sharing`。若此时把槽位还给 `WeakPool`，
+    /// 后续新对象可能复用同一块内存，旧 `Retain` 就会变成指向新对象的悬空 / 别名句柄。
+    ///
+    /// 所以规则是：
+    /// - 数据析构：照常执行；
+    /// - 槽位回收：必须等 `weak_count == 0` 再做；否则保留槽位，进入不再复用的
+    ///   "zombie handle" 状态，逃逸的 `Retain` 后续只能失败。
+    ///
     /// # Safety
     ///
-    /// 调用后本域中所有对象的句柄都会悬空；调用方必须保证此后不再使用它们。
+    /// 调用后本域中所有对象的**数据**都会析构；调用方必须保证不通过正常借用继续访问
+    /// 数据。逃逸出去的 `Retain` 仍可安全地失败，但不能再认领任何对象。
     pub(crate) unsafe fn flush_(&mut self) {
         let mut cursor = self.live_head_;
         while let Option::Some(weak) = cursor {
             // SAFETY: 链上的槽位都由本域分配且仍然有效
             let weak_ref = unsafe { weak.as_ref() };
-            // 先把后继取出来，因为下面会把本槽位还给池（会清掉链接）
+            // 先把后继取出来，因为下面可能把本槽位还给池（会清掉链接）
             cursor = NonNull::new(weak_ref.next_live());
             if weak_ref.chunk_state().try_claim_destroy().is_some() {
                 // SAFETY: 刚由本调用认领成功，恰好执行一次
                 unsafe { weak_ref.drop_data() };
                 weak_ref.chunk_state().mark_destroyed();
             }
-            weak_ref.chunk_state().mark_finalized();
-            // 归还槽位：反查所属池 -> deallocate 会把状态、链接与登记一并重置
-            if let Option::Some((pool, index)) = self.weak_pool_of_(weak) {
-                // SAFETY: pool 由本树持有且存活
-                if let Option::Some(pool_ref) = unsafe { pool.as_ptr().as_mut() } {
-                    let _ = pool_ref.deallocate(index);
+
+            if weak_ref.weak_count() == 0 {
+                // 没有逃逸的 Retain 了：可以按既有语义终态化并归还槽位。
+                if weak_ref.chunk_state().try_finalize_from(DataState::Destroyed) {
+                    // 归还槽位：反查所属池 -> deallocate 会把状态、链接与登记一并重置
+                    if let Option::Some((pool, index)) = self.weak_pool_of_(weak) {
+                        // SAFETY: pool 由本树持有且存活
+                        if let Option::Some(pool_ref) = unsafe { pool.as_ptr().as_mut() } {
+                            let _ = pool_ref.deallocate(index);
+                        }
+                    }
                 }
+            } else {
+                // 数据已经析构，但还有 Retain 逃逸在世。此时禁止复用这块弱槽位：
+                // - 先登记“最后一个 Retain 消失时如何归还 WeakPool”的入口；
+                // - 清掉 live 链接；
+                // - 最后用 CAS 发布 Zombie 状态。
+                //
+                // 发布 Zombie 之后不能再访问 weak_ref：最后一个 Retain 可能已经在
+                // 另一个线程里 CAS Finalized 并把槽位归还给 WeakPool。这里接受一个
+                // 极小竞争窗口下的安全泄漏（最后一个 Retain 恰在 inspect 与 publish
+                // 之间减到 0），但绝不允许复用已被旧句柄看见的槽位。
+                weak_ref.set_zombie_reclaimer_(dealloc_zombie_slot_::<CELL_SIZE>);
+                weak_ref.set_next_live(core::ptr::null_mut());
+                weak_ref.set_prev_live(core::ptr::null_mut());
+                let _ = weak_ref.chunk_state().mark_zombie();
             }
         }
         self.live_head_ = Option::None;
@@ -216,4 +250,30 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         // SAFETY: node 由同一个分配器按 `Layout::new::<Self>()` 分配
         unsafe { alloc.deallocate(node.cast::<u8>(), Layout::new::<Self>()) };
     }
+}
+
+/// 僵尸弱槽位的归还入口：由 `ScopeInner::flush_` 注册，由最后一个逃逸 `Retain`
+/// 在 [`WeakChunk::try_reclaim_zombie_`] 中调用。
+///
+/// 它会从弱槽位地址反推所属 `WeakPool`，再把槽位放回空闲链。调用后弱槽位可能立刻被
+/// 新对象复用，因此调用方不得再访问该槽位。
+///
+/// # Safety
+///
+/// 必须只在 `weak_count == 0` 且状态为 [`DataState::Zombie`] 时调用。
+unsafe fn dealloc_zombie_slot_<const CELL_SIZE: usize>(weak: NonNull<WeakChunk<()>>) {
+    let Option::Some(pool) =
+        WeakPool::<CELL_SIZE, RootExtension<CELL_SIZE>>::of_slot_(weak)
+    else {
+        return;
+    };
+    // SAFETY: pool 由弱槽位地址反推得到，且已通过对齐校验
+    let Option::Some(index) = unsafe { pool.as_ref() }.index_of_(weak) else {
+        return;
+    };
+    // SAFETY: pool 由本树持有且存活；索引也已校验
+    let Option::Some(pool_ref) = (unsafe { pool.as_ptr().as_mut() }) else {
+        return;
+    };
+    let _ = pool_ref.deallocate(index);
 }

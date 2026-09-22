@@ -50,6 +50,10 @@ where
     /// 存活链的链尾方向链接。
     next_live_: AtomicPtr<WeakChunk<()>>,
     /// 本槽位对应的强块。数据的析构与访问都要经过它。
+    ///
+    /// 当数据已经析构、槽位进入 [`DataState::Zombie`] 后，这里改为存一个类型擦除的
+    /// “归还 `WeakPool`”函数指针（`dealloc_zombie_slot_` 的单态化实例），以便最后一个
+    /// 逃逸 `Retain` drop 时把槽位放回空闲链。
     strong_chunk_: AtomicPtr<StrongChunkBase>,
     /// 类型擦除的清理登记，指向**每类型一份**的 [`PreDropRecord`]；空闲槽位为 [`None`]。
     ///
@@ -91,6 +95,13 @@ pub(crate) enum DataState {
     /// 这是"已纳入 GC 队列"的终态：存活链本身就是待清理队列的实体，状态位只负责
     /// 记录"这块钱销毁到哪一步"。
     Finalized = 0x06,
+
+    /// 数据已经析构，但仍存在逃逸的 `Retain`，因此弱槽位不能归还、不能被复用。
+    ///
+    /// 这就是“僵尸 handle”在状态机里的落点：`try_owning` / `try_sharing` 都会失败，
+    /// 但 `Retain` 仍可安全 clone / drop；最后一个弱引用消失后，`Retain::drop`
+    /// 会把这个槽位归还给 `WeakPool`。
+    Zombie = 0x07,
 }
 
 impl DataState {
@@ -121,6 +132,7 @@ impl DataState {
             0x04 => DataState::Destroying,
             0x05 => DataState::Destroyed,
             0x06 => DataState::Finalized,
+            0x07 => DataState::Zombie,
             _ => unreachable!(),
         }
     }
@@ -282,6 +294,24 @@ impl WeakChunkState {
         let _ = self.transition_(|_| Option::Some(DataState::Finalized));
     }
 
+    /// 当数据已析构但仍有逃逸 `Retain` 时，把状态推进到 [`DataState::Zombie`]。
+    ///
+    /// 这是与最后一个 `Retain` 的 drop 竞争终态的起点：`mark_zombie` 成功之后，
+    /// 弱槽位既不能被复用，也不会再被 `flush_` 接续销毁。
+    pub(crate) fn mark_zombie(&self) -> bool {
+        self.try_transition_state(DataState::Destroyed, DataState::Zombie)
+            .is_some()
+    }
+
+    /// 从指定状态尝试认领 `Finalized`，成功返回 `true`。
+    ///
+    /// 正常 teardown 从 [`DataState::Destroyed`] 认领，僵尸路径从
+    /// [`DataState::Zombie`] 认领；两边都用 CAS，保证弱槽位只被归还一次。
+    pub(crate) fn try_finalize_from(&self, from: DataState) -> bool {
+        self.try_transition_state(from, DataState::Finalized)
+            .is_some()
+    }
+
     /// 把状态置为 `Created`。分配路径在数据就位、槽位正式投入使用之后调用。
     pub(crate) fn init_created(&self) {
         let _ = self.transition_(|_| Option::Some(DataState::Created));
@@ -342,6 +372,65 @@ where
     #[inline]
     pub fn data_state(&self) -> DataState {
         self.chunk_state_.data_state()
+    }
+
+    /// 该槽位是否处于僵尸状态。
+    #[inline]
+    pub(crate) fn is_zombie_(&self) -> bool {
+        self.data_state() == DataState::Zombie
+    }
+
+    /// 记录僵尸槽位的归还入口。
+    ///
+    /// # Safety
+    ///
+    /// 只能在 `Destroyed -> Zombie` 发布之前调用；`reclaimer` 必须是
+    /// `dealloc_zombie_slot_` 的某个 `CELL_SIZE` 单态化实例，并且会从槽位地址
+    /// O(1) 反推所属 `WeakPool` 后归还槽位。
+    pub(crate) fn set_zombie_reclaimer_(
+        &self,
+        reclaimer: unsafe fn(NonNull<WeakChunk<()>>),
+    ) {
+        let bits = reclaimer as usize;
+        debug_assert!(bits != 0, "僵尸归还入口不能为空");
+        self.strong_chunk_
+            .store(bits as *mut StrongChunkBase, Ordering::Release);
+    }
+
+    /// 读取 `set_zombie_reclaimer_` 写入的归还入口。
+    fn zombie_reclaimer_(&self) -> Option<unsafe fn(NonNull<WeakChunk<()>>)> {
+        let bits = self.strong_chunk_.load(Ordering::Acquire) as usize;
+        if bits == 0 {
+            return Option::None;
+        }
+        // SAFETY: 只有 Zombie 状态且 weak_count == 0 时才会走到这里；写入方是
+        // `set_zombie_reclaimer_`，写读之间由 `mark_zombie` / `try_finalize_from`
+        // 的状态 CAS 建立 happens-before。
+        Option::Some(unsafe {
+            core::mem::transmute::<usize, unsafe fn(NonNull<WeakChunk<()>>)>(bits)
+        })
+    }
+
+    /// 最后一个弱引用消失后回收僵尸槽位。
+    ///
+    /// 先 CAS `Zombie -> Finalized`，保证只有一个线程执行真正的归还；随后调用事先
+    /// 注册的 `WeakPool` 归还入口。返回后本槽位可能已被重新分配，调用方不得再访问。
+    ///
+    /// # Safety
+    ///
+    /// 必须在 `weak_count == 0` 且状态为 [`DataState::Zombie`] 时调用。
+    pub(crate) unsafe fn try_reclaim_zombie_(&self) {
+        if !self.chunk_state().try_finalize_from(DataState::Zombie) {
+            return;
+        }
+        let Option::Some(reclaimer) = self.zombie_reclaimer_() else {
+            // 没有归还入口时只能安全泄漏，绝不能复用。
+            return;
+        };
+        let ptr = NonNull::from(self).cast::<WeakChunk<()>>();
+        // SAFETY: 状态已经成功地被本次调用 CAS 到 Finalized，weak_count 为 0；
+        // reclaimer 会把槽位还给所属 WeakPool。
+        unsafe { reclaimer(ptr) };
     }
 
     /// 读取槽位当前的弱引用计数。
