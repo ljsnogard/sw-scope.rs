@@ -8,7 +8,7 @@ use core::{
 extern crate alloc;
 
 use crate::{
-    abs_::{TrEmplace, TrScope},
+    abs_::{IntoEmplace, TrEmplace, TrScope},
     index_::Retain,
     scope_inner_::{self, PoolIndex, RootScope, ScopeInner},
     scope_str_::ScopeStr,
@@ -160,8 +160,30 @@ impl Scope {
             .map_err(|_| ScopeError::MallocFailed)
     }
 
+    /// 把 `str` 的字节原地放进 arena，交出 [`ScopeStr`] 的句柄。
+    ///
+    /// 走的是 `?Sized` 的 emplace 路径：数据区布局来自 `Layout::for_value(str)`，`ScopeStr`
+    /// 的元数据就是长度，因此 `&*handle` 直接得到 `&str`。
+    ///
+    /// # Errors
+    ///
+    /// 弱池已满或强池分配失败时返回 [`ScopeError::MallocFailed`]。
     pub fn try_put_str(&mut self, str: &str) -> Result<Retain<ScopeStr>, ScopeError> {
-        todo!()
+        let len = str.len();
+        let layout = Layout::for_value(str);
+        // 元数据就是长度；闭包在 arena 给出的位置写入字节
+        let emplace = IntoEmplace::<_, ScopeStr>::new(
+            |_layout, place: *mut ScopeStr| {
+                // SAFETY: place 指向 layout 划定的数据区，写入长度与 str 一致
+                unsafe { core::ptr::copy_nonoverlapping(str.as_ptr(), place.cast::<u8>(), len) };
+            },
+            len,
+        );
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let inner = unsafe { self.inner_ptr_.as_mut() };
+        // SAFETY: 写入长度与 layout 一致，且 str 不需要 Drop
+        unsafe { inner.emplace_value_with_(layout, emplace, Option::None) }
+            .map_err(|_| ScopeError::MallocFailed)
     }
 
     pub fn try_clone<T>(&mut self, src: &[T]) -> Result<Retain<[T]>, ScopeError>
@@ -185,7 +207,35 @@ impl Scope {
     where
         TyEmp: TrEmplace,
     {
-        todo!()
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let inner = unsafe { self.inner_ptr_.as_mut() };
+        // SAFETY: 由调用方满足 TrEmplace::emplace 的安全契约
+        unsafe { inner.emplace_value_with_(layout, emplace, Option::None) }
+            .map_err(|_| ScopeError::MallocFailed)
+    }
+
+    /// 同 [`Scope::try_emplace`]，但额外传一个对象级 `PreDrop` 钩子；它覆盖类型级钩子。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`Scope::try_emplace`]。
+    pub unsafe fn try_emplace_with<TyEmp, Fin>(
+        &mut self,
+        layout: Layout,
+        emplace: TyEmp,
+        pre_drop: Fin,
+    ) -> Result<Retain<TyEmp::Target>, ScopeError>
+    where
+        TyEmp: TrEmplace,
+        Fin: FnOnce(&mut TyEmp::Target) + 'static,
+    {
+        let record = PreDropRecord::of_with::<TyEmp::Target, Fin>();
+        core::mem::drop(pre_drop);
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let inner = unsafe { self.inner_ptr_.as_mut() };
+        // SAFETY: 由调用方满足 TrEmplace::emplace 的安全契约
+        unsafe { inner.emplace_value_with_(layout, emplace, Option::Some(record)) }
+            .map_err(|_| ScopeError::MallocFailed)
     }
 
     pub fn try_alloc_slice_uninit<T>(
@@ -230,6 +280,20 @@ impl TrScope for &mut Scope {
         TyEmp: TrEmplace,
     {
         unsafe { Scope::try_emplace(self, layout, emplace) }
+    }
+
+    #[inline]
+    unsafe fn try_emplace_with<TyEmp, Fin>(
+        self,
+        layout: Layout,
+        emplace: TyEmp,
+        pre_drop: Fin,
+    ) -> Result<Retain<TyEmp::Target>, Self::Err>
+    where
+        TyEmp: TrEmplace,
+        Fin: FnOnce(&mut TyEmp::Target) + 'static,
+    {
+        unsafe { Scope::try_emplace_with(self, layout, emplace, pre_drop) }
     }
 
     #[inline]

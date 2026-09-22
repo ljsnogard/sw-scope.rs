@@ -6,9 +6,10 @@ use core::{
 };
 
 use crate::{
+    abs_::TrEmplace,
     index_::Retain,
-    strong_::{StrongChunk, StrongPool},
-    weak_::{PreDropRecord, PreDropRegistry, WeakChunk, WeakPool, resolve_},
+    strong_::{StrongChunk, StrongChunkBase, StrongPool},
+    weak_::{PreDropRecord, PreDropRegistry, WeakChunk, WeakPool, meta_to_raw_, resolve_},
 };
 
 pub(crate) const DEFAULT_CELL_SIZE: usize = mem::size_of::<usize>();
@@ -225,6 +226,52 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         let chunk = mem.as_ptr() as *mut u8 as *mut StrongChunk<T>;
         // SAFETY: mem 满足 StrongChunk<T> 的布局，且本域独占
         unsafe { (*chunk).init_with_record_(weak, value, record) };
+        // SAFETY: weak 是本域刚分配的槽位
+        let weak_ref = unsafe { weak.as_ref() };
+        weak_ref.chunk_state_.init_created();
+        weak_ref.incr_weak_count();
+        self.push_live_(weak);
+        Result::Ok(Retain::new(weak.cast()))
+    }
+
+    /// 就地构造一个（可能 `?Sized` 的）值并交出句柄。
+    ///
+    /// 与 [`ScopeInner::put_value_with_`] 的区别：数据区的布局由调用方给出，构造由 `emplace`
+    /// 完成，`?Sized` 元数据由 `emplace.meta_()` 提供——这是解开"arena 要构造胖指针才能调
+    /// `emplace`、而元数据本该由这次调用给出"循环的关键。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须满足 [`TrEmplace::emplace`] 的安全契约。
+    pub(crate) unsafe fn emplace_value_with_<TyEmp>(
+        &mut self,
+        layout: Layout,
+        emplace: TyEmp,
+        object_level: Option<&'static PreDropRecord>,
+    ) -> Result<Retain<TyEmp::Target>, AllocError>
+    where
+        TyEmp: TrEmplace,
+    {
+        let meta: <TyEmp::Target as ptr::Pointee>::Metadata = emplace.meta_().into();
+        let record = resolve_::<TyEmp::Target>(self.root_registry_(), object_level);
+        let weak = self.allocate_weak_().ok_or(AllocError)?;
+        // StrongChunk<T> = { base_: StrongChunkBase, data_: T }；Layout::extend 给出与
+        // repr(C) 一致的整块布局与数据区偏移
+        let (chunk_layout, data_offset) = Layout::new::<StrongChunkBase>()
+            .extend(layout)
+            .map_err(|_| AllocError)?;
+        let mem = self.allocate(chunk_layout)?;
+        let base = mem.as_ptr() as *mut u8;
+        // SAFETY: data_offset 由 Layout::extend 给出，落在这块刚分配的内存内
+        let data = unsafe { base.add(data_offset) };
+        // arena 先建好胖指针，再交回 emplace 就地写入
+        let place = ptr::from_raw_parts_mut::<TyEmp::Target>(data.cast::<()>(), meta);
+        // SAFETY: 布局匹配、数据尚未初始化，且由调用方保证 emplace 的契约
+        unsafe { emplace.emplace(layout, place) };
+        // 绑定：base 就是 StrongChunk<Target> 的首址
+        let chunk = ptr::from_raw_parts_mut::<StrongChunk<TyEmp::Target>>(base.cast::<()>(), meta);
+        // SAFETY: 数据刚由 emplace 就地构造完毕；weak 是本域刚分配的槽位
+        unsafe { (*chunk).bind_fresh_(weak, meta_to_raw_(meta), record) };
         // SAFETY: weak 是本域刚分配的槽位
         let weak_ref = unsafe { weak.as_ref() };
         weak_ref.chunk_state_.init_created();

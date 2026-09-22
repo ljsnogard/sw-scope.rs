@@ -185,6 +185,25 @@ where
         data: *mut T,
         record: &'static PreDropRecord,
     ) {
+        let meta_ = crate::weak_::meta_to_raw_(ptr::metadata(data as *const T));
+        // SAFETY: 由调用方保证 weak_chunk 是身份槽位、数据已构造完毕
+        unsafe { self.bind_fresh_(weak_chunk, meta_, record) };
+    }
+
+    /// 数据**已经就地构造完毕**，这里只做绑定：记录身份、清理登记与 `?Sized` 元数据。
+    ///
+    /// 与 [`StrongChunk::init_fresh_`] 的区别是元数据由调用方直接给出——`?Sized` 的
+    /// emplace 路径只能这样拿到它（那时数据是刚被 `emplace` 写进去的）。
+    ///
+    /// # Safety
+    ///
+    /// `weak_chunk` 必须是本块的身份槽位；数据必须已经构造在数据区，且本块尚未登记过。
+    pub(crate) unsafe fn bind_fresh_(
+        &mut self,
+        weak_chunk: NonNull<WeakChunk<()>>,
+        meta_: *const (),
+        record: &'static PreDropRecord,
+    ) {
         self.base_ = StrongChunkBase::empty_(weak_chunk);
         let this = self as *const Self as *mut Self;
         // SAFETY: base_ 是首字段，addr_of_mut! 取到的是合法的薄指针
@@ -192,7 +211,6 @@ where
         // SAFETY: weak_chunk 是本对象的身份槽位，且此刻独占使用
         let weak = unsafe { &mut *(weak_chunk.as_ptr() as *mut WeakChunk<T>) };
         weak.set_strong_chunk(base);
-        let meta_ = crate::weak_::meta_to_raw_(ptr::metadata(data as *const T));
         // 空操作登记（既不需要 Drop 也没有钩子）直接存 None，省掉一个无意义的指针
         let record_ = if record.is_noop_() {
             Option::None
