@@ -51,21 +51,16 @@ impl Scope {
     #[allow(clippy::new_without_default)]
     #[cfg(feature = "core-alloc")]
     pub fn new() -> Scope {
-
-        let x = RootScope::try_init_default_root_scope_(
+        let root = match RootScope::try_init_default_root_scope_(
             &scope_inner_::DEFAULT_ROOT_SCOPE,
             scope_inner_::DEFAULT_PAGE_SIZE,
             alloc::alloc::Global,
-        );
-        let root_scope_inner = match x {
-            Result::Err(s) => s,
-            Result::Ok(s) => s,
+        ) {
+            Result::Err(s) | Result::Ok(s) => s,
         };
-        let root_scope = unsafe {
-            let ptr = root_scope_inner
-                as *const _
-                as *mut ScopeInner<_>;
-            Scope { inner_ptr_: NonNull::new_unchecked(ptr) }
+        // 以 root 域为父创建子 Scope；root 自身没有父域，临时句柄析构时会被跳过
+        let root_scope = Scope {
+            inner_ptr_: NonNull::from(root.inner_()),
         };
         Self::new_from_parent(&root_scope)
     }

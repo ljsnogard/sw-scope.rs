@@ -74,6 +74,40 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     const HEADER_SLOT_COUNT: usize =
         mem::size_of::<Self>().div_ceil(Self::SLOT_SIZE);
 
+    /// 池头占用的字节数，即槽位数组相对池首的固定偏移。
+    ///
+    /// `cell_offset_` 在构造时就写成 `HEADER_SLOT_COUNT`，因此第 `i` 个槽位相对池首的偏移是
+    /// `HEADER_BYTES + i * SLOT_SIZE`；这正是"由槽位地址反推所属池"能成立的前提，见
+    /// [`WeakPool::of_slot_`]。
+    pub(crate) const HEADER_BYTES: usize = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE;
+
+    /// 由槽位地址反推它所属的池（O(1)，不依赖池链）。
+    ///
+    /// 槽位数组紧跟在池头之后，第 `i` 个槽位相对池首的偏移是
+    /// `(HEADER_SLOT_COUNT + i) * SLOT_SIZE`；`i` 正是槽位里的 `pool_order_`——它在池构造时
+    /// 按数组下标写死、终生只读（归还槽位也不会重置），因此对空闲槽位同样有效。
+    ///
+    /// 返回 `None` 表示该地址不可能是本类池的槽位（越界或未按池对齐）。
+    pub(crate) fn of_slot_(weak: NonNull<WeakChunk<()>>) -> Option<NonNull<Self>> {
+        let addr = weak.as_ptr() as usize;
+        // 先按槽位对齐校验，避免对错位地址解引用去读 `pool_order_`
+        if !addr.is_multiple_of(mem::align_of::<WeakChunk<()>>()) {
+            return Option::None;
+        }
+        // SAFETY: addr 已按槽位对齐；调用方保证它指向一个本类池分配出的（含空闲）槽位
+        let order = unsafe { weak.as_ref() }.pool_order() as usize;
+        let offset = Self::HEADER_BYTES + order * Self::SLOT_SIZE;
+        if addr < offset {
+            return Option::None;
+        }
+        let base = addr - offset;
+        if !base.is_multiple_of(mem::align_of::<Self>()) {
+            return Option::None;
+        }
+        // SAFETY: base 由非空槽位地址减去固定偏移得到，必定非空
+        Option::Some(unsafe { NonNull::new_unchecked(base as *mut Self) })
+    }
+
     /// 根据目标要容纳的 WeakChunk 数量，计算最小内存占用量
     pub fn min_size_for_max_count(count: PoolIndex) -> usize {
         Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE + (count as usize) * Self::SLOT_SIZE

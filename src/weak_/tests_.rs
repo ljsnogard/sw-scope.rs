@@ -866,3 +866,32 @@ fn weak_chunk_data_state_full_transition_path() {
     assert_eq!(state.weak_count(), 0);
     assert_eq!(state.pool_order(), 0);
 }
+
+/// 测试"由槽位地址 O(1) 反推所属弱池"。
+/// - 手段：构造两个容量 16 的池，各自把全部槽位分配掉，再对每个槽位调用
+///   `WeakPool::of_slot_`；每个池的槽位都应反推回它自己的首址。
+/// - 判断：任一槽位反推出的池地址与该槽位实际所属的池不同即断言失败；两个池的槽位互不
+///   串味（池 A 的槽位不会反推到池 B），说明 `pool_order_` 与池头偏移的换算正确。
+#[test]
+fn weak_pool_of_slot_reverses_to_owning_pool() {
+    let pools = [new_pool_(), new_pool_()];
+    for mut owner in pools {
+        // SAFETY: owner 指向独占分配的池；测试结束前都存活
+        let pool = unsafe { owner.as_mut() };
+        let owner_ptr = owner.as_ptr();
+        for _ in 0..TEST_CAP {
+            pool.allocate().expect("按容量逐个分配应当成功");
+        }
+        // SAFETY: 池未释放，槽位数组有效
+        let slots = unsafe { pool.slots().as_mut() };
+        for index in 0..TEST_CAP as usize {
+            let slot = NonNull::from(&mut slots[index]);
+            let derived = TestPool::of_slot_(slot).expect("槽位必须能反推出所属池");
+            assert_eq!(
+                derived.as_ptr(),
+                owner_ptr,
+                "槽位 {index} 反推出的池不是它实际所属的池",
+            );
+        }
+    }
+}
