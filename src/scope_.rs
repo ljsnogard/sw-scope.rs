@@ -12,6 +12,7 @@ use crate::{
     index_::Retain,
     scope_inner_::{self, PoolIndex, RootScope, ScopeInner},
     scope_str_::ScopeStr,
+    weak_::PreDropRecord,
 };
 
 #[derive(Debug)]
@@ -96,6 +97,54 @@ impl Scope {
             .map_err(|_| ScopeError::MallocFailed)
     }
 
+    /// 为类型 `T` 注册一个**类型级** `PreDrop` 钩子，作用于本 Scope 树里该类型的所有实例。
+    ///
+    /// 表挂在 root 上（整棵树共享一份），因此子 Scope 注册后对其父 / 兄弟同样可见。
+    /// 钩子必须是非捕获闭包或函数项；捕获式闭包会在编译期被拒绝。
+    ///
+    /// # Errors
+    ///
+    /// 本 Scope 树还没有初始化好注册表时返回 [`ScopeError::MalformedInit`]。
+    pub fn set_pre_drop<T, Fin>(&mut self, pre_drop: Fin) -> Result<(), ScopeError>
+    where
+        T: ?Sized,
+        Fin: FnOnce(&mut T) + 'static,
+    {
+        // SAFETY: Scope 持有一个有效的 ScopeInner，且 &mut self 保证独占
+        let inner = unsafe { self.inner_ptr_.as_mut() };
+        let registry = inner
+            .root_registry_mut_()
+            .ok_or(ScopeError::MalformedInit)?;
+        registry.register_::<T, Fin>(pre_drop);
+        Result::Ok(())
+    }
+
+    /// 同 [`Scope::try_put`]，但额外传一个**对象级** `PreDrop` 钩子；它覆盖类型级钩子。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Scope::try_put`]；此外，若 `Fin` 不是零尺寸类型（捕获了环境），会在**编译期**
+    /// 报错而不是运行期。
+    pub fn try_put_with<F, T, Fin>(
+        &mut self,
+        factory: F,
+        pre_drop: Fin,
+    ) -> Result<Retain<T>, ScopeError>
+    where
+        F: FnOnce() -> T,
+        Fin: FnOnce(&mut T) + 'static,
+    {
+        let value = factory();
+        // 钩子是零尺寸的：这里只借用它的类型作为登记键
+        let record = PreDropRecord::of_with::<T, Fin>();
+        core::mem::drop(pre_drop);
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let inner = unsafe { self.inner_ptr_.as_mut() };
+        inner
+            .put_value_with_(value, Option::Some(record))
+            .map_err(|_| ScopeError::MallocFailed)
+    }
+
     pub fn try_put_str(&mut self, str: &str) -> Result<Retain<ScopeStr>, ScopeError> {
         todo!()
     }
@@ -174,6 +223,24 @@ impl TrScope for &mut Scope {
         length: usize,
     ) -> Result<Retain<[MaybeUninit<T>]>, Self::Err> {
         Scope::try_alloc_slice_uninit(self, length)
+    }
+
+    #[inline]
+    fn set_pre_drop<T, Fin>(self, pre_drop: Fin) -> Result<(), Self::Err>
+    where
+        T: ?Sized,
+        Fin: FnOnce(&mut T) + 'static,
+    {
+        Scope::set_pre_drop::<T, Fin>(self, pre_drop)
+    }
+
+    #[inline]
+    fn try_put_with<F, T, Fin>(self, factory: F, pre_drop: Fin) -> Result<Retain<T>, Self::Err>
+    where
+        F: FnOnce() -> T,
+        Fin: FnOnce(&mut T) + 'static,
+    {
+        Scope::try_put_with(self, factory, pre_drop)
     }
 }
 

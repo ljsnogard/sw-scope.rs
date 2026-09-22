@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::weak_::WeakChunk;
+use crate::weak_::{PreDropRecord, WeakChunk};
 
 /// Arena 中承载用户数据的一个块。
 ///
@@ -171,7 +171,9 @@ where
         self.base_.weak_chunk()
     }
 
-    /// 供分配路径调用：绑定身份、清零强计数，并把数据登记进弱槽位的析构表。
+    /// 供分配路径调用：绑定身份、清零强计数，并把数据登记进弱槽位的清理登记。
+    ///
+    /// `record` 是调用方按"对象级 > 类型级 > 默认"选好的有效登记，交给类型无关的弱槽位保管。
     ///
     /// # Safety
     ///
@@ -181,6 +183,7 @@ where
         &mut self,
         weak_chunk: NonNull<WeakChunk<()>>,
         data: *mut T,
+        record: &'static PreDropRecord,
     ) {
         self.base_ = StrongChunkBase::empty_(weak_chunk);
         let this = self as *const Self as *mut Self;
@@ -189,19 +192,37 @@ where
         // SAFETY: weak_chunk 是本对象的身份槽位，且此刻独占使用
         let weak = unsafe { &mut *(weak_chunk.as_ptr() as *mut WeakChunk<T>) };
         weak.set_strong_chunk(base);
-        // 在这里（有具体 T 的地方）取到"每类型一份"的清理登记，再交给类型无关的弱槽位保管
-        let record_ = if mem::needs_drop::<T>() {
-            Option::Some(crate::weak_::PreDropRecord::of::<T>())
-        } else {
-            Option::None
-        };
         let meta_ = crate::weak_::meta_to_raw_(ptr::metadata(data as *const T));
+        // 空操作登记（既不需要 Drop 也没有钩子）直接存 None，省掉一个无意义的指针
+        let record_ = if record.is_noop_() {
+            Option::None
+        } else {
+            Option::Some(record)
+        };
         weak.set_record_erased_(record_, meta_);
     }
 }
 
 impl<T> StrongChunk<T> {
-    /// 就地把 `value` 构造进数据区并完成登记。
+    /// 就地把 `value` 构造进数据区，并用调用方指定的有效登记完成绑定。
+    ///
+    /// # Safety
+    ///
+    /// `weak_chunk` 必须是本块的身份槽位，且本块尚未登记过任何数据。
+    pub(crate) unsafe fn init_with_record_(
+        &mut self,
+        weak_chunk: NonNull<WeakChunk<()>>,
+        value: T,
+        record: &'static PreDropRecord,
+    ) {
+        let data = self.data_ptr();
+        // SAFETY: 数据区已分配、对齐且尚未初始化；由调用方保证独占
+        unsafe { data.write(value) };
+        // SAFETY: 由调用方保证 weak_chunk 是身份槽位
+        unsafe { self.init_fresh_(weak_chunk, data, record) };
+    }
+
+    /// 就地把 `value` 构造进数据区并完成登记（无钩子的默认登记）。
     ///
     /// 分配路径的真实流程是"先备好壳、再由 `TrEmplace` 就地构造"，本方法把该流程压成
     /// 一步，供那些不需要就地构造的简单类型使用。
@@ -214,11 +235,8 @@ impl<T> StrongChunk<T> {
         weak_chunk: NonNull<WeakChunk<()>>,
         value: T,
     ) {
-        let data = self.data_ptr();
-        // SAFETY: 数据区已分配、对齐且尚未初始化；由调用方保证独占
-        unsafe { data.write(value) };
         // SAFETY: 由调用方保证 weak_chunk 是身份槽位
-        unsafe { self.init_fresh_(weak_chunk, data) };
+        unsafe { self.init_with_record_(weak_chunk, value, PreDropRecord::of::<T>()) };
     }
 
 }

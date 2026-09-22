@@ -8,7 +8,7 @@ use core::{
 use crate::{
     index_::Retain,
     strong_::{StrongChunk, StrongPool},
-    weak_::{WeakChunk, WeakPool},
+    weak_::{PreDropRecord, PreDropRegistry, WeakChunk, WeakPool, resolve_},
 };
 
 pub(crate) const DEFAULT_CELL_SIZE: usize = mem::size_of::<usize>();
@@ -44,6 +44,8 @@ pub(crate) struct ScopeInner<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
     live_tail_: Option<NonNull<WeakChunk<()>>>,
     /// 整棵树共享的弱槽位池链头
     weak_pool_: Option<NonNull<WeakPool<CELL_SIZE, ScopeInner<CELL_SIZE>>>>,
+    /// 整棵树共享的类型级 `PreDrop` 注册表（root 分配，子域复制指针，见 D2d）
+    pre_drop_registry_: Option<NonNull<PreDropRegistry>>,
     /// 指向本 Scope 所有内存池的分配器，也就是 RootScope 的分配器
     /// 也可用于计算 RootScope 的地址
     allocator_: &'static dyn Allocator,
@@ -69,6 +71,7 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
             live_head_: Option::None,
             live_tail_: Option::None,
             weak_pool_: parent.weak_pool_,
+            pre_drop_registry_: parent.pre_drop_registry_,
             allocator_: parent.allocator_,
         }
     }
@@ -169,18 +172,59 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         self.live_head_
     }
 
+    /// 整棵树共享的类型级 `PreDrop` 注册表（只读）。
+    pub(crate) fn root_registry_(&self) -> Option<&'static PreDropRegistry> {
+        let root = self.root_scope();
+        // SAFETY: root 是本树的 root 域，注册表由它分配并随它存活
+        let root_ref = unsafe { root.as_ref() };
+        match root_ref.pre_drop_registry_ {
+            Option::Some(ptr) => Option::Some(unsafe { &*ptr.as_ptr() }),
+            Option::None => Option::None,
+        }
+    }
+
+    /// 整棵树共享的类型级 `PreDrop` 注册表（可写）。
+    ///
+    /// 调用方（`Scope::set_pre_drop`）持有 `&mut Scope`，因此对注册表的访问是独占的。
+    pub(crate) fn root_registry_mut_(&mut self) -> Option<&mut PreDropRegistry> {
+        let root = self.root_scope();
+        // SAFETY: root 是本树唯一的 root 域；调用方独占整棵树
+        let root_ref = unsafe { root.as_ptr().as_mut() }?;
+        match root_ref.pre_drop_registry_ {
+            Option::Some(mut ptr) => Option::Some(unsafe { ptr.as_mut() }),
+            Option::None => Option::None,
+        }
+    }
+
     /// 就地构造 `value` 并交出句柄：分配弱槽位 → 分配强块 → 绑定清理登记 → 挂存活链。
     ///
     /// # Errors
     ///
     /// 弱池已满或强池分配失败时返回 [`AllocError`]。
     pub(crate) fn put_value_<T>(&mut self, value: T) -> Result<Retain<T>, AllocError> {
+        self.put_value_with_(value, Option::None)
+    }
+
+    /// 同 [`ScopeInner::put_value_`]，但允许调用方指定对象级清理登记。
+    ///
+    /// 有效登记按"对象级 > 类型级 > 默认"选定（`resolve_`）。
+    ///
+    /// # Errors
+    ///
+    /// 弱池已满或强池分配失败时返回 [`AllocError`]。
+    pub(crate) fn put_value_with_<T>(
+        &mut self,
+        value: T,
+        object_level: Option<&'static PreDropRecord>,
+    ) -> Result<Retain<T>, AllocError> {
+        // 先定好记录（只读借用），再做需要 &mut self 的分配
+        let record = resolve_::<T>(self.root_registry_(), object_level);
         let weak = self.allocate_weak_().ok_or(AllocError)?;
         let layout = Layout::new::<StrongChunk<T>>();
         let mem = self.allocate(layout)?;
         let chunk = mem.as_ptr() as *mut u8 as *mut StrongChunk<T>;
         // SAFETY: mem 满足 StrongChunk<T> 的布局，且本域独占
-        unsafe { (*chunk).init_with_(weak, value) };
+        unsafe { (*chunk).init_with_record_(weak, value, record) };
         // SAFETY: weak 是本域刚分配的槽位
         let weak_ref = unsafe { weak.as_ref() };
         weak_ref.chunk_state_.init_created();
@@ -294,6 +338,7 @@ where
             live_head_: Option::None,
             live_tail_: Option::None,
             weak_pool_: Option::None,
+            pre_drop_registry_: Option::None,
             allocator_: alloc,
         };
         let x = crate::weak_::WeakPool::try_new_with_max_size(page_size, alloc).expect("");
@@ -301,6 +346,15 @@ where
         // 让 `ScopeInner` 也能直接到达弱池：`Scope` 只持有 `ScopeInner`，而 `RootScope`
         // 对分配器类型泛型、在这一侧已擦除，指不到 `weak_pools_` 字段。
         root_scope_mut.scope_inner_.weak_pool_ = Option::Some(x);
+        // 类型级 PreDrop 注册表：由 root 分配，子域复制指针共享同一份（D2d）
+        let registry_mem = alloc
+            .allocate(Layout::new::<PreDropRegistry>())
+            .expect("分配 PreDrop 注册表失败");
+        let registry_ptr = registry_mem.as_ptr() as *mut u8 as *mut PreDropRegistry;
+        // SAFETY: registry_mem 是刚分配、尚无人共享的独占内存；new_ 不做任何分配
+        unsafe { registry_ptr.write(PreDropRegistry::new_()) };
+        root_scope_mut.scope_inner_.pre_drop_registry_ =
+            Option::Some(unsafe { NonNull::new_unchecked(registry_ptr) });
         // 初始化完成后才把真正的地址放入，以表示初始化已完成
         root_ptr_ref.store(&mut root_scope_mut.scope_inner_, Ordering::SeqCst);
         Result::Ok(unsafe {

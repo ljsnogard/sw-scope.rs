@@ -64,8 +64,32 @@ pub trait TrScope {
         length: usize,
     ) -> Result<Retain<[MaybeUninit<T>]>, Self::Err>;
 
+    /// 为类型 `T` 注册一个类型级 `PreDrop` 钩子，作用于该类型的所有实例。
+    fn set_pre_drop<T, Fin>(self, pre_drop: Fin) -> Result<(), Self::Err>
+    where
+        T: ?Sized,
+        Fin: FnOnce(&mut T) + 'static;
+
+    /// 同 [`TrScope::try_put`]，但额外传一个对象级 `PreDrop` 钩子；它覆盖类型级钩子。
+    fn try_put_with<F, T, Fin>(self, factory: F, pre_drop: Fin) -> Result<Retain<T>, Self::Err>
+    where
+        F: FnOnce() -> T,
+        Fin: FnOnce(&mut T) + 'static;
+
     fn put<T>(self, data: T) -> Retain<T> where Self: Sized {
         let Result::Ok(w) = self.try_put(|| data) else {
+            panic!()
+        };
+        w
+    }
+
+    fn put_with<F, T, Fin>(self, factory: F, pre_drop: Fin) -> Retain<T>
+    where
+        Self: Sized,
+        F: FnOnce() -> T,
+        Fin: FnOnce(&mut T) + 'static,
+    {
+        let Result::Ok(w) = self.try_put_with(factory, pre_drop) else {
             panic!()
         };
         w
