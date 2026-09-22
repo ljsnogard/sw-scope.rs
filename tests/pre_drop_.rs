@@ -177,3 +177,22 @@ fn weak_pool_grows_beyond_initial_capacity() {
     assert_eq!(*handles[0].try_owning().expect("首句柄应能独占"), 0);
     assert_eq!(*handles[399].try_owning().expect("末句柄应能独占"), 399);
 }
+
+/// 验证清盘之后槽位被归还、Scope 仍可继续使用（`collect` 不是一次性操作）。
+/// - 手段：先放一批对象并逐个析构句柄，调用 `collect()` 清盘，再放入一个新对象。
+/// - 判断：清盘后的新对象仍能独占并读到写入值；若槽位/强池回收有误，这一步会因复用坏内存
+///   而失败或崩溃。
+#[test]
+fn scope_is_reusable_after_collect() {
+    let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
+    let mut scope = Scope::new();
+    for value in 0..64u64 {
+        let retain = scope.put(value);
+        drop(retain);
+    }
+    // SAFETY: 此时没有存活的句柄
+    unsafe { scope.collect() };
+
+    let retain = scope.put(7u64);
+    assert_eq!(*retain.try_owning().expect("清盘后应仍可用"), 7);
+}

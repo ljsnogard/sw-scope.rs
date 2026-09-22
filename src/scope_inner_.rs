@@ -255,12 +255,31 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         self.chain_tail_ = Option::None;
     }
 
+    /// 由槽位反查它所属的弱池与池内序号。
+    fn weak_pool_of_(
+        &self,
+        weak: NonNull<WeakChunk<()>>,
+    ) -> Option<(
+        NonNull<WeakPool<CELL_SIZE, ScopeInner<CELL_SIZE>>>,
+        PoolIndex,
+    )> {
+        let mut cursor = self.weak_pool_;
+        while let Option::Some(pool) = cursor {
+            // SAFETY: 池链上的池都由树持有且仍然存活
+            let pool_ref = unsafe { pool.as_ref() };
+            if let Option::Some(index) = pool_ref.index_of_(weak) {
+                return Option::Some((pool, index));
+            }
+            cursor = pool_ref.next();
+        }
+        Option::None
+    }
+
     /// 清盘的保证路径（来源 (b)）：遍历存活链，把**仍然活着**的对象逐个 `PreDrop` + 析构，
-    /// 然后整块回收强池。
+    /// 把槽位还回所属弱池，然后整块回收强池。
     ///
     /// 与来源 (a) 共用同一个 `try_claim_destroy` 认领 CAS：级联析构或并发 `drop` 已经处理过
-    /// 的槽位会认领失败，这里直接跳过，因此"恰好一次"仍然成立。弱槽位本身留在树共享的弱池里
-    /// （归还槽位待后续补）。
+    /// 的槽位会认领失败，这里直接跳过，因此"恰好一次"仍然成立。
     ///
     /// # Safety
     ///
@@ -270,6 +289,7 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         while let Option::Some(weak) = cursor {
             // SAFETY: 链上的槽位都由本域分配且仍然有效
             let weak_ref = unsafe { weak.as_ref() };
+            // 先把后继取出来，因为下面会把本槽位还给池（会清掉链接）
             cursor = NonNull::new(weak_ref.next_live());
             if weak_ref.chunk_state_.try_claim_destroy().is_some() {
                 // SAFETY: 刚由本调用认领成功，恰好执行一次
@@ -277,8 +297,13 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
                 weak_ref.chunk_state_.mark_destroyed();
             }
             weak_ref.chunk_state_.mark_finalized();
-            weak_ref.set_prev_live(ptr::null_mut());
-            weak_ref.set_next_live(ptr::null_mut());
+            // 归还槽位：反查所属池 -> deallocate 会把状态、链接与登记一并重置
+            if let Option::Some((pool, index)) = self.weak_pool_of_(weak) {
+                // SAFETY: pool 由本树持有且存活
+                if let Option::Some(pool_ref) = unsafe { pool.as_ptr().as_mut() } {
+                    let _ = pool_ref.deallocate(index);
+                }
+            }
         }
         self.live_head_ = Option::None;
         self.live_tail_ = Option::None;

@@ -311,4 +311,22 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
         let ptr = core::ptr::slice_from_raw_parts_mut(chunks, self.capacity_ as usize);
         unsafe { NonNull::new_unchecked(ptr) }
     }
+
+    /// 判断某个槽位是否落在本池的槽位数组内；是则返回它在池内的序号。
+    ///
+    /// 供清盘路径"由槽位反查所属池"使用：池链上的池地址互不相同，逐池做一次地址范围判断
+    /// 即可定位。
+    pub(crate) fn index_of_(&self, weak: NonNull<WeakChunk<()>>) -> Option<PoolIndex> {
+        let slot_start = self as *const Self as usize + self.cell_offset_ as usize * Self::SLOT_SIZE;
+        let slot_end = slot_start + self.capacity_ as usize * Self::SLOT_SIZE;
+        let addr = weak.as_ptr() as usize;
+        if addr < slot_start || addr >= slot_end {
+            return Option::None;
+        }
+        let offset = addr - slot_start;
+        if offset % Self::SLOT_SIZE != 0 {
+            return Option::None;
+        }
+        Option::Some((offset / Self::SLOT_SIZE) as PoolIndex)
+    }
 }
