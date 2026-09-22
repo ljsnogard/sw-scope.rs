@@ -12,7 +12,7 @@ extern crate alloc;
 use crate::{
     abs_::{TrScope, TrShareMarker},
     emplace_::{IntoEmplace, TrEmplace},
-    index_::Retain,
+    smart_pointer_::Retain,
     scope_inner_::{self, RootScope},
     scope_str_::ScopeStr,
     share_marker_,
@@ -40,7 +40,7 @@ pub enum ScopeError {
 /// 即，当其分配的所有 Retain 指针都不再存活，且其所有子 Scope 也不存活，这个
 /// `Scope` 的内存才会被回收。
 ///
-/// `M` 是预留的线程模式 marker，当前只实现 [`Local`]：整个 Scope 树都在同一个线程内使用。
+/// `M` 是预留的线程模式 marker，当前只实现 `Local`：整个 Scope 树都在同一个线程内使用。
 /// 后续 `Shared` 模式接入时，再为 `M = Shared` 补跨线程约束和同步。
 pub struct Scope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE, M = Local>
 where
@@ -63,7 +63,7 @@ impl Scope<DEFAULT_CELL_SIZE, Local> {
     /// 子域。
     #[allow(clippy::new_without_default)]
     #[cfg(feature = "core-alloc")]
-    pub fn new() -> Self {
+    pub fn new_local() -> Self {
         let root = match RootScope::try_init_default_root_scope_(
             &scope_inner_::DEFAULT_ROOT_SCOPE,
             scope_inner_::DEFAULT_PAGE_SIZE,
@@ -81,7 +81,13 @@ impl Scope<DEFAULT_CELL_SIZE, Local> {
 }
 
 impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
-    /// 配置一个 root scope。若当前进程内已存在 root scope 则返回 false
+    /// 初始化/配置一个 root scope。
+    ///
+    /// Root 初始化是必须的，但这个方法**只返回是否由本次调用完成初始化**，
+    /// 不会把 `RootScope` 包装成公开 `Scope` 返回。用户要创建数据域，必须再通过
+    /// `Scope::new` / `new_from_parent` 创建它的子 Scope。
+    ///
+    /// 若当前进程内已存在 root scope 则返回 false。
     pub fn try_config_root<A>(
         root_ptr: &'static AtomicPtr<ScopeInner<CELL_SIZE>>,
         page_size: usize,

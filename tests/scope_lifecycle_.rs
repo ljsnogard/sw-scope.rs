@@ -14,7 +14,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn closing_scopes_keeps_live_retain_usable() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
-    let parent = Scope::new();
+    let parent = Scope::new_local();
     let mut child = parent.child_scope();
     let retain = child.put(42u64);
 
@@ -39,7 +39,7 @@ fn deep_scope_chain_closes_iteratively() {
 
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
     let mut handles: Vec<Scope> = Vec::new();
-    let mut cur = Scope::new();
+    let mut cur = Scope::new_local();
     for _ in 0..DEPTH {
         let next = cur.child_scope();
         handles.push(cur);
@@ -60,7 +60,7 @@ fn deep_scope_chain_closes_iteratively() {
 #[test]
 fn put_after_close_is_ignored_by_default() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
-    let parent = Scope::new();
+    let parent = Scope::new_local();
     let mut child = parent.child_scope();
     // 析构父句柄：子域被标记关闭，但子句柄仍活着
     drop(parent);

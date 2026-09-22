@@ -92,7 +92,7 @@ pub(crate) struct RootScope<A, const CELL_SIZE: usize, M = Local> {
     extension_: RootExtension<CELL_SIZE>,
     /// 本树分配器的具体类型；由 root 终身持有，是最后一个非零大小字段。
     allocator_: A,
-    /// 预留的线程模式 marker；当前固定为 [`Local`]。
+    /// 预留的线程模式 marker；当前固定为 `Local`。
     _mode_: PhantomData<M>,
 }
 

@@ -24,7 +24,7 @@ fn demo() {
         retain
     }
 
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     let retain = scope.put(42);
     {
         let x = retain.try_owning().unwrap();

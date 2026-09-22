@@ -29,7 +29,7 @@ fn str_hook(_text: &mut ScopeStr) {
 #[test]
 fn put_str_is_usable_as_str() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     let retain = scope.put_str("hello, scope");
 
     let owning = retain.try_owning().expect("应能独占");
@@ -48,7 +48,7 @@ fn put_str_type_hook_runs_on_destruction() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
     STR_HOOKED.store(0, Ordering::Release);
 
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     scope
         .set_pre_drop::<ScopeStr, _>(str_hook)
         .expect("注册类型级钩子应当成功");
@@ -64,7 +64,7 @@ fn put_str_type_hook_runs_on_destruction() {
 #[test]
 fn try_emplace_constructs_sized_target() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     let emplace =
         IntoEmplace::<_, u64>::new(|_layout, place: *mut u64| unsafe { place.write(99) }, ());
     let retain = unsafe { scope.try_emplace(Layout::new::<u64>(), emplace) }.expect("应当成功");
@@ -79,7 +79,7 @@ fn try_emplace_constructs_sized_target() {
 fn try_emplace_constructs_unsized_slice() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
     let values: [u64; 3] = [1, 2, 3];
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     let emplace = IntoEmplace::<_, [u64]>::new(
         |_layout, place: *mut [u64]| unsafe {
             core::ptr::copy_nonoverlapping(values.as_ptr(), place.cast::<u64>(), values.len())
@@ -100,7 +100,7 @@ fn try_emplace_with_runs_object_hook() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
     EMPLACE_HOOKED.store(0, Ordering::Release);
 
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     let emplace =
         IntoEmplace::<_, u64>::new(|_layout, place: *mut u64| unsafe { place.write(7) }, ());
     let retain = unsafe {

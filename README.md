@@ -1,43 +1,125 @@
 # SW-Scope
 
-使用三种智能指针来管理内存的 Arena。
-其中两种是带有域生命周期的智能指针：
-- `Owning<'a, T>` 独占指针，类似 `Box<T>`;
-- `Sharing<'a, T>` 线程安全的引用计数，类似 `Arc<T>`;
-还有一种是不带生命周期的 `Retain<T>`，它更像是一个 GC Handle，传递到哪里，生命周期便带到哪里。
+`sw-scope` 是一个实验性的 Rust scope arena。
+
+它想探索的问题是：
+
+> 能否用 Rust 的生命周期检查处理“临时访问”，
+> 再用一小块类似 GC 的“批量清盘”思想处理引用计数不擅长的清理问题，
+> 而不实现一个真正的 tracing GC？
+
+这里的对象由三种智能指针访问：
+
+- `Retain<T, M = Local>`：类似 GC Handle，不带生命周期，可以独立传递，也可以形成引用环；
+- `Owning<'a, T, M = Local>`：独占访问，类似 `Box<T>`；
+- `Sharing<'a, T, M = Local>`：引用计数共享访问，类似 `Arc<T>`。
+
+`Owning` / `Sharing` 的 `'a` 来自产生它们的 `Retain` 借用，因此它们不能逃逸成任意长生命周期的所有权结构。
+
+## 当前阶段
+
+当前只实现**单线程模式**：
+
+```text
+Root / Scope / Retain / Owning / Sharing
+    => !Send + !Sync
+```
+
+原因是先把树结构、清盘顺序、PreDrop、弱槽位生命周期在单线程下做正确。
+线程安全 / 跨线程 Scope 只保留类型层面的扩展位，不在这一阶段实现。
+
+因此：
+
+- `Retain<T, Local>` / `Owning<'a, T, Local>` / `Sharing<'a, T, Local>` 现在都不能跨线程发送；
+- `Scope<..., Local>` 现在也不能跨线程发送或共享；
+- `RootScope` 是内部管理员，永远不会作为 `Scope` 返回给用户；
+- RootScope 的初始化是必须的，通过 `Scope::try_config_root(...)` 完成，但它只返回是否初始化成功；
+- 用户拿到的 `Scope` 永远是 root 的子 Scope。
+
+这与 gc-arena 的选择类似：先把整个 arena/GC 对象图限制在单线程里，
+因此无需给 `T` 增加 `Send` / `Sync` 约束。
+
+## 类型模型
+
+```rust
+pub struct Local;
+pub struct Shared;
+
+pub struct Scope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE, M = Local> {
+    // ...
+}
+
+pub type LocalScope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> =
+    Scope<CELL_SIZE, Local>;
+
+pub type SharedScope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> =
+    Scope<CELL_SIZE, Shared>;
+
+pub struct Retain<T, M = Local> { /* ... */ }
+pub struct Owning<'a, T, M = Local> { /* ... */ }
+pub struct Sharing<'a, T, M = Local> { /* ... */ }
+```
+
+- `Local`：当前唯一实现的模式，单线程使用；
+- `Shared`：预留的跨线程模式，当前没有可用构造入口；
+- 现有 `Scope<CELL_SIZE>` / `Retain<T>` / `Owning<'a, T>` / `Sharing<'a, T>` 默认仍等价于 Local 模式。
+
+内部 root：
+
+```rust
+pub(crate) struct RootScope<A, const CELL_SIZE: usize, M = Local> {
+    // root 自己的域节点、共享扩展、分配器、线程模式 marker
+}
+```
+
+`RootScope` 只负责：
+
+- 持有整棵树的强池 / 弱池 / `PreDrop` 注册表；
+- 作为域树的根节点，供 `Scope::new()` 创建顶层子 Scope；
+- 提供反向定位 root 的能力；
+- 通过 `Scope::try_config_root(...)` 初始化，但绝不以 `Scope` 形式返回。
+
+它本身不是用户可持有的 Arena。
 
 ## 使用思路
 
 ```rust
+use sw_scope::{LocalScope, Retain, Scope, TrScope};
+
+fn owning_somewhere(retain: Retain<usize>) -> Retain<usize> {
+    let mut x = retain.try_owning().unwrap();
+    *x = 58;
+    // Owning 实现 Drop，借用持续到它被析构
+    drop(x);
+    retain
+}
+
+fn share_everywhere(retain: Retain<usize>) -> Retain<usize> {
+    // 即使强引用一度归零，只要 Retain 还在，数据仍可重新共享
+    let x = retain.try_sharing().unwrap();
+    assert_eq!(*x, 58);
+
+    // 手动制造一个泄漏：下次 try_owning 就会失败
+    let _ = Box::leak(Box::new(x));
+    retain
+}
+
 fn demo() {
-    fn owning_somewhere(retain: Retain<usize>) -> Retain<usize> {
-        let mut x = retain.try_owning().unwrap();
-        *x = 58;
-        drop(x); // `Owning` 实现了 Drop，借用持续到它被析构
-        retain
-    }
-
-    fn share_everywhere(retain: Retain<usize>) -> Retain<usize> {
-        // 依然可以成功尽管强引用一度归零，但 retain 还在，scope 也在
-        let x = retain.try_sharing().unwrap();
-        assert_eq!(*x, 58);
-
-        // 手动制造一个泄露，下次 try_owning 就会失败
-        let _ = Box::leak(Box::new(x));
-        retain
-    }
-
-    let mut scope = Scope::new();
+    // `Scope::new()` 返回的是 RootScope 的子 Scope，而不是 RootScope 自身。
+    let mut scope = LocalScope::new();
     let retain = scope.put(42);
+
     {
         let x = retain.try_owning().unwrap();
         assert_eq!(*x, 42);
     }
+
     let retain = owning_somewhere(retain);
     {
         let x = retain.try_owning().unwrap();
         assert_eq!(*x, 58);
     }
+
     let retain = share_everywhere(retain);
 
     assert!(retain.try_owning().is_none());
@@ -45,45 +127,34 @@ fn demo() {
 }
 ```
 
-# sw-scope
+## 两种机制
 
-`sw-scope` is an experimental Rust scope arena that explores a simple question:
-
-> Can we combine Rust's compile-time lifetime checking with a small part of the idea behind garbage collection, without actually implementing a garbage collector?
-
-The motivation comes from a class of objects that are very common in asynchronous systems, such as `CancellationToken`.
-
-A cancellation state may be copied many times and then observed by futures running on different tasks, threads, or independent parts of a system. Those observers may all disappear at different times, and it may be impossible for any single owner to know when the underlying state is finally safe to destroy.
-
-`Arc` solves the basic lifetime problem, but it represents ownership through reference counting. Once long-lived asynchronous objects start referring to one another, ownership cycles become possible, and reference counting alone cannot reclaim them.
-
-A tracing GC can solve that problem, but it introduces a much larger runtime mechanism than many such applications actually need.
-
-`sw-scope` explores a different division of responsibility.
-
-## Two mechanisms, two jobs
-
-First, use Rust's lifetime system for **temporary access**.
-
-`Owning<'a, T>` and `Sharing<'a, T>` are borrowed access handles. They are derived from a `Retain<T>`, and their lifetimes are constrained by the borrow from which they came. This means the compiler can prevent these access handles from freely escaping into arbitrary long-lived ownership structures.
-
-In other words:
+### 1. Rust 生命周期负责“临时访问”
 
 ```text
-Retain<T>
+Retain<T, M>
     │
-    ├── try_owning()  ──> Owning<'a, T>
+    ├── try_owning()  ──> Owning<'a, T, M>
     │
-    └── try_sharing() ──> Sharing<'a, T>
+    └── try_sharing() ──> Sharing<'a, T, M>
 ```
 
-`Retain<T>` may live independently and may even participate in reference cycles. The temporary `Owning` / `Sharing` access, however, remains subject to Rust's lifetime rules.
+`Retain<T, M>` 可以独立存续，也可以参与引用环；
+`Owning` / `Sharing` 则受 `&Retain` 借用生命周期约束，不会随意逃逸。
+当前 `M = Local` 是唯一实现。
 
-Second, use a small piece of the idea behind GC for **final cleanup**.
+### 2. Scope 负责“批量清盘”
 
-A `Scope` owns the storage for its objects. When the scope is explicitly ended, it can begin destroying the objects it owns without needing to inspect the references between those objects.
+`Scope` 拥有对象的存储。显式清盘时，它会把本域中仍然存活的对象逐个：
 
-Therefore an object graph such as:
+```text
+PreDrop 钩子
+    -> drop_in_place
+    -> 归还弱槽位
+    -> 回收强池
+```
+
+因此对象之间有环：
 
 ```text
 A ───> B
@@ -91,65 +162,46 @@ A ───> B
 └──────┘
 ```
 
-does not prevent cleanup.
+不会阻止清盘。清盘不需要判断对象图可达性，也不需要 tracing。
 
-The collector does not need to determine whether `A` or `B` is reachable from some root. It does not need to trace the object graph at all. The scope itself is the lifetime boundary: when the scope is collected, the objects belonging to that scope can be driven through their destruction state regardless of whether their internal references form trees, DAGs, or cycles.
+## 为什么值得实验
 
-This gives `sw-scope` a deliberately unusual combination:
-
-```text
-             Rust lifetime system
-                    │
-                    ▼
-        temporary access is bounded
-                    │
-                    │
-             Scope-owned storage
-                    │
-                    ▼
-          explicit bulk destruction
-                    │
-                    ▼
-       cycles do not block reclamation
-```
-
-The goal is therefore not to build a smaller GC.
-
-The goal is to explore whether **compile-time lifetime checking can handle the parts that Rust is already good at, while scope-based collection can handle the part where reference counting becomes awkward**.
-
-## Why is this worth experimenting with?
-
-Because it sits between several familiar models:
+`sw-scope` 位于几种熟悉模型之间：
 
 ```text
 Box / Rc / Arc
-    └── object lifetime follows ownership
+    └── 生命周期跟随所有权
 
 Arena
-    └── objects usually die together
+    └── 对象通常一起死亡
 
 Tracing GC
-    └── reachability determines liveness
+    └── 可达性决定存活
 
 sw-scope
-    ├── Scope owns the storage
-    ├── Retain provides a long-lived handle
-    ├── Owning / Sharing provide lifetime-bounded access
-    └── Scope cleanup can destroy cyclic object graphs
+    ├── Scope 拥有存储
+    ├── Retain 提供长生命周期句柄
+    ├── Owning / Sharing 提供生命周期受控的访问
+    └── Scope 清盘可以销毁成环对象图
 ```
 
-The interesting question is whether this middle ground is useful in practice.
+## 路线图
 
-A successful implementation would be particularly interesting for systems containing large numbers of short-lived asynchronous state objects, where:
+1. **单线程正确性**
+   - RootScope 去用户化；
+   - 去除 RootShared 式的全局树状态；
+   - `Scope` / 各类句柄保持 `!Send + !Sync`；
+   - 完善 `try_clone` / `try_alloc_slice_uninit`、环与 `mem::forget` 的清盘测试。
+2. **Local 模式收口**
+   - 默认 root 改为线程本地或显式 local root；
+   - 明确 LocalScope 的“单线程树”边界；
+   - 保持 `Retain<T, Local>` / `Owning<'a, T, Local>` / `Sharing<'a, T, Local>` 的
+     `!Send + !Sync` 语义。
+3. **SharedScope**
+   - 为三种句柄补 `M = Shared` 的实现；
+   - 插入数据要求 `T: Send + Sync`；
+   - 每父域子链锁；
+   - root 弱池、`PreDrop` 注册表、teardown task 的锁设计；
+   - 再补 `SharedScope` 与 `M = Shared` 句柄的 `Send` / `Sync` marker。
 
-* references may be distributed across tasks or threads;
-* reference relationships may form cycles;
-* temporary access should remain checked by Rust's borrow system;
-* explicit ownership of individual objects is inconvenient;
-* and a larger lifetime domain can eventually be shut down as a whole.
-
-`sw-scope` is therefore an experiment in combining **Rust's lifetime guarantees** with **a very small, deliberately non-tracing piece of GC-style reclamation**.
-
-It may turn out that the additional machinery is not worth the complexity.
-
-But if the model works, it could provide a useful alternative for asynchronous systems whose lifetime structure is too irregular for ordinary lexical scopes, while being too structured to justify a full garbage collector.
+当前阶段先完成第 1 步；第 2、3 步都还在类型占位和设计阶段。

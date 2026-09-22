@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    index_::Retain,
+    smart_pointer_::Retain,
     emplace_::TrEmplace,
     scope_str_::ScopeStr,
 };

@@ -50,7 +50,7 @@ fn type_level_hook_runs_on_destruction() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
     A_HOOKED.store(0, Ordering::Release);
 
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     scope
         .set_pre_drop::<TypeLevelA, _>(hook_a)
         .expect("注册类型级钩子应当成功");
@@ -78,7 +78,7 @@ fn object_level_hook_overrides_type_level() {
     OVERRIDDEN_TYPE_HOOKED.store(0, Ordering::Release);
     OBJ_HOOKED.store(0, Ordering::Release);
 
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     scope
         .set_pre_drop::<Override, _>(type_hook_override)
         .expect("注册类型级钩子应当成功");
@@ -108,7 +108,7 @@ fn registry_is_shared_across_child_scopes() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
     B_HOOKED.store(0, Ordering::Release);
 
-    let mut parent = Scope::new();
+    let mut parent = Scope::new_local();
     let mut child = parent.child_scope();
     child
         .set_pre_drop::<TypeLevelB, _>(hook_b)
@@ -147,7 +147,7 @@ fn collect_forces_pre_drop_for_still_alive_objects() {
     C_HOOKED.store(0, Ordering::Release);
     C_DROPPED.store(0, Ordering::Release);
 
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     scope
         .set_pre_drop::<TypeLevelC, _>(hook_c)
         .expect("注册类型级钩子应当成功");
@@ -169,7 +169,7 @@ fn collect_forces_pre_drop_for_still_alive_objects() {
 #[test]
 fn weak_pool_grows_beyond_initial_capacity() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     let mut handles = Vec::new();
     for value in 0..400u64 {
         handles.push(scope.put(value));
@@ -186,7 +186,7 @@ fn weak_pool_grows_beyond_initial_capacity() {
 #[test]
 fn scope_is_reusable_after_collect() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     for value in 0..64u64 {
         let retain = scope.put(value);
         drop(retain);
@@ -226,7 +226,7 @@ fn collect_keeps_weak_slot_alive_while_escaped_retain_exists() {
     let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
     ESCAPED_HANDLE.with(|slot| *slot.borrow_mut() = None);
 
-    let mut scope = Scope::new();
+    let mut scope = Scope::new_local();
     scope
         .set_pre_drop::<EscapedHandle, _>(escape_handle_hook)
         .expect("注册类型级钩子应当成功");

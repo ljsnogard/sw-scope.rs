@@ -1,12 +1,6 @@
 use core::{
     alloc::Layout,
     marker::PhantomData,
-    mem::MaybeUninit,
-};
-
-use crate::{
-    index_::Retain,
-    scope_str_::ScopeStr,
 };
 
 pub trait TrEmplace {

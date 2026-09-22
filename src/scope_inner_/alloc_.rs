@@ -10,7 +10,7 @@ use core::{
 
 use crate::{
     emplace_::TrEmplace,
-    index_::Retain,
+    smart_pointer_::Retain,
     strong_::{StrongChunk, StrongChunkBase, StrongPool},
     weak_::{PreDropRecord, WeakChunk, WeakPool, meta_to_raw_, resolve_},
 };
