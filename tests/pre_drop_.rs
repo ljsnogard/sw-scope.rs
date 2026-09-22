@@ -2,8 +2,9 @@
 //!
 //! 设计依据：`dev-notes/weak-20260922-1135.md` §5。
 //!
-//! 注意：类型级注册表挂在全局 root 上；为了让"共享同一棵树"的用例互不干扰，本文件用一把
-//! 互斥锁把各用例串行化（注册表本身的可变访问目前还没有锁，见 dev-notes §7.3）。
+//! 注意：`Scope::new` 走的是进程内共享的全局 root，其弱槽位池还没有同步；为了让各用例
+//! 在共享池上的分配互不干扰，本文件用一把互斥锁把它们串行化。（注册表本身已经带自旋锁，
+//! 见 `pre_drop_registry_is_thread_safe`。）
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -158,4 +159,21 @@ fn collect_forces_pre_drop_for_still_alive_objects() {
 
     assert_eq!(C_HOOKED.load(Ordering::Acquire), 1, "清盘必须强制跑 PreDrop");
     assert_eq!(C_DROPPED.load(Ordering::Acquire), 1, "清盘必须强制析构数据");
+}
+
+/// 验证弱池扩容：放入超过初始弱池容量的对象不会失败。
+/// - 手段：一个 Scope 里连续放入 400 个 `u64`（初始弱池约 290 个槽位），保留全部句柄。
+/// - 判断：全部放入成功，且首尾句柄都能再次独占并读到写入值。如果弱池不能扩容，第 293 个
+///   `put` 会走 `Err` 分支而 panic。
+#[test]
+fn weak_pool_grows_beyond_initial_capacity() {
+    let _guard = TEST_LOCK.lock().expect("测试锁不该中毒");
+    let mut scope = Scope::new();
+    let mut handles = Vec::new();
+    for value in 0..400u64 {
+        handles.push(scope.put(value));
+    }
+
+    assert_eq!(*handles[0].try_owning().expect("首句柄应能独占"), 0);
+    assert_eq!(*handles[399].try_owning().expect("末句柄应能独占"), 399);
 }

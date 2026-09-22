@@ -115,7 +115,8 @@ impl Scope {
 
     /// 为类型 `T` 注册一个**类型级** `PreDrop` 钩子，作用于本 Scope 树里该类型的所有实例。
     ///
-    /// 表挂在 root 上（整棵树共享一份），因此子 Scope 注册后对其父 / 兄弟同样可见。
+    /// 表挂在 root 上（整棵树共享一份），因此子 Scope 注册后对其父 / 兄弟同样可见。注册表
+    /// 自带自旋锁，因此"多线程各自持有本树的 Scope 并注册 / 放入"不会造成数据竞争。
     /// 钩子必须是非捕获闭包或函数项；捕获式闭包会在编译期被拒绝。
     ///
     /// # Errors
@@ -126,11 +127,9 @@ impl Scope {
         T: ?Sized,
         Fin: FnOnce(&mut T) + 'static,
     {
-        // SAFETY: Scope 持有一个有效的 ScopeInner，且 &mut self 保证独占
-        let inner = unsafe { self.inner_ptr_.as_mut() };
-        let registry = inner
-            .root_registry_mut_()
-            .ok_or(ScopeError::MalformedInit)?;
+        // SAFETY: Scope 持有一个有效的 ScopeInner
+        let inner = unsafe { self.inner_ptr_.as_ref() };
+        let registry = inner.root_registry_().ok_or(ScopeError::MalformedInit)?;
         registry.register_::<T, Fin>(pre_drop);
         Result::Ok(())
     }

@@ -135,17 +135,35 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
             .map_err(|_| AllocError)
     }
 
-    /// 从树共享的弱池链上取一个槽位。
+    /// 从树共享的弱池链上取一个槽位；尾池满了就开一个新池接到链尾。
     ///
-    /// 目前只走"链尾还有空位"这条路径；整条链都满时返回 [`None`]（弱池扩容待补：
-    /// 需要 `WeakPool::try_new_with_max_size` + `link_siblings`）。
+    /// 返回 [`None`] 只会在底层分配器失败时发生。
     pub(crate) fn allocate_weak_(&mut self) -> Option<NonNull<WeakChunk<()>>> {
         let head = self.weak_pool_?;
+        // 沿兄弟链走到尾池
         let mut tail = head;
         while let Option::Some(next) = unsafe { tail.as_ref() }.next() {
             tail = next;
         }
-        let pool = unsafe { tail.as_ptr().as_mut() }?;
+        let chosen = {
+            let pool = unsafe { tail.as_ptr().as_mut() }?;
+            if pool.free_count() != 0 {
+                tail
+            } else {
+                // 尾池已满：开一个新池，登记所属域并接到链尾
+                let new = WeakPool::try_new_with_max_size(DEFAULT_PAGE_SIZE, self.allocator_)
+                    .ok()?;
+                // SAFETY: new 是刚初始化的独占池
+                let new_ref = unsafe { new.as_ptr().as_mut() }?;
+                // SAFETY: self 是本域，池只把它存下来再原样交还
+                new_ref.set_root(NonNull::from(&mut *self));
+                // SAFETY: tail 是链尾，new 尚未入链
+                let tail_ref = unsafe { tail.as_ptr().as_mut() }?;
+                tail_ref.link_siblings(new_ref);
+                new
+            }
+        };
+        let pool = unsafe { chosen.as_ptr().as_mut() }?;
         let index = pool.allocate()?;
         let slots = pool.slots();
         // SAFETY: index < capacity_，落点必在槽位数组内
@@ -174,19 +192,6 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         let root_ref = unsafe { root.as_ref() };
         match root_ref.pre_drop_registry_ {
             Option::Some(ptr) => Option::Some(unsafe { &*ptr.as_ptr() }),
-            Option::None => Option::None,
-        }
-    }
-
-    /// 整棵树共享的类型级 `PreDrop` 注册表（可写）。
-    ///
-    /// 调用方（`Scope::set_pre_drop`）持有 `&mut Scope`，因此对注册表的访问是独占的。
-    pub(crate) fn root_registry_mut_(&mut self) -> Option<&mut PreDropRegistry> {
-        let root = self.root_scope();
-        // SAFETY: root 是本树唯一的 root 域；调用方独占整棵树
-        let root_ref = unsafe { root.as_ptr().as_mut() }?;
-        match root_ref.pre_drop_registry_ {
-            Option::Some(mut ptr) => Option::Some(unsafe { ptr.as_mut() }),
             Option::None => Option::None,
         }
     }

@@ -47,7 +47,7 @@ fn pre_drop_record_is_shared_per_type() {
 /// - 判断：`lookup_::<u64>` 命中且不是空操作。
 #[test]
 fn pre_drop_registry_hits_registered_type() {
-    let mut registry = PreDropRegistry::new_();
+    let registry = PreDropRegistry::new_();
     registry.register_::<u64, _>(|value: &mut u64| *value += 1);
 
     let record = registry
@@ -74,7 +74,7 @@ fn pre_drop_registry_key_does_not_leak_across_types() {
         "本测试要求两者同尺寸，才足以复现常量合并的风险"
     );
 
-    let mut registry = PreDropRegistry::new_();
+    let registry = PreDropRegistry::new_();
     registry.register_::<A, _>(|value: &mut A| value.0 += 1);
 
     assert!(registry.lookup_::<A>().is_some(), "注册过的类型必须命中");
@@ -94,7 +94,7 @@ fn pre_drop_registry_key_does_not_leak_across_types() {
 ///   `PreDropRecord::of::<String>()`。
 #[test]
 fn object_level_record_overrides_type_level() {
-    let mut registry = PreDropRegistry::new_();
+    let registry = PreDropRegistry::new_();
     registry.register_::<String, _>(|text: &mut String| text.clear());
     let type_level = registry
         .lookup_::<String>()
@@ -176,4 +176,33 @@ fn pre_drop_runs_before_drop_exactly_once() {
 
     assert_eq!(PRE_DROPPED.load(Ordering::Acquire), 1, "PreDrop 应恰好运行一次");
     assert_eq!(DROPPED.load(Ordering::Acquire), 1, "Drop 应恰好运行一次");
+}
+
+/// 验证注册表的自旋锁真的把并发访问串行化了。
+/// - 手段：把同一个注册表放进 `Arc`，4 个线程各重复 64 次"注册 + 查找"同一类型。
+/// - 判断：所有线程都能查到登记，且全程没有数据竞争（若没有锁，`Vec` 的并发读写会破坏
+///   内存或让查找失败）。这正是"不能拿 `&mut` 别名共享给多线程"那处隐患的回归测试。
+#[test]
+fn pre_drop_registry_is_thread_safe() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let registry = Arc::new(PreDropRegistry::new_());
+    let mut handles = alloc::vec::Vec::new();
+    for _ in 0..4usize {
+        let worker_registry = Arc::clone(&registry);
+        handles.push(thread::spawn(move || {
+            for _ in 0..64usize {
+                worker_registry.register_::<u64, _>(|value: &mut u64| *value += 1);
+                assert!(
+                    worker_registry.lookup_::<u64>().is_some(),
+                    "并发注册之后必须能查到"
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("工作线程不应 panic");
+    }
+    assert!(registry.lookup_::<u64>().is_some());
 }
