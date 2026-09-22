@@ -17,12 +17,6 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
     /// 标志位：指向本域的 `Scope` 句柄已经析构。回收要求这一位置位（见 A 方案）。
     pub(crate) const FLAG_HANDLE_DROPPED: usize = 1 << 1;
 
-    /// 是否有父域（没有父域的是 root，root 没有 `Scope` 句柄）。
-    #[inline]
-    pub(crate) const fn has_parent_(&self) -> bool {
-        self.parent_scope_.is_some()
-    }
-
     /// 是否已被标记清盘。
     #[inline]
     pub(crate) fn is_closed_(&self) -> bool {

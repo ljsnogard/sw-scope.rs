@@ -9,7 +9,7 @@ use core::{
 };
 
 use crate::{
-    abs_::TrEmplace,
+    emplace_::TrEmplace,
     index_::Retain,
     strong_::{StrongChunk, StrongChunkBase, StrongPool},
     weak_::{PreDropRecord, WeakChunk, WeakPool, meta_to_raw_, resolve_},

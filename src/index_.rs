@@ -39,54 +39,6 @@ where
     weak_chunk_: NonNull<WeakChunk<T>>,
 }
 
-// SAFETY: `Owning` 持有 `T` 的独占访问权，语义与 `Box<T>` 一致。把 `Owning` 移到别的
-// 线程等价于把 `T` 的独占所有权移过去，因此 `Send` 要求 `T: Send`；而 `&Owning` 只给出
-// `&T`，跨线程共享它要求 `T: Sync`。
-unsafe impl<'a, T> Send for Owning<'a, T>
-where
-    T: 'a + ?Sized + Send,
-{
-}
-
-// SAFETY: 见上。
-unsafe impl<'a, T> Sync for Owning<'a, T>
-where
-    T: 'a + ?Sized + Sync,
-{
-}
-
-// SAFETY: `Sharing` 可以克隆，多个句柄可以同时存在于不同线程，并且每个句柄都能给出
-// `&T`，因此它与 `Arc<T>` 的 marker 约束一致：`Send` 与 `Sync` 都要求
-// `T: Send + Sync`。
-unsafe impl<'a, T> Send for Sharing<'a, T>
-where
-    T: 'a + ?Sized + Send + Sync,
-{
-}
-
-// SAFETY: 见上。
-unsafe impl<'a, T> Sync for Sharing<'a, T>
-where
-    T: 'a + ?Sized + Send + Sync,
-{
-}
-
-// SAFETY: `Retain` 可以克隆并分发到不同线程，并且可由任意一个克隆在任意线程升级出
-// `Owning` / `Sharing`；因此它也按 `Arc<T>` 的边界要求 `T: Send + Sync`。实际的状态
-// 迁移由 `WeakChunkStateGuard` 串行化，`Retain::clone/drop` 只改动原子弱计数。
-unsafe impl<T> Send for Retain<T>
-where
-    T: ?Sized + Send + Sync,
-{
-}
-
-// SAFETY: 见上。
-unsafe impl<T> Sync for Retain<T>
-where
-    T: ?Sized + Send + Sync,
-{
-}
-
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 

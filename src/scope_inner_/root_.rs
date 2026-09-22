@@ -18,12 +18,16 @@
 
 use core::{
     alloc::{Allocator, Layout},
+    marker::PhantomData,
     mem,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-use crate::weak_::{PreDropRegistry, WeakChunk, WeakPool};
+use crate::{
+    weak_::{PreDropRegistry, WeakChunk, WeakPool},
+    share_marker_::Local,
+};
 
 use super::{PoolIndex, ScopeInner};
 
@@ -81,16 +85,18 @@ impl<const CELL_SIZE: usize> RootExtension<CELL_SIZE> {
 /// 它**真正持有**弱槽位池链与类型级 `PreDrop` 注册表，因此 [`ScopeInner`] 不再各自复制这
 /// 些指针，也不泄漏分配器。
 #[repr(C)]
-pub(crate) struct RootScope<A, const CELL_SIZE: usize> {
+pub(crate) struct RootScope<A, const CELL_SIZE: usize, M = Local> {
     /// root 自己的域状态。
     scope_inner_: ScopeInner<CELL_SIZE>,
     /// root 比普通域多出来的共享内容。
     extension_: RootExtension<CELL_SIZE>,
-    /// 本树分配器的具体类型；由 root 终身持有，且**永远排在最后**。
+    /// 本树分配器的具体类型；由 root 终身持有，是最后一个非零大小字段。
     allocator_: A,
+    /// 预留的线程模式 marker；当前固定为 [`Local`]。
+    _mode_: PhantomData<M>,
 }
 
-impl<A, const CELL_SIZE: usize> RootScope<A, CELL_SIZE>
+impl<A, const CELL_SIZE: usize> RootScope<A, CELL_SIZE, Local>
 where
     A: Allocator + 'static,
 {
@@ -149,9 +155,11 @@ where
         let inner_ptr = unsafe { ptr::addr_of_mut!((*root_ptr).scope_inner_) };
         let ext_ptr = unsafe { ptr::addr_of_mut!((*root_ptr).extension_) };
         let owner_ptr = unsafe { ptr::addr_of_mut!((*root_ptr).allocator_) };
+        let mode_ptr = unsafe { ptr::addr_of_mut!((*root_ptr)._mode_) };
         unsafe {
-            // 先把具体分配器移进 root（最后一个字段），再取擦除引用
+            // 先把具体分配器移进 root（最后一个非零大小字段），再取擦除引用
             owner_ptr.write(allocator);
+            mode_ptr.write(PhantomData);
             let alloc: &'static dyn Allocator = &*owner_ptr;
             // root 域
             inner_ptr.write(ScopeInner {

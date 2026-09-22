@@ -1,5 +1,6 @@
 use core::{
     alloc::{Allocator, Layout},
+    marker::PhantomData,
     mem::MaybeUninit,
     ptr::{self, NonNull},
     sync::atomic::AtomicPtr,
@@ -9,14 +10,17 @@ use core::{
 extern crate alloc;
 
 use crate::{
-    abs_::{IntoEmplace, TrEmplace, TrScope},
+    abs_::{TrScope, TrShareMarker},
+    emplace_::{IntoEmplace, TrEmplace},
     index_::Retain,
-    scope_inner_::{self, RootScope, RootScopeRef},
+    scope_inner_::{self, RootScope},
     scope_str_::ScopeStr,
+    share_marker_,
     weak_::PreDropRecord,
 };
 
 pub use scope_inner_::{DEFAULT_CELL_SIZE, ScopeInner};
+pub use share_marker_::{Local, Shared};
 
 #[derive(Debug)]
 pub enum ScopeError {
@@ -35,12 +39,28 @@ pub enum ScopeError {
 /// 一个自包含结构，位于 Root 树，其生命周期由其分配的所有 Retain<T> 共同决定。
 /// 即，当其分配的所有 Retain 指针都不再存活，且其所有子 Scope 也不存活，这个
 /// `Scope` 的内存才会被回收。
-pub struct Scope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
+///
+/// `M` 是预留的线程模式 marker，当前只实现 [`Local`]：整个 Scope 树都在同一个线程内使用。
+/// 后续 `Shared` 模式接入时，再为 `M = Shared` 补跨线程约束和同步。
+pub struct Scope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE, M = Local>
+where
+    M: TrShareMarker,
+{
     inner_ptr_: NonNull<ScopeInner<CELL_SIZE>>,
+    _mode_: PhantomData<M>,
 }
 
-impl Scope<DEFAULT_CELL_SIZE> {
-    /// 从默认的 RootScope 中创建一个子 scope
+/// 线程局部 Scope 的便捷别名。
+pub type LocalScope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> = Scope<CELL_SIZE, Local>;
+
+/// 预留的跨线程 Scope 别名；当前还没有可用构造入口。
+pub type SharedScope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> = Scope<CELL_SIZE, Shared>;
+
+impl Scope<DEFAULT_CELL_SIZE, Local> {
+    /// 从默认的 RootScope 中创建一个子 scope。
+    ///
+    /// RootScope 永远不会被包装成公开 `Scope` 返回；这里直接以 root 域为父创建它的
+    /// 子域。
     #[allow(clippy::new_without_default)]
     #[cfg(feature = "core-alloc")]
     pub fn new() -> Self {
@@ -51,20 +71,22 @@ impl Scope<DEFAULT_CELL_SIZE> {
         ) {
             Result::Err(s) | Result::Ok(s) => s,
         };
-        // 以 root 域为父创建子 Scope；root 自身没有父域，临时句柄析构时会被跳过
-        let root_scope = Self::make_scope_(root);
-        Self::new_from_parent(&root_scope)
+        // SAFETY: root 是本树 root，创建子域不会与其它借用冲突
+        let inner = ScopeInner::new_child_(NonNull::from(root)).expect("分配子 Scope 失败");
+        Scope {
+            inner_ptr_: inner,
+            _mode_: PhantomData,
+        }
     }
 }
 
 impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
-    /// 获取或者创建一个 root scope。若当前进程内已存在 root scope 则通过 Err
-    /// 返回已创建的 root scope
-    pub fn root<A>(
+    /// 配置一个 root scope。若当前进程内已存在 root scope 则返回 false
+    pub fn try_config_root<A>(
         root_ptr: &'static AtomicPtr<ScopeInner<CELL_SIZE>>,
         page_size: usize,
         allocator: A,
-    ) -> Result<Self, Self>
+    ) -> bool
     where
         A: 'static + Allocator,
     {
@@ -73,14 +95,16 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
             page_size,
             allocator,
         );
-        x.map(Self::make_scope_)
-            .map_err(Self::make_scope_)
+        x.is_ok()
     }
 
     pub fn new_from_parent(parent: &Scope<CELL_SIZE>) -> Self {
         // SAFETY: parent.inner_ptr_ 来自一个仍然存活的 Scope
         let inner = ScopeInner::new_child_(parent.inner_ptr_).expect("分配子 Scope 失败");
-        Scope { inner_ptr_: inner }
+        Scope {
+            inner_ptr_: inner,
+            _mode_: PhantomData,
+        }
     }
 
     /// 显式清盘：遍历本域存活链，把仍然活着的数据逐个 `PreDrop` + 析构，再整块回收强池。
@@ -281,14 +305,9 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
         }
     }
 
-    fn make_scope_(root_scope_ref: RootScopeRef<CELL_SIZE>) -> Self {
-        Scope {
-            inner_ptr_: NonNull::from(root_scope_ref),
-        }
-    }
 }
 
-impl<const CELL_SIZE: usize>  TrScope for &mut Scope<CELL_SIZE> {
+impl<const CELL_SIZE: usize> TrScope for &mut Scope<CELL_SIZE, Local> {
     type Err = ScopeError;
 
     #[inline]
@@ -365,7 +384,10 @@ impl<const CELL_SIZE: usize>  TrScope for &mut Scope<CELL_SIZE> {
     }
 }
 
-impl<const CELL_SIZE: usize> core::cmp::PartialEq for Scope<CELL_SIZE> {
+impl<const CELL_SIZE: usize, M> core::cmp::PartialEq for Scope<CELL_SIZE, M>
+where
+    M: TrShareMarker,
+{
     fn eq(&self, other: &Self) -> bool {
         let lhs = self.inner_ptr_.as_ptr();
         let rhs = other.inner_ptr_.as_ptr();
@@ -373,9 +395,15 @@ impl<const CELL_SIZE: usize> core::cmp::PartialEq for Scope<CELL_SIZE> {
     }
 }
 
-impl<const CELL_SIZE: usize> core::cmp::Eq for Scope<CELL_SIZE> {}
+impl<const CELL_SIZE: usize, M> core::cmp::Eq for Scope<CELL_SIZE, M>
+where
+    M: TrShareMarker,
+{}
 
-impl<const CELL_SIZE: usize> Drop for Scope<CELL_SIZE> {
+impl<const CELL_SIZE: usize, M> Drop for Scope<CELL_SIZE, M>
+where
+    M: TrShareMarker,
+{
     /// 按清盘方案 A：只把子树**标记关闭、摘链、挂进待回收名单**，再尝试回收已经静默的域。
     ///
     /// 真正的析构与内存回收发生在"句柄已析构 + 已关闭 + 静默"之后（可能很久以后），
@@ -383,10 +411,6 @@ impl<const CELL_SIZE: usize> Drop for Scope<CELL_SIZE> {
     fn drop(&mut self) {
         // SAFETY: Scope 持有一个有效的 ScopeInner
         let inner = unsafe { self.inner_ptr_.as_mut() };
-        // 根域没有 Scope 句柄，不应走到这里；防御性跳过
-        if !inner.has_parent_() {
-            return;
-        }
         inner.mark_handle_dropped_();
         if !inner.is_closed_() {
             // 非递归地把整棵子树标记关闭并挂进名单

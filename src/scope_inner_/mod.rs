@@ -28,7 +28,7 @@ mod teardown_;
 #[cfg(test)]
 mod tests_;
 
-pub(crate) use root_::{RootScope, RootScopeRef};
+pub(crate) use root_::RootScope;
 pub(crate) use root_::RootExtension;
 
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 4 * 4096usize;
