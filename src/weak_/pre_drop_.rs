@@ -6,11 +6,14 @@
 //!   取引用"提升进静态内存；弱槽位只保存一个 `&'static PreDropRecord`；
 //! - 记录自身只含一个类型擦除入口，**不含**数据地址与 `?Sized` 元数据：前者由入口按 `T`
 //!   单态化重建，后者仍逐对象保存在弱槽位里；
-//! - 类型级钩子由整棵树共享的 [`PreDropRegistry`] 按类型名查找（物理位置见 D2d），对象级
-//!   钩子直接在放入点生成记录并覆盖类型级；
+//! - 类型级钩子由整棵树共享的 [`PreDropRegistry`] 按**类型 ID** 查找（物理位置见 D2d），
+//!   对象级钩子直接在放入点生成记录并覆盖类型级；
 //! - 钩子必须是**零尺寸类型**（函数项或非捕获闭包），捕获式闭包会在编译期被 `const` 断言拒绝。
 
-use core::{mem, ptr};
+use core::{any::TypeId, mem, ptr};
+
+#[cfg(feature = "core-alloc")]
+use alloc::collections::BTreeMap;
 
 use crate::atomic_::SpinMutex;
 
@@ -153,23 +156,23 @@ unsafe fn pre_drop_entry_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(
 ///
 /// # 键的选择
 ///
-/// 键是 [`core::any::type_name`]，**不是**"每类型一份常量的地址"：内容相同的常量会被编译器
-/// 合并（例如 `u64` 与 `u32` 的无钩子记录），拿地址当键会让不同类型的钩子互相串味。
+/// 键是**类型 ID**（[`core::any::TypeId`]，由 [`typeid::of`] 取得）。不再用
+/// [`core::any::type_name`]，也不用"每类型一份常量的地址"：
+///
+/// - `type_name` 的文档明确声明"不保证唯一"，跨 crate / 版本重名时会让不同类型的钩子串味；
+/// - 每类型常量的地址会被编译器合并（内容相同的记录地址相同），同样不能当身份；
+/// - [`typeid::of`] 对**非 `'static`、`?Sized`** 的 `T` 同样可用，这正是 `Retain<T>`
+///   允许携带借用所需要的（标准库的 `TypeId::of` 要求 `T: 'static`，不满足）。
+///
+/// 表用 [`BTreeMap`]：条目按类型 ID 有序，查找 / 插入是 `O(log n)`，且不需要为"哈希"再多
+/// 引入一套随机状态。
 #[cfg(feature = "core-alloc")]
 pub(crate) struct PreDropRegistry {
     /// 自旋锁直接锁住登记表：跨 Scope 树共享，注册与查找都必须串行化。
     ///
     /// "锁住的内容"由 [`SpinMutex`] 的泛型参数给出，因此这里不需要再手写
     /// `UnsafeCell` 与 `unsafe impl Sync/Send`。
-    entries_: SpinMutex<alloc::vec::Vec<PreDropEntry>>,
-}
-
-#[cfg(feature = "core-alloc")]
-struct PreDropEntry {
-    /// 类型键，取自 [`core::any::type_name`]。
-    key_: &'static str,
-    /// 该类型的有效登记。
-    record_: &'static PreDropRecord,
+    entries_: SpinMutex<BTreeMap<typeid::ConstTypeId, &'static PreDropRecord>>,
 }
 
 #[cfg(feature = "core-alloc")]
@@ -177,7 +180,7 @@ impl PreDropRegistry {
     /// 建一张空表（要分配，因此不是 `const fn`）。
     pub(crate) fn new() -> Self {
         PreDropRegistry {
-            entries_: SpinMutex::new(alloc::vec::Vec::new()),
+            entries_: SpinMutex::new(BTreeMap::new()),
         }
     }
 
@@ -185,7 +188,10 @@ impl PreDropRegistry {
     ///
     /// 把"抢锁 + 取可变引用"合成一次调用，调用方拿不到能脱离临界区的 `&mut`；解锁由
     /// [`SpinMutex`] 的守卫在析构时完成，因此临界区内 panic 也不会把锁落下。
-    fn with_entries_<R>(&self, access: impl FnOnce(&mut alloc::vec::Vec<PreDropEntry>) -> R) -> R {
+    fn with_entries_<R>(
+        &self,
+        access: impl FnOnce(&mut BTreeMap<typeid::ConstTypeId, &'static PreDropRecord>) -> R,
+    ) -> R {
         self.entries_.with_locked(access)
     }
 
@@ -193,26 +199,17 @@ impl PreDropRegistry {
     ///
     /// `hook` 本身只是用来推断 `Fin` 的类型，零尺寸、按值收下即丢弃。
     pub(crate) fn register_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(&self, _hook: Fin) {
-        let key = core::any::type_name::<T>();
+        let key = typeid::ConstTypeId::of::<T>();
         let record = PreDropRecord::of_with::<T, Fin>();
-        self.with_entries_(|entries| match entries.iter_mut().find(|entry| entry.key_ == key) {
-            Option::Some(entry) => entry.record_ = record,
-            Option::None => entries.push(PreDropEntry {
-                key_: key,
-                record_: record,
-            }),
+        self.with_entries_(|entries| {
+            entries.insert(key, record);
         });
     }
 
     /// 查找类型 `T` 的类型级登记。
     pub(crate) fn lookup_<T: ?Sized>(&self) -> Option<&'static PreDropRecord> {
-        let key = core::any::type_name::<T>();
-        self.with_entries_(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry.key_ == key)
-                .map(|entry| entry.record_)
-        })
+        let key = typeid::ConstTypeId::of::<T>();
+        self.with_entries_(|entries| entries.get(&key).copied())
     }
 }
 

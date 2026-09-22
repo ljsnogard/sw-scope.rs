@@ -15,7 +15,11 @@ strict-put-after-close = []
 
 default = ["core-alloc"]
 
+[dependencies]
+# 类型键：`typeid::of::<T>()` 对非 `'static`、`?Sized` 的 `T` 也能给出稳定的
+# `core::any::TypeId`，用来取代原先不可靠的 `core::any::type_name`。
+typeid = "1"
+
 # 对照实验 crate：独立 workspace，引用 bumpalo 以实证析构语义。
-# sw-scope 本体本身不依赖任何外部 crate。
 [workspace]
 members = [".", "drop-semantics-demo"]

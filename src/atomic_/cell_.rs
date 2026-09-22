@@ -1,4 +1,4 @@
-//! 字宽原子量抽象与内存序配置：`atomex` 相关子集的零依赖版本。
+//! 字宽原子量抽象与内存序配置：`atomex` 相关子集的本地实现（不引 `atomex`）。
 //!
 //! - [`TrAtomicCell`]：把 `AtomicU32` / `AtomicUsize` 统一成"字宽原子量"；
 //! - [`TrAtomicData`]：值类型到其原子单元的映射，并给出字宽与零元 / 一；
@@ -119,8 +119,7 @@ pub(crate) trait TrBitWord:
     + Not<Output = Self>
     + Shl<u32, Output = Self>
     + PartialEq
-{
-}
+{}
 
 impl<T> TrBitWord for T where
     T: TrAtomicData
@@ -129,8 +128,7 @@ impl<T> TrBitWord for T where
         + Not<Output = T>
         + Shl<u32, Output = T>
         + PartialEq
-{
-}
+{}
 
 /// CAS 与读取使用的内存序，作为锁的 `O` 配置项。
 pub(crate) trait TrCmpxchOrderings {

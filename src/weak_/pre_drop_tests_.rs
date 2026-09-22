@@ -60,7 +60,7 @@ fn pre_drop_registry_hits_registered_type() {
 /// - 手段：给 `A(u64)` 注册钩子；`B(u64)` 与它同尺寸、同对齐，且两者都不需要 `Drop`，
 ///   因此二者"无钩子记录"的内容完全相同、允许被编译器合并成同一份常量。
 /// - 判断：`lookup_::<A>` 命中，而 `lookup_::<B>` 必须为 `None`。若拿记录地址当键，这一条
-///   就会因为常量合并而失败；用 `type_name` 作键则不会。
+///   就会因为常量合并而失败；用 `typeid::of` 得到的类型 ID 作键则不会。
 #[test]
 fn pre_drop_registry_key_does_not_leak_across_types() {
     #[repr(transparent)]
@@ -85,6 +85,25 @@ fn pre_drop_registry_key_does_not_leak_across_types() {
     assert!(
         registry.lookup_::<String>().is_none(),
         "未注册的类型不能命中"
+    );
+}
+
+/// 验证类型键支持**非 `'static`** 的类型参数——这正是引入 `typeid` 的理由。
+/// - 手段：用一个带生命周期参数的类型 `Borrowed<'a>` 注册类型级钩子，再查找同一类型；
+///   生命周期会被 `typeid::of` 规范化掉，因此注册与查找必须命中同一个键。
+/// - 判断：`lookup_::<Borrowed<'_>>` 命中。若改用 `core::any::TypeId::of`，这段代码根本
+///   无法通过编译（它要求 `T: 'static`）。
+#[test]
+fn pre_drop_registry_key_accepts_non_static_types() {
+    struct Borrowed<'a>(core::marker::PhantomData<&'a u64>);
+
+    fn hook_borrowed(_: &mut Borrowed<'_>) {}
+
+    let registry = PreDropRegistry::new();
+    registry.register_::<Borrowed<'_>, _>(hook_borrowed);
+    assert!(
+        registry.lookup_::<Borrowed<'_>>().is_some(),
+        "非 'static 的类型也必须能登记与命中",
     );
 }
 
