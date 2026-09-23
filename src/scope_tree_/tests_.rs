@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 use super::{DEFAULT_PAGE_SIZE, DEFAULT_ROOT_SCOPE, RootExtension, RootScope, ScopeNode};
 
 /// 测试 root 真正持有树级共享资源（弱池链、注册表），且无论空域还是有对象的域，都能 O(1)
-/// 找到 root：空域走"分配器指针反推"，有对象的域再走
+/// 找到 root：空域走"分配器指针反推"，已经 `retained()`（因而有关联 `WeakChunk`）的域再走
 /// "强块 → 弱槽位 → 弱池 → root"。
 /// - 手段：取（或并发初始化）默认 root，创建一个子域并放入 400 个对象，强制弱池扩容出
 ///   第二个池；分别在放入前后用 `ScopeInner::root_extension_`、并对存活链头尾两个槽位用

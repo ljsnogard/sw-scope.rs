@@ -15,11 +15,12 @@ use crate::{
 /// # 它为什么这么小
 ///
 /// 决策「不复用内存空洞」之后，强块不再需要在池内维护任何出入记录：位置一旦分配就
-/// 终身不变，整块池子最后一次性回收。于是状态、存活链链接、析构登记这些管理信息全部
-/// 移到了 [`WeakChunk`]（对象的身份所在，也是生命周期最长的一环），强块自己只剩两样：
+/// 终身不变，整块池子最后一次性回收。于是状态、存活链链接、清理登记这些管理信息全部
+/// 挂在 [`WeakChunk`]（对象身份槽位）上——但 `WeakChunk` 是**可选**的：对象可以直接以
+/// `Owning` / `Sharing` 放进 `Scope`，只有调用 `retained()` 才补建它。强块自己只剩两样：
 ///
 /// - 数据本身（`data_`）；
-/// - 自己那份**强**引用计数与指回身份的指针（[`StrongChunkBase`]）。
+/// - 自己那份**强**引用计数与指回身份槽位的可选指针（[`StrongChunkHead`]）。
 ///
 /// 强引用计数与弱槽位里的弱引用计数是**两个不同的东西**：前者数 "多少个 `Sharing` 共享
 /// 这份数据"，后者数 "多少个 `Retain` 句柄指向这个对象"，因此各自保管、互不干扰。
@@ -34,13 +35,14 @@ where
 
 /// 强块与类型无关的公共头部。
 ///
-/// 弱槽位通过 [`StrongChunkBase::weak_chunk`] 单向指回身份，因此从强块出发可以找到
-/// 存活链与析构登记所在的槽位；反向则不需要链接。
+/// [`StrongChunkHead::weak_chunk_`] 指向本块的身份弱槽位：对象尚未 `retained()` 时为空，
+/// 一旦补建便在强块的整个生命周期内保持不变。因此从强块出发可以找到存活链与清理登记所在
+/// 的槽位；反向则不需要链接。
 #[repr(C)]
 pub(crate) struct StrongChunkHead {
     /// 强引用计数（仅 `Sharing<T>` 有效）。
     chunk_info_: StrongChunkHeadInfo,
-    /// 指向本块的身份弱槽位。
+    /// 指向本块的身份弱槽位；尚未建立身份时为 null。
     weak_chunk_: AtomicPtr<WeakChunk<()>>,
 }
 
@@ -70,7 +72,7 @@ impl StrongChunkHead {
         }
     }
 
-    /// 本块的身份弱槽位。
+    /// 本块的身份弱槽位；尚未 `retained()` 时为空。
     #[inline]
     pub(crate) fn weak_chunk(&self) -> Option<NonNull<WeakChunk<()>>> {
         let p = self.weak_chunk_.load(Ordering::Acquire);
@@ -81,7 +83,7 @@ impl StrongChunkHead {
         }
     }
 
-    /// 数据区的起始偏移（以 `StrongChunkBase` 计）。
+    /// 数据区的起始偏移（以 `StrongChunkHead` 计）。
     ///
     /// 注意返回的是 `size_of::<T>()` 为 0 时的偏移；`?Sized` 的 `T` 必须改用
     /// [`StrongChunk::data_offset`]，因为数据区的位置随 `T` 的元数据而变。
@@ -187,13 +189,20 @@ where
         self.chunk_head_.chunk_state().is_data_alive()
     }
 
-    /// 本块的身份弱槽位。
+    /// 本块的身份弱槽位；对象从未 `retained()` 时为 [`None`]。
+    ///
+    /// 该指针一旦建立便不再改变：要么一直为空，要么在强块的整个生命周期内都指向同一个
+    /// `WeakChunk`。
     #[inline]
     pub(crate) fn weak_chunk(&self) -> Option<NonNull<WeakChunk<()>>> {
         self.chunk_head_.weak_chunk()
     }
 
-    /// 供分配路径调用：绑定身份、清零强计数，并把数据登记进弱槽位的清理登记。
+    /// 供**已建立身份弱槽位**的分配路径调用：绑定身份、清零强计数，并把数据登记进弱槽位的
+    /// 清理登记。
+    ///
+    /// 直接以 `Owning` / `Sharing` 放进 `Scope` 的对象此时还没有弱槽位，不走本方法；它要到
+    /// `retained()` 补建身份时才建立这份绑定。
     ///
     /// `record` 是调用方按"对象级 > 类型级 > 默认"选好的有效登记，交给类型无关的弱槽位保管。
     ///

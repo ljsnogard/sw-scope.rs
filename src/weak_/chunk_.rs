@@ -21,11 +21,12 @@ pub enum DataState {
     /// 默认状态，弱槽位未分配，弱引用计数为0。
     Reclaimed = 0x00,
 
-    /// 已分配 StrongChunk 并持有数据，但当前没有任何强引用持有者，WeakChunk 是唯一
-    /// 的持有者。
+    /// 已关联 `WeakChunk`、数据活着，但当前没有任何强引用持有者（既没有 `Owning`，强计数
+    /// 也为 0）。
     ///
-    /// 与 `Rc`，`Arc` 不同，被 `Retain` 关联时强引用计数降为 0 并不一定会马上回收
-    /// 内存空间，除非同时弱引用计数也降为 0 或者 Scope 发起了清盘。
+    /// 与 `Rc` / `Arc` 不同：此时强引用计数虽为 0，但只要还有 `Retain`（弱计数 > 0）撑着，
+    /// 或者 Scope 尚未清盘，内存空间就不一定马上回收。它是升级为 `OwnOrShare` 的起点，也是
+    /// "计数不可达"确定性析构的判据状态。
     Retained = 0x01,
 
     /// 数据被 `Owning<T>` 或 `Sharing<T>` 持有且有关联的 WeakChunk。
@@ -75,21 +76,30 @@ impl DataState {
     }
 }
 
-/// 弱引用槽位。它既是 `Retain<T>` 的持有对象，也是**对象的身份与生命周期上下文**。
+/// 弱引用槽位：`Retain<T>` 指向的身份槽位，也是存活链与清理登记的落点。
 ///
-/// # 为什么它是最长寿的一环
+/// # 它是可选的，而且一旦建立就与强块同寿
 ///
-/// `Retain<T>` 是类似 GC Handle 的东西：一旦绑定后，句柄传递到哪里，生命周期便带
-/// 到哪里。绑定后 `Owning<'a, T>` / `Sharing<'a, T>` 都是从 `Retain` 上"借"出来的
-/// 伴生视图，它们的 `'a` 绑定在 `&Retain` 上，**不可能比产生它们的那个 `Retain`
-/// 活得更久**。因此：
+/// 对象可以直接以 `Owning` / `Sharing` 放进 `Scope`，这种对象**没有** `WeakChunk`。只有调用
+/// `Owning::retained()` / `Sharing::retained()` 需要取得 `Retain` 时，才为强块补建本槽位。
+/// 因此 `StrongChunk` 与 `WeakChunk` **不再一一对应**：一个强块可能对应零个或一个弱槽位。
 ///
-/// > 数据还活着 ⇒ 至少有一个 `Retain` 活着 ⇒ 这个 `WeakChunk` 还活着。
+/// 补建之后，强块上那个“身份槽位”指针终生不变：只要强块还活着，这个 `WeakChunk` 就一直
+/// 存在，不会被回收复用。这就是现行模型的核心不变量：
 ///
-/// 这条不等式是后续所有设计的地基：
-/// - 存活链的链接、清理登记都可以安全地放在弱槽位里——强块的数据区活着的整个期间，
-///   弱槽位都不可能被回收复用；
-/// - `?Sized` 的析构也因此可行：重建胖指针所需的元数据有地方长期保存。
+/// > `WeakChunk` 活着 ⇒ 它对应的 `StrongChunk` 活着；反之**不**成立。
+///
+/// 旧模型里"数据还活着 ⇒ 至少有一个 `Retain` 活着 ⇒ 弱槽位活着"的地基已经不再成立，因为
+/// 没有 `WeakChunk` 的对象同样可以是活的、被独占 / 共享的。
+///
+/// # 谁是生命周期权威
+///
+/// - 没有 `WeakChunk`：对象就是普通的 arena `Box` / `Arc`，最后一个强句柄析构时就地析构；
+/// - 有 `WeakChunk`：强计数归零不再直接析构，改由 `Retain` 与状态机决定。清理登记与存活链
+///   都挂在本槽位上，因此 `?Sized` 的析构可行——重建胖指针所需的元数据有地方长期保存。
+///
+/// 反过来说，凡是要经弱槽位完成的工作，都必须先确认强块的 `weak_chunk()` 返回 `Some`；
+/// 尚无弱槽位的对象不走这条路径。
 ///
 /// # 何时可以被回收
 ///
@@ -138,7 +148,7 @@ type StateWord = SpinFlag<u32, AtomicU32, LockSignal>;
 
 /// 状态字的位布局：高 1 位锁、次 3 位 [`DataState`]、低 28 位**弱**引用计数。
 ///
-/// 强引用计数**不在这里**，它由 [`StrongChunkBase`] 自己管理：两者数的是完全不同的东西。
+/// 强引用计数**不在这里**，它由 [`StrongChunkHead`] 自己管理：两者数的是完全不同的东西。
 #[repr(C)]
 pub(crate) struct WeakChunkState {
     /// 在所属 `WeakPool` 中的索引（0 开始），也用于从槽位反推池地址。
@@ -266,12 +276,12 @@ impl WeakChunkState {
         self.transition_(|current| (current == from).then_some(to))
     }
 
-    /// 认领销毁：把状态从 `{Created, Owning, Sharing}` 搬到 [`DataState::Destroying`]。
+    /// 认领销毁：把状态从 `{Retained, OwnOrShare}` 搬到 [`DataState::Collected`]。
     ///
     /// 返回先前状态表示认领成功；返回 [`None`] 表示已有别的路径处理过（或该块从未携带
     /// 存活数据），调用方必须放弃析构。这是在"多路径析构"下保证**恰好销毁一次**的唯一
-    /// 裁决点：`Owning::drop`、`Sharing::drop` 的最后一次减计数、以及清盘兜底，都只能
-    /// 通过这里竞争。
+    /// 裁决点：有关联 `WeakChunk` 的 `Owning::drop` / `Sharing::drop` 收尾、以及清盘兜底，
+    /// 都只能通过这里竞争。
     pub(crate) fn try_claim_destroy(&self) -> Option<DataState> {
         self.transition_(|from| {
             from.is_claimable()
@@ -304,12 +314,12 @@ impl WeakChunkState {
             .is_some()
     }
 
-    /// 把状态置为 `Created`。分配路径在数据就位、槽位正式投入使用之后调用。
+    /// 把状态置为 `Retained`。分配路径在数据就位、槽位正式投入使用之后调用。
     pub(crate) fn try_mark_created(&self) -> Option<DataState> {
         self.transition_(|_| Option::Some(DataState::Retained))
     }
 
-    /// 只在当前为 `Created` 时把状态置为 `to`；返回先前状态。
+    /// 只在当前为 `Retained` 时把状态置为 `to`；返回先前状态。
     ///
     /// 这个条件迁移同时充当"无强引用"这一前提的判据与上锁动作，因此不需要额外的锁位。
     pub(crate) fn try_set_state(&self, to: DataState) -> Option<DataState> {
@@ -499,18 +509,18 @@ where
 
     /// 尝试把 `Retain` 的持有关系升级为 `Owning`。
     ///
-    /// 前提是当前状态恰为 [`DataState::Created`]（数据活着且没有强引用持有者）。整个
+    /// 前提是当前状态恰为 [`DataState::Retained`]（数据活着且没有强引用持有者）。整个
     /// “检查无强引用 + 迁移状态”步骤在槽位锁内完成，因此判据与写入不会被并发的
     /// `Sharing` 计数变化撕开。
     ///
     /// # Errors
     ///
-    /// 状态不是 `Created`（数据已析构，或已被 `Owning` / `Sharing` 持有）时返回当前状态。
+    /// 状态不是 `Retained`（数据已析构，或已被 `Owning` / `Sharing` 持有）时返回当前状态。
     pub fn try_owning(&self) -> Result<NonNull<StrongChunkHead>, DataState> {
         let Some(chunk) = self.strong_chunk() else {
             return Result::Err(self.data_state());
         };
-        // 升级要同时保证"状态为 Created"与"没有其它访问者"；锁住槽位后判据与状态写
+        // 升级要同时保证"状态为 Retained"与"没有其它访问者"；锁住槽位后判据与状态写
         // 构成一个临界区。守卫在返回时自动释放，因此成功路径不会把锁带出函数。
         let guard = self.lock_busy();
         match guard
@@ -524,8 +534,8 @@ where
 
     /// 尝试把 `Retain` 的持有关系升级为 `Sharing`。
     ///
-    /// - 状态为 `Created`：置为 `Sharing` 并把强计数置 1；
-    /// - 状态已经是 `Sharing`：只把强计数加 1。这条**幂等增量**是 README 使用思路里
+    /// - 状态为 `Retained`：置为 `OwnOrShare` 并把强计数置 1；
+    /// - 状态已经是 `OwnOrShare`：只把强计数加 1。这条**幂等增量**是 README 使用思路里
     ///   "泄漏一个 `Sharing` 之后仍能继续共享"的依据。
     ///
     /// # Errors
@@ -740,7 +750,7 @@ where
 /// 合成一个临界区：
 ///
 /// - `try_owning` / `try_sharing`：锁住之后才检查状态、绑定强块、写登记、抬计数；
-/// - 分配路径：锁住之后才把"已就位的数据"正式置为 `Created`，避免外界看到半成品。
+/// - 分配路径：锁住之后才把"已就位的数据"正式置为 `Retained`，避免外界看到半成品。
 ///
 /// 本守卫 `Deref` 到 [`WeakChunk`]，因此可以在临界区内改动槽位字段。`Drop` 负责释放
 /// 锁位——即使临界区里 panic，锁也一定被归还。

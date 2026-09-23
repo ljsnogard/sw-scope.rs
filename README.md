@@ -14,8 +14,22 @@
 - `Owning<'a, T, M = Local>`：独占访问，类似 `Box<T>`，但生命周期保证它不会被长期持有；
 - `Sharing<'a, T, M = Local>`：引用计数共享访问，类似 `Arc<T>`，同样地，生命周期保证它只能临时共享。
 
-`Owning` / `Sharing` 的 `'a` 来自产生它们的 `Retain` 借用，因此它们不能逃逸成任意长生命周期的所有权结构。
-因此 Scope 清盘是完全有可能在尊重“独占”和“分享”的语义前提下，可以不扫描对象可达性，也能清理潜在的循环引用。
+`Owning` / `Sharing` 既可以直接把对象放进 `Scope`（`Owning::try_new_local` 等），也可以由
+`Retain` 升级而来（`Retain::try_owning` / `try_sharing`）。两条路径的 `'a` 分别借用产生它的
+`Scope` 或 `Retain`，因此都不能逃逸成任意长生命周期的所有权结构。因此 Scope 清盘是完全有可能在
+尊重“独占”和“分享”的语义前提下，不扫描对象可达性，也能清理潜在的循环引用。
+
+对象在 `Scope` 里的本体是一块 `StrongChunk`；只有真正需要 `Retain` 句柄时
+（`Owning::retained()` / `Sharing::retained()`），才会为它补建一个 `WeakChunk` 作为身份槽位。
+所以：
+
+- `StrongChunk` **不一定**对应 `WeakChunk`；
+- 但只要 `WeakChunk` 已经建立，它就在 `StrongChunk` 的整个生命周期里一直存在，
+  不会再消失，也不会改指别的对象。
+
+没有 `WeakChunk` 时，对象就是普通的 arena `Box` / `Arc`：最后一个强句柄析构时就地析构数据。
+有 `WeakChunk` 时，才转入 `Retain` + 状态机的路径（只要还有 `Retain`，强计数归零也不析构；
+逃逸的 `Retain` 由 Zombie 槽位兜住）。
 
 ## 当前阶段
 
@@ -43,7 +57,7 @@ Root / Scope / Retain / Owning / Sharing
 ## 示例
 
 ```rust
-use sw_scope::{Retain, Scope, TrScope};
+use sw_scope::{Owning, Retain, Scope, TrScope};
 
 fn reown_somewhere(retain: Retain<usize>) -> Retain<usize> {
     let mut x = retain.try_owning().unwrap();
@@ -91,15 +105,19 @@ assert_eq!(*shared, 58);
 ### 1. Rust 生命周期负责“临时访问”
 
 ```text
+        ┌── 直接构造（如 Owning::try_new_local）──> Owning<'a, T, M>
+Scope ──┤
+        └── 直接构造 ────────────────────────────> Sharing<'a, T, M>
+
 Retain<T, M>
-    │
     ├── try_owning()  ──> Owning<'a, T, M>
-    │
     └── try_sharing() ──> Sharing<'a, T, M>
+
+Owning / Sharing ──retained()──> Retain<T, M>   （首次调用时补建 WeakChunk）
 ```
 
-`Retain<T, M>` 可以独立存续，也可以参与引用环；
-`Owning` / `Sharing` 则受 `&Retain` 借用生命周期约束，不会随意逃逸。
+`Scope` 与 `Retain<T, M>` 都可以独立存续，`Retain` 还可以参与引用环；从它们借出的
+`Owning` / `Sharing` 则受 `&Scope` / `&Retain` 借用生命周期约束，不会随意逃逸。
 当前 `M = Local` 是唯一实现。
 
 ### 2. Scope 负责“批量清盘”
@@ -109,7 +127,7 @@ Retain<T, M>
 ```text
 PreDrop 钩子
     -> drop_in_place
-    -> 归还弱槽位
+    -> 归还弱槽位（若该对象曾建立 WeakChunk）
     -> 回收强池
 ```
 

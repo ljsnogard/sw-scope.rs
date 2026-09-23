@@ -36,9 +36,11 @@ pub enum ScopeError {
     ClosedScope,
 }
 
-/// 一个自包含结构，位于 Root 树，其生命周期由其分配的所有 Retain<T> 共同决定。
-/// 即，当其分配的所有 Retain 指针都不再存活，且其所有子 Scope 也不存活，这个
-/// `Scope` 的内存才会被回收。
+/// 一个自包含结构，位于 Root 树，代表一个数据域。
+///
+/// 域的生命周期不再由 `Retain` 单独决定——`Retain` 只是可选句柄，对象可以直接以
+/// `Owning` / `Sharing` 放进域里而没有 `Retain`。域内对象与子 `Scope` 都结束后，这块域的
+/// 内存才会被回收；显式清盘（[`Scope::collect`]）可以提前把仍然存活的对象一并终结。
 ///
 /// `M` 是预留的线程模式 marker，当前只实现 `Local`：整个 Scope 树都在同一个线程内使用。
 /// 后续 `Shared` 模式接入时，再为 `M = Shared` 补跨线程约束和同步。

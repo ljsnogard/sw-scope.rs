@@ -6,7 +6,11 @@ use core::{
 
 use crate::{scope_tree_::PoolIndex, weak_::WeakChunk};
 
-/// 一个专门用于存储 `Retain<T>` 所需弱引用槽位（slot）的内存池。
+/// 一个专门用于存储对象身份弱槽位（[`WeakChunk`]，即 `Retain<T>` 的指向目标）的内存池。
+///
+/// 弱槽位是**可选**的：对象可以直接以 `Owning` / `Sharing` 放进 `Scope` 而没有弱槽位，
+/// 只有调用 `retained()` 时才从本池取一个槽位补建身份。一旦建立，该槽位就在强块的整个
+/// 生命周期内保留、不会归还。
 ///
 /// # 布局
 ///

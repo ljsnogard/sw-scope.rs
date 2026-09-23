@@ -1,5 +1,9 @@
 //! `Sharing<'a, T, M = Local>`：类似 `Arc<T>` 的 scope 引用计数共享句柄。
 //!
+//! 与 `Owning` 一样，它既可由 `Scope` 直接构造，也可由 [`Retain::try_sharing`] 升级得到。
+//! 尚未关联 `WeakChunk` 时，强计数归零即析构数据（同 `Arc`）；已关联 `WeakChunk` 时，强计数
+//! 归零只归还访问权，数据由 `Retain` / 清盘负责。
+//!
 //! 当前只为 `M = Local` 实现，并保持 `!Send + !Sync`。
 
 use core::{marker::PhantomData, ptr::NonNull};
@@ -37,6 +41,10 @@ where
         }
     }
 
+    /// 取得（必要时补建）该对象的 [`Retain`] 身份句柄。
+    ///
+    /// 语义同 [`crate::Owning::retained`]：首次调用补建 `WeakChunk`，此后该槽位在强块的整个
+    /// 生命周期内一直存在。拿到 `Retain` 后，强计数归零不再当场析构数据。
     pub fn retained(&self) -> Retain<T, M> {
         todo!()
     }
@@ -83,11 +91,11 @@ where
     T: 'a + ?Sized,
     M: TrShareMarker,
 {
-    /// 释放一个共享句柄：强计数减 1。如果本指针是最后一个引用，且 WeakChunk 指针
-    /// 为空，则行为同 `Arc` / `Rc`。
+    /// 释放一个共享句柄：强计数减 1。若本块没有关联 `WeakChunk`，最后一个句柄析构时行为
+    /// 同 `Arc` / `Rc`，当场析构数据。
     ///
-    /// 否则 **归零不析构数据**，只把状态还给 `Created`（`Retain` 还在，数据仍应活着）；
-    /// 只有"强计数归零且弱计数也为 0"这种组合才顺带走确定性析构。
+    /// 若已关联 `WeakChunk`，则 **归零不析构数据**，只把访问权还回 `Retained`（`Retain` 还在，
+    /// 数据仍应活着）；只有"强计数归零且弱计数也为 0"这种组合才顺带走确定性析构。
     fn drop(&mut self) {
         todo!()
     }

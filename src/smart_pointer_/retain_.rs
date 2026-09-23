@@ -1,4 +1,8 @@
-//! `Retain<T, M = Local>`：不带生命周期的 GC Handle，也是对象存活计数与升级入口。
+//! `Retain<T, M = Local>`：不带生命周期的 GC Handle，是对象身份句柄与升级入口。
+//!
+//! `Retain` 是**可选**的：对象可以直接以 `Owning` / `Sharing` 放进 `Scope`，只有调用
+//! `retained()` 时才补建 `WeakChunk` 并产生 `Retain`。一旦有了 `Retain`，它就让对象在强计数
+//! 归零后仍然活着，直到最后一个 `Retain` 消失或 Scope 清盘。
 //!
 //! 当前只为 `M = Local` 实现方法，且保持 `!Send + !Sync`。
 
@@ -19,8 +23,8 @@ where
     T: ?Sized,
     M: TrShareMarker,
 {
-    /// We are guaranteed that `WeakChunk<T>` always outlives everything in
-    /// the `Weak<T>`;
+    /// `Retain` 自己持有弱计数，因此只要本句柄活着，它指向的 `WeakChunk` 就不会被回收；
+    /// 反过来不成立——没有 `WeakChunk` 的对象同样可以活着，只是无法取得 `Retain`。
     weak_chunk_: NonNull<WeakChunk<T>>,
     _mode_: PhantomData<M>,
 }
@@ -36,7 +40,7 @@ where
     T: ?Sized,
     M: TrShareMarker,
 {
-    /// 构造一个句柄。分配管线（Batch 2）落地前，生产路径还没有调用点。
+    /// 构造一个句柄，指向 `retained()` 时补建（或复用）的身份槽位。
     #[allow(dead_code)]
     pub(crate) const fn new(chunk: NonNull<WeakChunk<T>>) -> Self {
         Retain {
@@ -56,8 +60,10 @@ where
         self.data_state() == DataState::Zombie
     }
 
-    /// 尝试从 Weak<T> 提升为 Retain<T>。
-    /// 当且仅当 `DataState::Allocated` 时会成功
+    /// 尝试把本句柄的身份升级为 [`Owning`]。
+    ///
+    /// 仅当对象当前没有别的访问者时成功：状态从 [`DataState::Retained`] 迁到
+    /// [`DataState::OwnOrShare`]。数据已析构、已被独占 / 共享时返回当前状态。
     pub fn try_owning(&self) -> Result<Owning<'_, T, M>, UpgradeError> {
         let chunk = unsafe { self.weak_chunk_.as_ref() };
         chunk
@@ -66,8 +72,10 @@ where
             .map_err(|e| UpgradeError::StateErr(e))
     }
 
-    /// 尝试从 Weak<T> 提升为 Shared<T>。
-    /// 当且仅当 `DataState::Allocated` 时会成功。
+    /// 尝试把本句柄的身份升级为 [`Sharing`]。
+    ///
+    /// 对象当前没有强引用时把状态迁到 [`DataState::OwnOrShare`] 并把强计数置 1；已经处于
+    /// 共享状态时只做幂等加计数。数据已析构 / 已被独占时返回当前状态。
     pub fn try_sharing(&self) -> Result<Sharing<'_, T, M>, UpgradeError> {
         let chunk = unsafe { self.weak_chunk_.as_ref() };
         chunk
@@ -128,10 +136,10 @@ where
         }
     }
 }
-/// 走"确定性析构"来源 (a)：当且仅当"弱计数为 0 且状态为 `Created`"时认领并执行清理。
+/// 有 `WeakChunk` 关联时，"计数不可达"这条机会路径的共用判断：当且仅当"弱计数为 0 且状态为
+/// [`DataState::Retained`]"时认领并执行清理。
 ///
-/// 这是三处引用计数收尾（`Owning::drop` / `Sharing::drop` / `Retain::drop`）共用的判断，
-/// 保证"恰好销毁一次"只由 `try_claim_destroy` 的 CAS 裁决。返回本次是否完成了析构。
+/// "恰好销毁一次"只由 `try_claim_destroy` 的 CAS 裁决。返回本次是否完成了析构。
 pub(super) fn claim_and_destroy_if_unreachable_(weak: &WeakChunk<()>) -> bool {
     if weak.weak_count() != 0 || weak.data_state() != DataState::Retained {
         return false;

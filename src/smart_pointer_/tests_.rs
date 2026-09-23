@@ -1,7 +1,8 @@
 //! `Owning` / `Sharing` / `Retain` 的引用计数与"确定性析构"语义测试。
 //!
-//! 对应 `dev-notes/weak-20260922-1135.md` §2、§6：`Owning` / `Sharing` 析构只归还访问权，
-//! 只有"最后一个 `Retain` 也消失、且没有强引用残留"才走确定性析构（来源 (a)）。
+//! 对应 `dev-notes/overview-20260924-0431.md` §0.3、§2.2：**有 `WeakChunk` 时**
+//! `Owning` / `Sharing` 析构只归还访问权，只有"最后一个 `Retain` 也消失、且没有强引用残留"
+//! 才走确定性析构（来源 (a)）。
 
 use core::{mem::MaybeUninit, ptr::NonNull, sync::atomic::{AtomicUsize, Ordering}};
 

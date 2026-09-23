@@ -4,16 +4,16 @@
 //!
 //! ```text
 //! RootScope<A> {
-//!     scope_inner_: ScopeInner,    // root 自己的域状态（与普通域同型）
-//!     extension_:   RootExtension, // root 比普通域多出来的共享内容
-//!     allocator_:   A,                        // 具体分配器，永远放最后
+//!     tree_node_: TreeNodeBase,  // root 自己的域状态（与普通域同型）
+//!     root_ext_:  RootNodeExt,  // root 比普通域多出来的共享内容
+//!     allocator_: A,            // 具体分配器，永远放最后
 //! }
 //! ```
 //!
 //! 各域只保存一个 `&'static dyn Allocator`，指向 root 的 `allocator_` 字段。只要分配器字段
 //! 之前没有对齐填充，回退
-//! `size_of::<ScopeInner>() + size_of::<RootExtension>()` 就回到 root 域，回退
-//! `size_of::<RootExtension>()` 就得到扩展。初始化时会断言这一点（见
+//! `size_of::<TreeNodeBase>() + size_of::<RootNodeExt>()` 就回到 root 域，回退
+//! `size_of::<RootNodeExt>()` 就得到扩展。初始化时会断言这一点（见
 //! [`RootScope::try_init_default_root_scope_`]）。
 
 use core::{
@@ -32,7 +32,7 @@ use super::{PoolIndex, TreeNodeBase};
 
 /// 一整棵 Scope 树的根：root 域 + 共享扩展 + 内联的具体分配器（放最后）。
 ///
-/// 它**真正持有**弱槽位池链与类型级 `PreDrop` 注册表，因此 [`ScopeInner`] 不再各自复制这
+/// 它**真正持有**弱槽位池链与类型级 `PreDrop` 注册表，因此各域不再各自复制这
 /// 些指针，也不泄漏分配器。
 #[repr(C)]
 pub struct RootScope<A> {
@@ -46,7 +46,7 @@ pub struct RootScope<A> {
 
 pub(crate) type RootScopeRef<A> = &'static RootScope<A>;
 
-/// root 比普通 [`ScopeInner`] 多出来的那部分：整棵树共享的内容。
+/// root 比普通域节点多出来的那部分：整棵树共享的内容。
 ///
 /// 它是与分配器类型无关的具体类型，因此擦除侧（`Scope` 这一边）可以直接读它。
 #[repr(C)]
@@ -75,9 +75,13 @@ impl RootNodeExt {
     ///
     /// 槽位数组紧跟在池头之后，第 `i` 个槽位相对池首的偏移是
     /// `HEADER_BYTES + i * SLOT_SIZE`；`i` 就是槽位里的 `pool_order_`（终生只读），因此
-    /// 槽位地址一减就能得到所属弱池；弱池登记着它所属的 root。若手上是强块，先经
-    /// [`StrongChunkBase::weak_chunk`](crate::strong_::StrongChunkBase::weak_chunk) 拿到弱槽位
-    /// 即可，于是"强块 → 弱槽位 → 弱池 → root"整条路都成立。
+    /// 槽位地址一减就能得到所属弱池；弱池登记着它所属的 root。
+    ///
+    /// 若手上是强块，可先经
+    /// [`StrongChunk::weak_chunk`](crate::strong_::StrongChunk::weak_chunk) 拿到弱槽位。
+    /// **注意**：该路径只在强块已经 `retained()`、因而关联了 `WeakChunk` 时成立；没有弱槽位
+    /// 的对象不能走这条反推，也不需要靠它补建身份——补建由 `Owning` / `Sharing` 在
+    /// `retained()` 时通过创建它们的 `Scope` 完成。
     pub(crate) fn of_weak_(weak: NonNull<WeakChunk<()>>) -> NonNull<Self> {
         let Option::Some(pool) = WeakPool::of_slot_(weak) else {
             unreachable!("弱槽位必须落在某个弱池的槽位数组内");
@@ -194,9 +198,13 @@ where
     ///
     /// 槽位数组紧跟在池头之后，第 `i` 个槽位相对池首的偏移是
     /// `HEADER_BYTES + i * SLOT_SIZE`；`i` 就是槽位里的 `pool_order_`（终生只读），因此
-    /// 槽位地址一减就能得到所属弱池；弱池登记着它所属的 root。若手上是强块，先经
-    /// [`StrongChunkBase::weak_chunk`](crate::strong_::StrongChunkBase::weak_chunk) 拿到弱槽位
-    /// 即可，于是"强块 → 弱槽位 → 弱池 → root"整条路都成立。
+    /// 槽位地址一减就能得到所属弱池；弱池登记着它所属的 root。
+    ///
+    /// 若手上是强块，可先经
+    /// [`StrongChunk::weak_chunk`](crate::strong_::StrongChunk::weak_chunk) 拿到弱槽位。
+    /// **注意**：该路径只在强块已经 `retained()`、因而关联了 `WeakChunk` 时成立；没有弱槽位
+    /// 的对象不能走这条反推，也不需要靠它补建身份——补建由 `Owning` / `Sharing` 在
+    /// `retained()` 时通过创建它们的 `Scope` 完成。
     pub(crate) fn of_weak_(weak: NonNull<WeakChunk<()>>) -> NonNull<Self> {
         let Option::Some(pool) = WeakPool::of_slot_(weak) else {
             unreachable!("弱槽位必须落在某个弱池的槽位数组内");

@@ -1,6 +1,13 @@
 //! `Owning<'a, T, M = Local>`：类似 `Box<T>` 的 scope 独占访问句柄。
 //!
-//! 当前只为 `M = Local` 实现；它只归还访问权，不负责析构数据。
+//! 它有两条产生路径：
+//!
+//! - `Scope` 直接构造（[`Owning::try_new_local`] / [`Owning::try_local_str`]）：此时对象还
+//!   没有 `WeakChunk`，`Owning` 就是唯一负责人，析构行为同 `Box<T>`；
+//! - [`Retain::try_owning`]：此时对象已经关联 `WeakChunk`，析构只归还访问权，数据由
+//!   `Retain` / 清盘负责。
+//!
+//! 当前只为 `M = Local` 实现。
 
 use core::{marker::PhantomData, ptr::NonNull};
 
@@ -44,6 +51,11 @@ where
         todo!()
     }
 
+    /// 取得（必要时补建）该对象的 [`Retain`] 身份句柄。
+    ///
+    /// 若此前从未取得过 `Retain`，本调用会为强块补建一个 `WeakChunk` 身份槽位；此后该槽位
+    /// 在强块的整个生命周期内一直存在，不会消失也不会改指。拿到 `Retain` 后，对象的析构
+    /// 改由 `Retain` + 状态机决定（强计数归零不再当场析构）。
     pub fn retained(&self) -> Retain<T, M> {
         todo!()
     }
@@ -53,6 +65,11 @@ impl<'a, T> Owning<'a, T, Local>
 where
     T: 'a + Sized,
 {
+    /// 直接把 `data` 放进 `scope`，返回独占句柄。
+    ///
+    /// 这是"不必先有 `Retain` 也能把对象放进 Scope"的入口：此时对象没有 `WeakChunk`，
+    /// 句柄析构即就地析构数据（同 `Box<T>`）。之后若调用 [`Owning::retained`]，才会补建
+    /// 身份槽位并转入 `Retain` 路径。
     pub fn try_new_local(
         data: T,
         scope: &'a mut Scope<Local>,
@@ -62,6 +79,7 @@ where
 }
 
 impl<'a> Owning<'a, ScopeStr, Local> {
+    /// [`Owning::try_new_local`] 的 `str` 版本：把 `str` 拷贝进 `scope`。
     pub fn try_local_str(
         str: &str,
         scope: &'a mut Scope<Local>,

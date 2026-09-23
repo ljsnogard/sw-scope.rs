@@ -5,8 +5,8 @@
 //! - `spin_`：共享锁操作与两种锁——[`SpinMutex`]（锁住任意内容）、[`SpinFlag`]（锁住一个
 //!   带业务位的原子字）。
 //!
-//! 对外只导出使用方需要按名字引用的项（`ScopeInner::flags_` 的接入见
-//! `dev-notes/scope-20260922-1423.md` §8，本轮只提供锁本身）。
+//! 对外只导出使用方需要按名字引用的项（`ScopeNodeExt::flags_` 的接入见
+//! `dev-notes/overview-20260924-0431.md` §4，本轮只提供锁本身）。
 
 mod cell_;
 mod signal_;

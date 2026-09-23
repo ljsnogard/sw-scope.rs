@@ -1,7 +1,8 @@
-//! 对象分配管线：强池 bump 分配、树共享弱池取槽、就地构造与挂链。
+//! 用户 `Scope` 的节点扩展与强池 bump 分配管线。
 //!
-//! 这里的方法紧密共享 `chain_head_` / `chain_tail_` / `live_head_` / `live_tail_` 与
-//! `allocator_` 这组字段，因此放在同一个文件里。
+//! [`ScopeNodeExt`] 集中了域自己的一组字段（标志、子 / 兄弟链、强池链、存活链、分配器
+//! 引用）；[`ScopeNode::allocate`] 按 `Layout` 从强池链上取内存，尾池放不下时开新池。
+//! 这些操作紧密共享同一组字段，因此放在同一个文件里。
 
 use core::{
     alloc::{Allocator, AllocError, Layout},
