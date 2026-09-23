@@ -7,19 +7,82 @@ use core::{
 
 use crate::{
     atomic_::{MsbAsMutexSignal, SpinFlag},
-    scope_inner_::PoolIndex,
-    strong_::{StrongChunk, StrongChunkBase},
+    scope_tree_::PoolIndex,
+    strong_::{StrongChunk, StrongChunkHead},
 };
 
 use super::pre_drop_::PreDropRecord;
+
+/// `WeakChunk` 的生命周期状态。**这是"数据要不要析构"的唯一权威来源**。
+/// 被绑定后 `StrongChunk` 侧不再主导数据的生命周期。
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum DataState {
+    /// 默认状态，弱槽位未分配，弱引用计数为0。
+    Reclaimed = 0x00,
+
+    /// 已分配 StrongChunk 并持有数据，但当前没有任何强引用持有者，WeakChunk 是唯一
+    /// 的持有者。
+    ///
+    /// 与 `Rc`，`Arc` 不同，被 `Retain` 关联时强引用计数降为 0 并不一定会马上回收
+    /// 内存空间，除非同时弱引用计数也降为 0 或者 Scope 发起了清盘。
+    Retained = 0x01,
+
+    /// 数据被 `Owning<T>` 或 `Sharing<T>` 持有且有关联的 WeakChunk。
+    OwnOrShare = 0x02,
+
+    /// 已有线程认领计划销毁 StrongChunk，但数据的 `PreDrop` 尚未执行完毕。
+    Collected = 0x03,
+
+    /// 数据已析构，但 WeakChunk 与 StrongChunk 尚未回收。这是一个短暂的状态
+    Destroyed = 0x04,
+
+    /// 数据已经析构，但仍存在逃逸的 `Retain`，因此弱槽位不能归还、不能被复用。
+    /// 与默认状态的区别是此时弱引用技术不为 0
+    ///
+    /// 这就是“僵尸 handle”在状态机里的落点：`try_owning` / `try_sharing` 都会失败，
+    /// 但 `Retain` 仍可安全 clone / drop；最后一个弱引用消失后，`Retain::drop`
+    /// 会把这个槽位归还给 `WeakPool`。
+    Zombie = 0x05,
+}
+
+impl DataState {
+    /// 数据是否仍然活着，即是否还需要一次析构。
+    ///
+    /// 语义是"数据尚未被销毁"，**不是**"还有强引用"：只剩 `Retain`（弱计数 ≥ 1、无强引用）
+    /// 的块依然 alive，因此仍可被升级。
+    #[inline]
+    pub const fn is_data_alive(self) -> bool {
+        matches!(self, DataState::Retained | DataState::OwnOrShare)
+    }
+
+    /// 该状态是否还能被认领销毁。
+    #[inline]
+    pub const fn is_claimable(self) -> bool {
+        self.is_data_alive()
+    }
+
+    pub const fn new(v: u8) -> Self {
+        match v {
+            0x00 => DataState::Reclaimed,
+            0x01 => DataState::Retained,
+            0x02 => DataState::OwnOrShare,
+            0x03 => DataState::Collected,
+            0x04 => DataState::Destroyed,
+            0x05 => DataState::Zombie,
+            _ => unreachable!(),
+        }
+    }
+}
 
 /// 弱引用槽位。它既是 `Retain<T>` 的持有对象，也是**对象的身份与生命周期上下文**。
 ///
 /// # 为什么它是最长寿的一环
 ///
-/// `Retain<T>` 是类似 GC Handle 的东西：句柄传递到哪里，生命周期便带到哪里。而
-/// `Owning<'a, T>` / `Sharing<'a, T>` 都是从 `Retain` 上"借"出来的伴生视图，它们的 `'a`
-/// 绑定在 `&Retain` 上，**不可能比产生它们的那个 `Retain` 活得更久**。因此：
+/// `Retain<T>` 是类似 GC Handle 的东西：一旦绑定后，句柄传递到哪里，生命周期便带
+/// 到哪里。绑定后 `Owning<'a, T>` / `Sharing<'a, T>` 都是从 `Retain` 上"借"出来的
+/// 伴生视图，它们的 `'a` 绑定在 `&Retain` 上，**不可能比产生它们的那个 `Retain`
+/// 活得更久**。因此：
 ///
 /// > 数据还活着 ⇒ 至少有一个 `Retain` 活着 ⇒ 这个 `WeakChunk` 还活着。
 ///
@@ -54,7 +117,7 @@ where
     /// 当数据已经析构、槽位进入 [`DataState::Zombie`] 后，这里改为存一个类型擦除的
     /// “归还 `WeakPool`”函数指针（`dealloc_zombie_slot_` 的单态化实例），以便最后一个
     /// 逃逸 `Retain` drop 时把槽位放回空闲链。
-    strong_chunk_: AtomicPtr<StrongChunkBase>,
+    strong_chunk_: AtomicPtr<StrongChunkHead>,
     /// 类型擦除的清理登记，指向**每类型一份**的 [`PreDropRecord`]；空闲槽位为 [`None`]。
     ///
     /// 记录里不含数据区地址：它由 `strong_chunk_` 首址加上单态化入口自己算出的偏移重建。
@@ -65,77 +128,6 @@ where
     meta_: *const (),
     /// `T` 只在类型上区分，不参与布局。
     _unused_t_: PhantomData<NonNull<StrongChunk<T>>>,
-}
-
-/// `WeakChunk` 的生命周期状态。**这是"数据要不要析构"的唯一权威来源**，
-/// `StrongChunk` 侧不再有对应的状态枚举。
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(u8)]
-pub(crate) enum DataState {
-    /// 内存已回收，或槽位尚未分配。全零位是默认值。
-    Reclaimed = 0x00,
-
-    /// 强块已分配并持有数据，但当前没有任何强引用持有者（只被 `Retain` 句柄挂着）。
-    Created = 0x01,
-
-    /// 数据被 `Owning<T>` 独占持有。
-    Owning = 0x02,
-
-    /// 数据被 `Sharing<T>` 共享持有。
-    Sharing = 0x03,
-
-    /// 已有线程认领销毁，但数据的 `Drop` 尚未执行完毕。
-    Destroying = 0x04,
-
-    /// 数据已析构，但槽位与强块内存尚未回收。
-    Destroyed = 0x05,
-
-    /// 已退出存活链、弱引用计数归零，可随所属池一并回收。
-    ///
-    /// 这是"已纳入 GC 队列"的终态：存活链本身就是待清理队列的实体，状态位只负责
-    /// 记录"这块钱销毁到哪一步"。
-    Finalized = 0x06,
-
-    /// 数据已经析构，但仍存在逃逸的 `Retain`，因此弱槽位不能归还、不能被复用。
-    ///
-    /// 这就是“僵尸 handle”在状态机里的落点：`try_owning` / `try_sharing` 都会失败，
-    /// 但 `Retain` 仍可安全 clone / drop；最后一个弱引用消失后，`Retain::drop`
-    /// 会把这个槽位归还给 `WeakPool`。
-    Zombie = 0x07,
-}
-
-impl DataState {
-    /// 数据是否仍然活着，即是否还需要一次析构。
-    ///
-    /// 语义是"数据尚未被销毁"，**不是**"还有强引用"：只剩 `Retain`（弱计数 ≥ 1、无强引用）
-    /// 的块依然 alive，因此仍可被升级。
-    #[inline]
-    pub const fn is_data_alive(self) -> bool {
-        matches!(
-            self,
-            DataState::Created | DataState::Owning | DataState::Sharing
-        )
-    }
-
-    /// 该状态是否还能被认领销毁。
-    #[inline]
-    pub const fn is_claimable(self) -> bool {
-        self.is_data_alive()
-    }
-
-    pub const fn new(v: u8) -> Self {
-        match v {
-            0x00 => DataState::Reclaimed,
-            0x01 => DataState::Created,
-            0x02 => DataState::Owning,
-            0x03 => DataState::Sharing,
-            0x04 => DataState::Destroying,
-            0x05 => DataState::Destroyed,
-            0x06 => DataState::Finalized,
-            0x07 => DataState::Zombie,
-            _ => unreachable!(),
-        }
-    }
 }
 
 /// 状态字使用的锁信号策略：最高位。
@@ -235,7 +227,9 @@ impl WeakChunkState {
         self.weak_state_.is_locked()
     }
 
-    // -- 状态迁移：CAS 隐藏在 `SpinFlag::try_update` 里 ----------------------
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // 状态迁移：CAS 隐藏在 `SpinFlag::try_update` 里
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
     /// 把字里的状态位换成 `to`，保持锁位与弱计数不变。
     fn with_state_(raw: u32, to: DataState) -> u32 {
@@ -280,48 +274,47 @@ impl WeakChunkState {
     /// 通过这里竞争。
     pub(crate) fn try_claim_destroy(&self) -> Option<DataState> {
         self.transition_(|from| {
-            from.is_claimable().then_some(DataState::Destroying)
+            from.is_claimable()
+                .then_some(DataState::Collected)
         })
     }
 
     /// 标记数据已析构完成。只有成功认领过销毁的线程应当调用。
-    pub(crate) fn mark_destroyed(&self) {
-        let _ = self.transition_(|from| (from == DataState::Destroying).then_some(DataState::Destroyed));
-    }
-
-    /// 标记已退出存活链、可随池回收。只有弱引用计数归零后才应调用。
-    pub(crate) fn mark_finalized(&self) {
-        let _ = self.transition_(|_| Option::Some(DataState::Finalized));
+    pub(crate) fn try_mark_destroyed(&self) -> Option<DataState> {
+        self.transition_(|from| {
+            (from == DataState::Collected)
+                .then_some(DataState::Destroyed)
+        })
     }
 
     /// 当数据已析构但仍有逃逸 `Retain` 时，把状态推进到 [`DataState::Zombie`]。
     ///
     /// 这是与最后一个 `Retain` 的 drop 竞争终态的起点：`mark_zombie` 成功之后，
     /// 弱槽位既不能被复用，也不会再被 `flush_` 接续销毁。
-    pub(crate) fn mark_zombie(&self) -> bool {
+    pub(crate) fn try_mark_zombie(&self) -> Option<DataState> {
         self.try_transition_state(DataState::Destroyed, DataState::Zombie)
-            .is_some()
     }
 
-    /// 从指定状态尝试认领 `Finalized`，成功返回 `true`。
+    /// 从指定状态尝试认领 `Destroyed`，成功返回 `true`。
     ///
     /// 正常 teardown 从 [`DataState::Destroyed`] 认领，僵尸路径从
     /// [`DataState::Zombie`] 认领；两边都用 CAS，保证弱槽位只被归还一次。
     pub(crate) fn try_finalize_from(&self, from: DataState) -> bool {
-        self.try_transition_state(from, DataState::Finalized)
+        self.try_transition_state(from, DataState::Destroyed)
             .is_some()
     }
 
     /// 把状态置为 `Created`。分配路径在数据就位、槽位正式投入使用之后调用。
-    pub(crate) fn init_created(&self) {
-        let _ = self.transition_(|_| Option::Some(DataState::Created));
+    pub(crate) fn try_mark_created(&self) -> Option<DataState> {
+        self.transition_(|_| Option::Some(DataState::Retained))
     }
 
     /// 只在当前为 `Created` 时把状态置为 `to`；返回先前状态。
     ///
     /// 这个条件迁移同时充当"无强引用"这一前提的判据与上锁动作，因此不需要额外的锁位。
     pub(crate) fn try_set_state(&self, to: DataState) -> Option<DataState> {
-        self.transition_(|from| (from == DataState::Created).then_some(to))
+        self.transition_(|from|
+            (from == DataState::Retained).then_some(to))
     }
 
     /// 把状态无条件搬到 `to`（保持锁位与两个计数不变）。
@@ -394,7 +387,7 @@ where
         let bits = reclaimer as usize;
         debug_assert!(bits != 0, "僵尸归还入口不能为空");
         self.strong_chunk_
-            .store(bits as *mut StrongChunkBase, Ordering::Release);
+            .store(bits as *mut StrongChunkHead, Ordering::Release);
     }
 
     /// 读取 `set_zombie_reclaimer_` 写入的归还入口。
@@ -492,13 +485,13 @@ where
 
     /// 本槽位对应的强块；尚未分配强块时为空。
     #[inline]
-    pub fn strong_chunk(&self) -> Option<NonNull<StrongChunkBase>> {
+    pub fn strong_chunk(&self) -> Option<NonNull<StrongChunkHead>> {
         NonNull::new(self.strong_chunk_.load(Ordering::Acquire))
     }
 
     /// 记录强块指针。
     #[inline]
-    pub fn set_strong_chunk(&self, chunk: *mut StrongChunkBase) {
+    pub fn set_strong_chunk(&self, chunk: *mut StrongChunkHead) {
         self.strong_chunk_.store(chunk, Ordering::Release);
     }
 
@@ -513,7 +506,7 @@ where
     /// # Errors
     ///
     /// 状态不是 `Created`（数据已析构，或已被 `Owning` / `Sharing` 持有）时返回当前状态。
-    pub fn try_owning(&self) -> Result<NonNull<StrongChunkBase>, DataState> {
+    pub fn try_owning(&self) -> Result<NonNull<StrongChunkHead>, DataState> {
         let Some(chunk) = self.strong_chunk() else {
             return Result::Err(self.data_state());
         };
@@ -522,7 +515,7 @@ where
         let guard = self.lock_busy();
         match guard
             .chunk_state()
-            .try_transition_state(DataState::Created, DataState::Owning)
+            .try_transition_state(DataState::Retained, DataState::OwnOrShare)
         {
             Option::Some(_) => Result::Ok(chunk),
             Option::None => Result::Err(guard.data_state()),
@@ -538,7 +531,7 @@ where
     /// # Errors
     ///
     /// 数据已被 `Owning` 独占、或已被销毁 / 回收时返回当前状态。
-    pub fn try_sharing(&self) -> Result<NonNull<StrongChunkBase>, DataState> {
+    pub fn try_sharing(&self) -> Result<NonNull<StrongChunkHead>, DataState> {
         let Some(chunk) = self.strong_chunk() else {
             return Result::Err(self.data_state());
         };
@@ -548,14 +541,14 @@ where
         let guard = self.lock_busy();
         if guard
             .chunk_state()
-            .try_transition_state(DataState::Created, DataState::Sharing)
+            .try_transition_state(DataState::Retained, DataState::OwnOrShare)
             .is_some()
         {
             // SAFETY: 强块与身份槽位互相绑定，chunk 有效
             unsafe { &*chunk.as_ptr() }.incr_strong_count();
             return Result::Ok(chunk);
         }
-        if guard.data_state() == DataState::Sharing {
+        if guard.data_state() == DataState::OwnOrShare {
             // SAFETY: 同上
             unsafe { &*chunk.as_ptr() }.incr_strong_count();
             return Result::Ok(chunk);

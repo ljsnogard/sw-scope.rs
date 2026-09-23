@@ -1,7 +1,7 @@
 use alloc::alloc::Global;
 use core::ptr::NonNull;
 
-use super::{DEFAULT_PAGE_SIZE, DEFAULT_ROOT_SCOPE, RootExtension, RootScope, ScopeInner};
+use super::{DEFAULT_PAGE_SIZE, DEFAULT_ROOT_SCOPE, RootExtension, RootScope, ScopeNode};
 
 /// 测试 root 真正持有树级共享资源（弱池链、注册表），且无论空域还是有对象的域，都能 O(1)
 /// 找到 root：空域走"分配器指针反推"，有对象的域再走
@@ -13,7 +13,7 @@ use super::{DEFAULT_PAGE_SIZE, DEFAULT_ROOT_SCOPE, RootExtension, RootScope, Sco
 ///   而不是每个域各存一份。
 #[test]
 fn root_scope_owns_shared_pools_and_is_reachable_from_slots() {
-    let root = match RootScope::<Global, 8>::try_init_default_root_scope_(
+    let root = match RootScope::<Global>::try_init_default_root_scope_(
         &DEFAULT_ROOT_SCOPE,
         DEFAULT_PAGE_SIZE,
         Global,
@@ -21,7 +21,7 @@ fn root_scope_owns_shared_pools_and_is_reachable_from_slots() {
         Result::Ok(root) | Result::Err(root) => root,
     };
     let root_ext = root.root_extension_();
-    let root_ext_ptr: NonNull<RootExtension<8>> = NonNull::from(root_ext);
+    let root_ext_ptr: NonNull<RootExtension> = NonNull::from(root_ext);
     assert!(
         root_ext.weak_pools_head_().is_some(),
         "弱池链头必须由 root 持有"
@@ -30,7 +30,7 @@ fn root_scope_owns_shared_pools_and_is_reachable_from_slots() {
     // SAFETY: root 是本树 root，创建子域不会与其它借用冲突
     let root_inner = NonNull::from(root);
     let mut child_ptr =
-        unsafe { ScopeInner::<8>::new_child_(root_inner) }.expect("创建子域应当成功");
+        unsafe { ScopeNode::new_child_(root_inner) }.expect("创建子域应当成功");
     // SAFETY: child_ptr 是刚创建、本测试独占的子域
     let child = unsafe { child_ptr.as_mut() };
     // 空域也要能找到 root：直接用分配器指针反推
@@ -52,7 +52,7 @@ fn root_scope_owns_shared_pools_and_is_reachable_from_slots() {
     let head = child.live_head_.expect("放入之后存活链应有头");
     let tail = child.live_tail_.expect("放入之后存活链应有尾");
     for weak in [head, tail] {
-        let derived = RootExtension::<8>::of_weak_(weak);
+        let derived = RootExtension::of_weak_(weak);
         assert_eq!(
             derived.as_ptr(),
             root_ext_ptr.as_ptr(),

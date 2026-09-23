@@ -10,19 +10,19 @@ use core::{
 extern crate alloc;
 
 use crate::{
-    abs_::{TrScope, TrShareMarker},
+    TrPreDrop, abs_::{TrScope, TrShareMarker},
     emplace_::{IntoEmplace, TrEmplace},
-    smart_pointer_::Retain,
-    scope_inner_::{self, RootScope},
-    scope_str_::ScopeStr,
+    scope_str_::{self, ScopeStr},
+    scope_tree_::{self, RootScope, ScopeNode},
     share_marker_,
+    smart_pointer_::Retain,
     weak_::PreDropRecord,
 };
 
-pub use scope_inner_::{DEFAULT_CELL_SIZE, ScopeInner};
+pub use scope_tree_::{DEFAULT_CELL_SIZE, RootScope};
 pub use share_marker_::{Local, Shared};
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ScopeError {
     /// This is rare but still possible
     MallocFailed,
@@ -42,21 +42,15 @@ pub enum ScopeError {
 ///
 /// `M` 是预留的线程模式 marker，当前只实现 `Local`：整个 Scope 树都在同一个线程内使用。
 /// 后续 `Shared` 模式接入时，再为 `M = Shared` 补跨线程约束和同步。
-pub struct Scope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE, M = Local>
+pub struct Scope<M = Local>
 where
     M: TrShareMarker,
 {
-    inner_ptr_: NonNull<ScopeInner<CELL_SIZE>>,
+    inner_: NonNull<ScopeNode>,
     _mode_: PhantomData<M>,
 }
 
-/// 线程局部 Scope 的便捷别名。
-pub type LocalScope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> = Scope<CELL_SIZE, Local>;
-
-/// 预留的跨线程 Scope 别名；当前还没有可用构造入口。
-pub type SharedScope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> = Scope<CELL_SIZE, Shared>;
-
-impl Scope<DEFAULT_CELL_SIZE, Local> {
+impl Scope<Local> {
     /// 从默认的 RootScope 中创建一个子 scope。
     ///
     /// RootScope 永远不会被包装成公开 `Scope` 返回；这里直接以 root 域为父创建它的
@@ -65,31 +59,40 @@ impl Scope<DEFAULT_CELL_SIZE, Local> {
     #[cfg(feature = "core-alloc")]
     pub fn new_local() -> Self {
         let root = match RootScope::try_init_default_root_scope_(
-            &scope_inner_::DEFAULT_ROOT_SCOPE,
-            scope_inner_::DEFAULT_PAGE_SIZE,
+            &scope_tree_::DEFAULT_ROOT_SCOPE,
+            scope_tree_::DEFAULT_PAGE_SIZE,
             alloc::alloc::Global,
         ) {
             Result::Err(s) | Result::Ok(s) => s,
         };
         // SAFETY: root 是本树 root，创建子域不会与其它借用冲突
-        let inner = ScopeInner::new_child_(NonNull::from(root)).expect("分配子 Scope 失败");
+        let inner = ScopeNode::new_child_(NonNull::from(root)).expect("分配子 Scope 失败");
         Scope {
-            inner_ptr_: inner,
+            inner_: inner,
             _mode_: PhantomData,
         }
     }
 }
 
-impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
-    /// 初始化/配置一个 root scope。
+impl Scope<Shared> {
+    pub fn new_shared() -> Self {
+        todo!()
+    }
+}
+
+impl<M> Scope<M>
+where
+    M: TrShareMarker,
+{
+    /// 显式地初始化/配置一个 root scope。
     ///
-    /// Root 初始化是必须的，但这个方法**只返回是否由本次调用完成初始化**，
+    /// 这个方法**只返回是否由本次调用完成初始化**，
     /// 不会把 `RootScope` 包装成公开 `Scope` 返回。用户要创建数据域，必须再通过
     /// `Scope::new` / `new_from_parent` 创建它的子 Scope。
     ///
     /// 若当前进程内已存在 root scope 则返回 false。
     pub fn try_config_root<A>(
-        root_ptr: &'static AtomicPtr<ScopeInner<CELL_SIZE>>,
+        root_ptr: &'static AtomicPtr<RootScope>,
         page_size: usize,
         allocator: A,
     ) -> bool
@@ -104,11 +107,11 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
         x.is_ok()
     }
 
-    pub fn new_from_parent(parent: &Scope<CELL_SIZE>) -> Self {
+    pub fn new_from_parent(parent: &Scope) -> Self {
         // SAFETY: parent.inner_ptr_ 来自一个仍然存活的 Scope
-        let inner = ScopeInner::new_child_(parent.inner_ptr_).expect("分配子 Scope 失败");
+        let inner = ScopeNode::new_child_(parent.inner_).expect("分配子 Scope 失败");
         Scope {
-            inner_ptr_: inner,
+            inner_: inner,
             _mode_: PhantomData,
         }
     }
@@ -117,45 +120,14 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
     ///
     /// 这是"清理列表"的保证来源 (b)：环、`mem::forget`、泄漏句柄导致的"永远等不到最后一个
     /// 引用释放"都由它兜底。
-    ///
-    /// # Safety
-    ///
-    /// 调用后本域所有对象的句柄（`Retain` / `Owning` / `Sharing`）都会悬空；调用方必须保证
-    /// 此后不再使用它们。见 `dev-notes/weak-20260922-1135.md` §2.4。
-    pub unsafe fn collect(&mut self) {
-        // SAFETY: 由调用方保证清盘后不再使用本域的句柄
-        let inner = unsafe { self.inner_ptr_.as_mut() };
-        // SAFETY: 同上
-        unsafe { inner.flush_() };
-        // 顺带回收已经静默的关闭域
-        inner.reclaim_pending_();
+    pub fn collect(&mut self) {
+        todo!()
     }
 
     /// 创建一个子域，该子域将拥有独立的内存池和自身的生命周期。
     #[inline]
     pub fn child_scope(&self) -> Self {
         Self::new_from_parent(self)
-    }
-
-    /// 把 `factory` 造出的值就地放进本域的 arena，并交出它的句柄。
-    ///
-    /// 流程：从树共享的弱池取一个槽位 → 从本域强池分配一块 `StrongChunk<T>` → 就地写入
-    /// 数据并登记清理信息 → 把槽位置为 `Created`、弱计数置 1 → 追加到存活链尾。
-    ///
-    /// # Errors
-    ///
-    /// 弱池已满，或强池分配失败时返回 [`ScopeError::MallocFailed`]。
-    pub fn try_put<F, T>(&mut self, factory: F) -> Result<Retain<T>, ScopeError>
-    where
-        F: FnOnce() -> T,
-    {
-        self.ensure_open_()?;
-        let value = factory();
-        // SAFETY: Scope 持有一个有效的 ScopeInner
-        let inner = unsafe { self.inner_ptr_.as_mut() };
-        inner
-            .put_value_(value)
-            .map_err(|_| ScopeError::MallocFailed)
     }
 
     /// 为类型 `T` 注册一个**类型级** `PreDrop` 钩子，作用于本 Scope 树里该类型的所有实例。
@@ -167,77 +139,16 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
     /// # Errors
     ///
     /// 本 Scope 树还没有初始化好注册表时返回 [`ScopeError::MalformedInit`]。
-    pub fn set_pre_drop<T, Fin>(&mut self, pre_drop: Fin) -> Result<(), ScopeError>
+    pub fn set_pre_drop<P, T>(&mut self, pre_drop: P) -> Result<(), ScopeError>
     where
+        P: TrPreDrop<T>,
         T: ?Sized,
-        Fin: FnOnce(&mut T) + 'static,
     {
         // SAFETY: Scope 持有一个有效的 ScopeInner
-        let inner = unsafe { self.inner_ptr_.as_ref() };
+        let inner = unsafe { self.inner_.as_ref() };
         let registry = inner.root_registry_().ok_or(ScopeError::MalformedInit)?;
         registry.register_::<T, Fin>(pre_drop);
         Result::Ok(())
-    }
-
-    /// 同 [`Scope::try_put`]，但额外传一个**对象级** `PreDrop` 钩子；它覆盖类型级钩子。
-    ///
-    /// # Errors
-    ///
-    /// 同 [`Scope::try_put`]；此外，若 `Fin` 不是零尺寸类型（捕获了环境），会在**编译期**
-    /// 报错而不是运行期。
-    pub fn try_put_with<F, T, Fin>(
-        &mut self,
-        factory: F,
-        pre_drop: Fin,
-    ) -> Result<Retain<T>, ScopeError>
-    where
-        F: FnOnce() -> T,
-        Fin: FnOnce(&mut T) + 'static,
-    {
-        self.ensure_open_()?;
-        let value = factory();
-        // 钩子是零尺寸的：这里只借用它的类型作为登记键
-        let record = PreDropRecord::of_with::<T, Fin>();
-        core::mem::drop(pre_drop);
-        // SAFETY: Scope 持有一个有效的 ScopeInner
-        let inner = unsafe { self.inner_ptr_.as_mut() };
-        inner
-            .put_value_with_(value, Option::Some(record))
-            .map_err(|_| ScopeError::MallocFailed)
-    }
-
-    /// 把 `str` 的字节原地放进 arena，交出 [`ScopeStr`] 的句柄。
-    ///
-    /// 走的是 `?Sized` 的 emplace 路径：数据区布局来自 `Layout::for_value(str)`，`ScopeStr`
-    /// 的元数据就是长度，因此 `&*handle` 直接得到 `&str`。
-    ///
-    /// # Errors
-    ///
-    /// 弱池已满或强池分配失败时返回 [`ScopeError::MallocFailed`]。
-    pub fn try_put_str(&mut self, str: &str) -> Result<Retain<ScopeStr>, ScopeError> {
-        self.ensure_open_()?;
-        let len = str.len();
-        let layout = Layout::for_value(str);
-        // 元数据就是长度；闭包在 arena 给出的位置写入字节
-        let emplace = IntoEmplace::<_, ScopeStr>::new(
-            |_layout, place: *mut ScopeStr| {
-                // SAFETY: place 指向 layout 划定的数据区，写入长度与 str 一致
-                unsafe { core::ptr::copy_nonoverlapping(str.as_ptr(), place.cast::<u8>(), len) };
-            },
-            len,
-        );
-        // SAFETY: Scope 持有一个有效的 ScopeInner
-        let inner = unsafe { self.inner_ptr_.as_mut() };
-        // SAFETY: 写入长度与 layout 一致，且 str 不需要 Drop
-        unsafe { inner.emplace_value_with_(layout, emplace, Option::None) }
-            .map_err(|_| ScopeError::MallocFailed)
-    }
-
-    pub fn try_clone<T>(&mut self, src: &[T]) -> Result<Retain<[T]>, ScopeError>
-    where
-        T: Clone,
-    {
-        todo!()
     }
 
     /// A utility method to create data unconvenient to move from construction
@@ -246,44 +157,23 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
     ///
     /// # Safety
     /// See `TrScope` and `TrEmplace` for safety information.
-    pub unsafe fn try_emplace<TyEmp>(
+    pub unsafe fn try_emplace_with<TyEmp, TyPre>(
         &mut self,
-        layout: Layout,
         emplace: TyEmp,
+        pre_drop: TyPre,
     ) -> Result<Retain<TyEmp::Target>, ScopeError>
     where
         TyEmp: TrEmplace,
-    {
-        self.ensure_open_()?;
-        // SAFETY: Scope 持有一个有效的 ScopeInner
-        let inner = unsafe { self.inner_ptr_.as_mut() };
-        // SAFETY: 由调用方满足 TrEmplace::emplace 的安全契约
-        unsafe { inner.emplace_value_with_(layout, emplace, Option::None) }
-            .map_err(|_| ScopeError::MallocFailed)
-    }
-
-    /// 同 [`Scope::try_emplace`]，但额外传一个对象级 `PreDrop` 钩子；它覆盖类型级钩子。
-    ///
-    /// # Safety
-    ///
-    /// 同 [`Scope::try_emplace`]。
-    pub unsafe fn try_emplace_with<TyEmp, Fin>(
-        &mut self,
-        layout: Layout,
-        emplace: TyEmp,
-        pre_drop: Fin,
-    ) -> Result<Retain<TyEmp::Target>, ScopeError>
-    where
-        TyEmp: TrEmplace,
-        Fin: FnOnce(&mut TyEmp::Target) + 'static,
+        TyPre: TrPreDrop<TyEmp::Target>,
     {
         self.ensure_open_()?;
         let record = PreDropRecord::of_with::<TyEmp::Target, Fin>();
         core::mem::drop(pre_drop);
         // SAFETY: Scope 持有一个有效的 ScopeInner
-        let inner = unsafe { self.inner_ptr_.as_mut() };
+        let inner = unsafe { self.inner_.as_mut() };
         // SAFETY: 由调用方满足 TrEmplace::emplace 的安全契约
-        unsafe { inner.emplace_value_with_(layout, emplace, Option::Some(record)) }
+        unsafe {
+            inner.emplace_value_with_(emplace, Option::Some(record)) }
             .map_err(|_| ScopeError::MallocFailed)
     }
 
@@ -297,7 +187,7 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
     /// 关闭后仍放入的行为：默认忽略标记；开启 `strict-put-after-close` 时返回错误。
     fn ensure_open_(&self) -> Result<(), ScopeError> {
         // SAFETY: Scope 持有一个有效的 ScopeInner
-        let closed = unsafe { self.inner_ptr_.as_ref() }.is_closed_();
+        let closed = unsafe { self.inner_.as_ref() }.is_closed_();
         if !closed {
             return Result::Ok(());
         }
@@ -313,54 +203,20 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
 
 }
 
-impl<const CELL_SIZE: usize> TrScope for &mut Scope<CELL_SIZE, Local> {
+impl TrScope for &mut Scope<Local> {
     type Err = ScopeError;
 
     #[inline]
-    fn try_put<F, T>(self, factory: F) -> Result<Retain<T>, Self::Err>
-    where
-        F: FnOnce() -> T,
-    {
-        Scope::try_put(self, factory)
-    }
-
-    #[inline]
-    fn try_put_str(self, str: &str) -> Result<Retain<ScopeStr>, Self::Err> {
-        Scope::try_put_str(self, str)
-    }
-
-    #[inline]
-    fn try_clone<T>(self, src: &[T]) -> Result<Retain<[T]>, Self::Err>
-    where
-        T: Clone,
-    {
-        Scope::try_clone(self, src)
-    }
-
-    #[inline]
-    unsafe fn try_emplace<TyEmp>(
+    unsafe fn try_emplace_with<TyEmp, TyPre>(
         self,
-        layout: Layout,
         emplace: TyEmp,
+        pre_drop: TyPre,
     ) -> Result<Retain<TyEmp::Target>, Self::Err>
     where
         TyEmp: TrEmplace,
+        TyPre: TrPreDrop<TyEmp::Target>,
     {
-        unsafe { Scope::try_emplace(self, layout, emplace) }
-    }
-
-    #[inline]
-    unsafe fn try_emplace_with<TyEmp, Fin>(
-        self,
-        layout: Layout,
-        emplace: TyEmp,
-        pre_drop: Fin,
-    ) -> Result<Retain<TyEmp::Target>, Self::Err>
-    where
-        TyEmp: TrEmplace,
-        Fin: FnOnce(&mut TyEmp::Target) + 'static,
-    {
-        unsafe { Scope::try_emplace_with(self, layout, emplace, pre_drop) }
+        unsafe { Scope::try_emplace_with(self, emplace, pre_drop) }
     }
 
     #[inline]
@@ -372,12 +228,12 @@ impl<const CELL_SIZE: usize> TrScope for &mut Scope<CELL_SIZE, Local> {
     }
 
     #[inline]
-    fn set_pre_drop<T, Fin>(self, pre_drop: Fin) -> Result<(), Self::Err>
+    fn set_pre_drop<P, T>(self, pre_drop: P) -> Result<(), Self::Err>
     where
         T: ?Sized,
-        Fin: FnOnce(&mut T) + 'static,
+        P: TrPreDrop<T>,
     {
-        Scope::set_pre_drop::<T, Fin>(self, pre_drop)
+        Scope::set_pre_drop::<P, T>(self, pre_drop)
     }
 
     #[inline]
@@ -390,23 +246,23 @@ impl<const CELL_SIZE: usize> TrScope for &mut Scope<CELL_SIZE, Local> {
     }
 }
 
-impl<const CELL_SIZE: usize, M> core::cmp::PartialEq for Scope<CELL_SIZE, M>
+impl<M> core::cmp::PartialEq for Scope<M>
 where
     M: TrShareMarker,
 {
     fn eq(&self, other: &Self) -> bool {
-        let lhs = self.inner_ptr_.as_ptr();
-        let rhs = other.inner_ptr_.as_ptr();
+        let lhs = self.inner_.as_ptr();
+        let rhs = other.inner_.as_ptr();
         ptr::eq(lhs, rhs)
     }
 }
 
-impl<const CELL_SIZE: usize, M> core::cmp::Eq for Scope<CELL_SIZE, M>
+impl<M> core::cmp::Eq for Scope<M>
 where
     M: TrShareMarker,
 {}
 
-impl<const CELL_SIZE: usize, M> Drop for Scope<CELL_SIZE, M>
+impl<M> Drop for Scope<M>
 where
     M: TrShareMarker,
 {
@@ -416,12 +272,12 @@ where
     /// 所以 `Drop` 保持 **safe**：它不会让 `Retain` 或子 `Scope` 句柄悬空。
     fn drop(&mut self) {
         // SAFETY: Scope 持有一个有效的 ScopeInner
-        let inner = unsafe { self.inner_ptr_.as_mut() };
+        let inner = unsafe { self.inner_.as_mut() };
         inner.mark_handle_dropped_();
         if !inner.is_closed_() {
             // 非递归地把整棵子树标记关闭并挂进名单
-            inner.close_subtree_();
+            // inner.close_subtree_();
         }
-        inner.reclaim_pending_();
+        // inner.reclaim_pending_();
     }
 }

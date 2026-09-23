@@ -1,12 +1,16 @@
 use core::{
     mem,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicPtr, Ordering},
 };
 
-use crate::weak_::{PreDropRecord, WeakChunk};
+use crate::{
+    TrPreDrop,
+    scope_tree_::PoolIndex,
+    weak_::{PreDropRecord, WeakChunk},
+};
 
-/// Arena 中承载用户数据的一个块。
+/// StrongPool 中承载用户数据的一个块。
 ///
 /// # 它为什么这么小
 ///
@@ -24,7 +28,7 @@ pub(crate) struct StrongChunk<T>
 where
     T: ?Sized,
 {
-    base_: StrongChunkBase,
+    chunk_head_: StrongChunkHead,
     data_: T,
 }
 
@@ -33,26 +37,48 @@ where
 /// 弱槽位通过 [`StrongChunkBase::weak_chunk`] 单向指回身份，因此从强块出发可以找到
 /// 存活链与析构登记所在的槽位；反向则不需要链接。
 #[repr(C)]
-pub(crate) struct StrongChunkBase {
+pub(crate) struct StrongChunkHead {
     /// 强引用计数（仅 `Sharing<T>` 有效）。
-    refc_: AtomicU32,
-    /// 指回本块的身份弱槽位。
-    weak_chunk_: NonNull<WeakChunk<()>>,
+    chunk_info_: StrongChunkHeadInfo,
+    /// 指向本块的身份弱槽位。
+    weak_chunk_: AtomicPtr<WeakChunk<()>>,
 }
 
-impl StrongChunkBase {
-    /// 构造空白头部。`weak_chunk` 必须由分配路径立刻补上。
-    pub(crate) const fn empty_(weak_chunk: NonNull<WeakChunk<()>>) -> Self {
-        StrongChunkBase {
-            refc_: AtomicU32::new(0),
-            weak_chunk_: weak_chunk,
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub(crate) enum StrongChunkState {
+    /// 未分配资源
+    Unused  = 0x00,
+    /// 被 Owning 指针使用
+    Owning  = 0x01,
+    /// 被 Sharing 指针使用，此时强引用计数不为0
+    Sharing = 0x02,
+    /// 资源已被析构
+    Desert  = 0x03,
+}
+
+impl StrongChunkHead {
+    /// 构造空白头部
+    pub(crate) const fn empty_(
+        head: PoolIndex,
+        next: PoolIndex,
+    ) -> Self {
+        StrongChunkHead {
+            chunk_info_: StrongChunkHeadInfo::new(head, next),
+            weak_chunk_: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
     /// 本块的身份弱槽位。
     #[inline]
-    pub(crate) const fn weak_chunk(&self) -> NonNull<WeakChunk<()>> {
-        self.weak_chunk_
+    pub(crate) fn weak_chunk(&self) -> Option<NonNull<WeakChunk<()>>> {
+        let p = self.weak_chunk_.load(Ordering::Acquire);
+        if p.is_null() {
+            Option::None
+        } else {
+            Option::Some(unsafe { NonNull::new_unchecked(p)})
+        }
     }
 
     /// 数据区的起始偏移（以 `StrongChunkBase` 计）。
@@ -61,34 +87,34 @@ impl StrongChunkBase {
     /// [`StrongChunk::data_offset`]，因为数据区的位置随 `T` 的元数据而变。
     #[inline]
     pub(crate) const fn base_size_() -> usize {
-        mem::size_of::<StrongChunkBase>()
+        mem::size_of::<StrongChunkHead>()
+    }
+
+    #[inline]
+    pub(crate) fn chunk_state(&self) -> StrongChunkState {
+        self.chunk_info_.chunk_state()
     }
 
     /// 当前强引用计数。
     #[inline]
     pub(crate) fn strong_count(&self) -> u32 {
-        self.refc_.load(Ordering::Acquire)
+        self.chunk_info_.strong_count()
     }
 
-    /// 增加强引用计数。
+    /// 增加强引用计数，返回增加前的值
     #[inline]
     pub(crate) fn incr_strong_count(&self) -> u32 {
-        self.refc_.fetch_add(1, Ordering::AcqRel) + 1
+        self.chunk_info_.incr_strong_count()
     }
 
-    /// 减少强引用计数，返回减少后的值。
+    /// 减少强引用计数，返回减少前的值。
     #[inline]
     pub(crate) fn decr_strong_count(&self) -> u32 {
-        self.refc_.fetch_sub(1, Ordering::AcqRel) - 1
-    }
-
-    /// 把强计数置为 0，供归还/复用时收口。
-    #[inline]
-    pub(crate) fn reset_strong_count(&self) {
-        self.refc_.store(0, Ordering::Release);
+        self.chunk_info_.decr_strong_count()
     }
 }
 
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 impl<T> StrongChunk<T>
@@ -101,7 +127,7 @@ where
     #[inline]
     pub(crate) fn data_ptr(&self) -> *mut T {
         let this = self as *const Self as *mut Self;
-        // SAFETY: data_ 是 self 的第二个字段，按 repr(C) 布局紧跟在 base_ 之后
+        // SAFETY: data_ 是 self 的第三个字段，按 repr(C) 布局紧跟在 base_ 之后
         unsafe { ptr::addr_of_mut!((*this).data_) }
     }
 
@@ -118,19 +144,19 @@ where
 
     #[inline]
     pub(crate) fn strong_count(&self) -> u32 {
-        self.base_.strong_count()
+        self.chunk_head_.strong_count()
     }
 
     /// 增加强引用计数（`Sharing::clone`）。
     #[inline]
     pub(crate) fn incr_strong_count(&self) -> u32 {
-        self.base_.incr_strong_count()
+        self.chunk_head_.incr_strong_count()
     }
 
     /// 减少强引用计数并返回减少后的值（`Sharing::drop`）。
     #[inline]
     pub(crate) fn decr_strong_count(&self) -> u32 {
-        self.base_.decr_strong_count()
+        self.chunk_head_.decr_strong_count()
     }
 
     /// 数据仍然活着时返回其引用。
@@ -138,37 +164,33 @@ where
     /// 数据区地址与 `?Sized` 的元数据都记在身份槽位上，因此这里经由它重建引用。
     pub(crate) fn try_get_data(&self) -> Option<&T> {
         if !self.is_data_alive() {
-            return Option::None;
+            Option::None
+        } else {
+            // SAFETY: 状态表明数据尚未析构；身份槽位比强块活得久
+            unsafe { self.data_ptr().as_ref() }
         }
-        // SAFETY: 状态表明数据尚未析构；身份槽位比强块活得久
-        let weak = unsafe { self.base_.weak_chunk().as_ref() };
-        // SAFETY: 状态表明数据尚未析构
-        Option::Some(unsafe { weak.data_ref_as::<T>() })
     }
 
     /// 数据仍然活着时返回其可变引用。
     pub(crate) fn try_get_data_mut(&mut self) -> Option<&mut T> {
         if !self.is_data_alive() {
-            return Option::None;
+            Option::None
+        } else {
+            // SAFETY: 状态表明数据尚未析构
+            unsafe { self.data_ptr().as_mut() }
         }
-        // SAFETY: 状态表明数据尚未析构；身份槽位比强块活得久，且 &mut self 保证独占访问
-        let weak = unsafe { self.base_.weak_chunk().as_mut() };
-        // SAFETY: 状态表明数据尚未析构
-        Option::Some(unsafe { weak.data_ref_mut_as::<T>() })
     }
 
-    /// 数据是否仍然活着。状态权威在弱槽位，这里顺着身份指针去读。
+    /// 数据是否仍然活着。
     #[inline]
     pub(crate) fn is_data_alive(&self) -> bool {
-        // SAFETY: 弱槽位必然比强块活得久，见 WeakChunk 的文档
-        let weak = unsafe { self.base_.weak_chunk().as_ref() };
-        weak.data_state().is_data_alive()
+        self.chunk_head_.chunk_state().is_data_alive()
     }
 
     /// 本块的身份弱槽位。
     #[inline]
-    pub(crate) fn weak_chunk(&self) -> NonNull<WeakChunk<()>> {
-        self.base_.weak_chunk()
+    pub(crate) fn weak_chunk(&self) -> Option<NonNull<WeakChunk<()>>> {
+        self.chunk_head_.weak_chunk()
     }
 
     /// 供分配路径调用：绑定身份、清零强计数，并把数据登记进弱槽位的清理登记。
@@ -204,10 +226,10 @@ where
         meta_: *const (),
         record: &'static PreDropRecord,
     ) {
-        self.base_ = StrongChunkBase::empty_(weak_chunk);
+        self.chunk_head_ = StrongChunkHead::empty_(weak_chunk);
         let this = self as *const Self as *mut Self;
         // SAFETY: base_ 是首字段，addr_of_mut! 取到的是合法的薄指针
-        let base = unsafe { ptr::addr_of_mut!((*this).base_) };
+        let base = unsafe { ptr::addr_of_mut!((*this).chunk_head_) };
         // SAFETY: weak_chunk 是本对象的身份槽位，且此刻独占使用
         let weak = unsafe { &mut *(weak_chunk.as_ptr() as *mut WeakChunk<T>) };
         weak.set_strong_chunk(base);
@@ -221,7 +243,10 @@ where
     }
 }
 
-impl<T> StrongChunk<T> {
+impl<T> StrongChunk<T>
+where
+    T: Sized,
+{
     /// 就地把 `value` 构造进数据区，并用调用方指定的有效登记完成绑定。
     ///
     /// # Safety
@@ -256,5 +281,90 @@ impl<T> StrongChunk<T> {
         // SAFETY: 由调用方保证 weak_chunk 是身份槽位
         unsafe { self.init_with_record_(weak_chunk, value, PreDropRecord::of::<T>()) };
     }
+}
 
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+struct StrongChunkHeadInfo {
+    /// 距离 StrongPool 有多少个 cell
+    head_offset_: PoolIndex,
+    /// 距离下一个 StrongChunk 有多少个 cell
+    next_offset_: PoolIndex,
+    /// StrongChunk 的状态，包含 StrongChunkState （高2位）和强引用计数
+    atomic_flag_: AtomicU32,
+}
+
+impl StrongChunkHeadInfo {
+    const K_REFC_SHIFT: u32 = 28;
+    const K_MUTEX_MASK: u32 =
+        (StrongChunkState::K_U8_MASK as u32) << Self::K_REFC_SHIFT;
+
+    const K_STATE_MASK: u32 = 0x03 << Self::K_REFC_SHIFT;
+    const K_REFC_MASK: u32 = (1 << Self::K_REFC_SHIFT) - 1;
+
+    pub const fn new(
+        head_offset: PoolIndex,
+        next_offset: PoolIndex,
+    ) -> Self {
+        StrongChunkHeadInfo {
+            head_offset_: head_offset,
+            next_offset_: next_offset,
+            atomic_flag_: AtomicU32::new(0),
+        }
+    }
+
+    fn head_offset(&self) -> PoolIndex {
+        self.head_offset_
+    }
+
+    fn next_offset(&self) -> PoolIndex {
+        self.next_offset_
+    }
+
+    fn chunk_state(&self) -> StrongChunkState {
+        let v = self.atomic_flag_.load(Ordering::Acquire);
+        StrongChunkState::new((v >> Self::K_REFC_SHIFT) as u8)
+    }
+
+    /// 当前强引用计数。
+    #[inline]
+    fn strong_count(&self) -> u32 {
+        self.atomic_flag_.load(Ordering::Acquire)
+    }
+
+    /// 增加强引用计数，返回增加前的值
+    #[inline]
+    fn incr_strong_count(&self) -> u32 {
+        self.atomic_flag_.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// 减少强引用计数，返回减少前的值。
+    #[inline]
+    fn decr_strong_count(&self) -> u32 {
+        self.atomic_flag_.fetch_sub(1, Ordering::AcqRel)
+    }
+}
+
+
+impl StrongChunkState {
+    const K_U8_MASK: u8 = 0x03;
+
+    pub const fn new(v: u8) -> Self {
+        let v = Self::K_U8_MASK & v;
+        match v {
+            0x00 => StrongChunkState::Unused,
+            0x01 => StrongChunkState::Owning,
+            0x02 => StrongChunkState::Sharing,
+            0x03 => StrongChunkState::Desert,
+            _ => unreachable!(),
+        }
+    }
+
+    pub const fn is_data_alive(&self) -> bool {
+        match self {
+            StrongChunkState::Owning | StrongChunkState::Sharing => true,
+            _ => false
+        }
+    }
 }

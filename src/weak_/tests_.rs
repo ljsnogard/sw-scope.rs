@@ -11,11 +11,10 @@ use core::{
     sync::atomic::Ordering,
 };
 
-use crate::scope_inner_::{PoolIndex, ScopeInner};
-use crate::weak_::{DataState, WeakChunk, WeakPool};
-
-/// 测试统一使用"以 `ScopeInner<8>` 为根"的弱池；`Root` 参数在池内部是不透明的。
-type WeakChunkPool<const CELL_SIZE: usize> = WeakPool<CELL_SIZE, ScopeInner<CELL_SIZE>>;
+use crate::{
+    scope_tree_::{PoolIndex, ScopeInner},
+    weak_::{DataState, WeakChunk, WeakPool},
+};
 
 /// 验证 `WeakChunkPool` 布局所依赖的类型前提：`WeakChunk<T>` 的尺寸与对齐
 /// 与 `T` 无关，且恰好等于 `WeakChunk<()>`。
@@ -57,29 +56,29 @@ fn weak_chunk_size_is_type_agnostic() {
 fn weak_chunk_pool_capacity_math() {
     use core::mem::size_of;
 
-    type Pool = WeakChunkPool<8>;
-
     let slot = size_of::<WeakChunk<()>>();
     // 池头按槽位个数向上取整，槽位起点因此始终对齐
-    assert_eq!(Pool::min_size_for_max_count(0), size_of::<Pool>().div_ceil(slot) * slot);
-
+    assert_eq!(
+        WeakPool::<ScopeInner>::min_size_for_max_count(0),
+        size_of::<WeakPool<ScopeInner>>().div_ceil(slot) * slot,
+    );
     for count in [1u16, 7, 1000, PoolIndex::MAX] {
-        let need = Pool::min_size_for_max_count(count);
-        let header = size_of::<Pool>().div_ceil(slot) * slot;
+        let need = WeakPool::<ScopeInner>::min_size_for_max_count(count);
+        let header = size_of::<WeakPool<ScopeInner>>().div_ceil(slot) * slot;
         assert_eq!(need, header + count as usize * slot);
         // 恰好足够的预算应换回同样的槽位数
-        assert_eq!(Pool::max_count_within_max_size(need), count as usize);
+        assert_eq!(WeakPool::<ScopeInner>::max_count_within_max_size(need), count as usize);
         // 少一个字节就再也放不下这么多槽位
-        assert_eq!(Pool::max_count_within_max_size(need - 1), count as usize - 1);
+        assert_eq!(WeakPool::<ScopeInner>::max_count_within_max_size(need - 1), count as usize - 1);
     }
 
     // 预算连池头都放不下时没有任何槽位可用
-    let header = size_of::<Pool>().div_ceil(slot) * slot;
-    assert_eq!(Pool::max_count_within_max_size(0), 0);
-    assert_eq!(Pool::max_count_within_max_size(header), 0);
-    assert_eq!(Pool::max_count_within_max_size(header - 1), 0);
+    let header = size_of::<WeakPool<ScopeInner>>().div_ceil(slot) * slot;
+    assert_eq!(WeakPool::<ScopeInner>::max_count_within_max_size(0), 0);
+    assert_eq!(WeakPool::<ScopeInner>::max_count_within_max_size(header), 0);
+    assert_eq!(WeakPool::<ScopeInner>::max_count_within_max_size(header - 1), 0);
     // 刚好放下一个槽位的预算
-    assert_eq!(Pool::max_count_within_max_size(header + slot), 1);
+    assert_eq!(WeakPool::<ScopeInner>::max_count_within_max_size(header + slot), 1);
 }
 
 /// 验证池初始化后空闲链表的初始形态：槽位 `i` 的 `next_freed_` 指向 `i + 1`，
@@ -90,7 +89,7 @@ fn weak_chunk_pool_capacity_math() {
 ///   若初始化未串成顺序链，后续 `allocate` 将无法从表头依次摘出全部槽位。
 #[test]
 fn weak_chunk_pool_init_builds_sequential_free_list() {
-    let mut pool = WeakChunkPool::<8>::try_new_with_cell_count(4, &Global).unwrap();
+    let mut pool = WeakPool::<ScopeInner>::try_new_with_cell_count(4, &Global).unwrap();
     // SAFETY: pool 由 try_new_with_cell_count 分配，非空且在测试期间一直存活
     let pool = unsafe { pool.as_mut() };
     assert_eq!(pool.capacity(), 4);
@@ -117,7 +116,7 @@ fn weak_chunk_pool_init_builds_sequential_free_list() {
 ///   分配/归还变化；归还后必须还能再分配成功。
 #[test]
 fn weak_chunk_pool_allocate_pops_free_list_head() {
-    let mut pool = WeakChunkPool::<8>::try_new_with_cell_count(3, &Global).unwrap();
+    let mut pool = WeakPool::<ScopeInner>::try_new_with_cell_count(3, &Global).unwrap();
     // SAFETY: pool 由 try_new_with_cell_count 分配，非空且在测试期间一直存活
     let pool = unsafe { pool.as_mut() };
 
@@ -152,7 +151,7 @@ fn weak_chunk_pool_allocate_pops_free_list_head() {
 ///   这里会摘到越界序号或提前取到 3。
 #[test]
 fn weak_chunk_pool_reuses_returned_slots_before_virgin_ones() {
-    let mut pool = WeakChunkPool::<8>::try_new_with_cell_count(5, &Global).unwrap();
+    let mut pool = WeakPool::<ScopeInner>::try_new_with_cell_count(5, &Global).unwrap();
     // SAFETY: pool 由 try_new_with_cell_count 分配，非空且在测试期间一直存活
     let pool = unsafe { pool.as_mut() };
 
@@ -181,7 +180,7 @@ fn weak_chunk_pool_reuses_returned_slots_before_virgin_ones() {
 ///   合法归还返回 `true`，被归还槽位的 `weak_count()` 归零，且再次分配会取回同一序号。
 #[test]
 fn weak_chunk_pool_deallocate_rejects_invalid_input() {
-    let mut pool = WeakChunkPool::<8>::try_new_with_cell_count(2, &Global).unwrap();
+    let mut pool = WeakPool::<ScopeInner>::try_new_with_cell_count(2, &Global).unwrap();
     // SAFETY: pool 由 try_new_with_cell_count 分配，非空且在测试期间一直存活
     let pool = unsafe { pool.as_mut() };
 
@@ -215,8 +214,8 @@ fn weak_chunk_pool_deallocate_rejects_invalid_input() {
 ///   两种不足的预算都必须返回 `Err`。
 #[test]
 fn weak_chunk_pool_with_max_size_budget() {
-    let mut pool = WeakChunkPool::<8>::try_new_with_max_size(
-        WeakChunkPool::<8>::min_size_for_max_count(8),
+    let mut pool = WeakPool::<ScopeInner>::try_new_with_max_size(
+        WeakPool::<ScopeInner>::min_size_for_max_count(8),
         &Global,
     )
     .unwrap();
@@ -228,10 +227,10 @@ fn weak_chunk_pool_with_max_size_budget() {
     }
     assert_eq!(pool.allocate(), None);
 
-    assert!(WeakChunkPool::<8>::try_new_with_max_size(0, &Global).is_err());
+    assert!(WeakPool::<ScopeInner>::try_new_with_max_size(0, &Global).is_err());
     assert!(
-        WeakChunkPool::<8>::try_new_with_max_size(
-            WeakChunkPool::<8>::min_size_for_max_count(1) - 1,
+        WeakPool::<ScopeInner>::try_new_with_max_size(
+            WeakPool::<ScopeInner>::min_size_for_max_count(1) - 1,
             &Global,
         )
         .is_err()
@@ -248,7 +247,7 @@ fn weak_chunk_pool_with_max_size_budget() {
 ///   改写序号），断言失败。
 #[test]
 fn weak_chunk_pool_slot_order_is_fixed_at_construction() {
-    let mut pool = WeakChunkPool::<8>::try_new_with_cell_count(3, &Global).unwrap();
+    let mut pool = WeakPool::<ScopeInner>::try_new_with_cell_count(3, &Global).unwrap();
     // SAFETY: pool 由 try_new_with_cell_count 分配，非空且在测试期间一直存活
     let pool = unsafe { pool.as_mut() };
 
@@ -278,9 +277,6 @@ fn weak_chunk_pool_slot_order_is_fixed_at_construction() {
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- 池链的随机分配/归还正确性
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-
-/// 本次随机测试所使用的池类型。容量只有 16，因此一个 u64 就足以记录占用位图。
-type TestPool = WeakChunkPool<8>;
 
 /// 本次随机测试中每个池的槽位容量。
 const TEST_CAP: u16 = 16;
@@ -321,8 +317,8 @@ impl OpStream {
 }
 
 /// 按容量 16 构造一个池，并交出所有权。
-fn new_pool_() -> NonNull<TestPool> {
-    TestPool::try_new_with_cell_count(TEST_CAP, &Global).expect("测试用池应当构造成功")
+fn new_pool_() -> NonNull<WeakPool<ScopeInner>> {
+    WeakPool::<ScopeInner>::try_new_with_cell_count(TEST_CAP, &Global).expect("测试用池应当构造成功")
 }
 
 /// 以轮转方式跨越池链进行分配/归还，并在每一步之后校验所有池的内部数据依然有效。
@@ -361,8 +357,8 @@ fn weak_chunk_pool_chain_survives_random_alloc_and_free() {
     // 测试只关心域指针能否原样存取，不需要真的构造一个 ScopeInner，因此这里用一个
     // 对齐的占位地址；真正解引用域指针的代码尚未在测试路径上。
     let mut anchor = 0u8;
-    let root: NonNull<ScopeInner<8>> = NonNull::from(&mut anchor).cast();
-    let mut owners: Vec<NonNull<TestPool>> = Vec::with_capacity(POOL_NUM);
+    let root: NonNull<ScopeInner> = NonNull::from(&mut anchor).cast();
+    let mut owners: Vec<NonNull<WeakPool<ScopeInner>>> = Vec::with_capacity(POOL_NUM);
     for _ in 0..POOL_NUM {
         owners.push(new_pool_());
     }
@@ -374,8 +370,8 @@ fn weak_chunk_pool_chain_survives_random_alloc_and_free() {
         // SAFETY: 这些池由 new_pool_ 独占分配，测试结束前都存活
         let (a, b) = unsafe {
             (
-                owners[i].as_mut() as *mut TestPool,
-                owners[i + 1].as_mut() as *mut TestPool,
+                owners[i].as_mut() as *mut WeakPool<ScopeInner>,
+                owners[i + 1].as_mut() as *mut WeakPool<ScopeInner>,
             )
         };
         // SAFETY: a 与 b 指向不同的池
@@ -539,7 +535,11 @@ fn weak_chunk_pool_chain_survives_random_alloc_and_free() {
 }
 
 /// 校验整条池链：链结构本身 + 每个池的空闲链表与其外部账本。
-fn check_chain_(owners: &mut [NonNull<TestPool>], allocated: &[u64], cap: usize) {
+fn check_chain_(
+    owners: &mut [NonNull<WeakPool<ScopeInner>>],
+    allocated: &[u64],
+    cap: usize,
+) {
     // 链结构：从第一个池出发，应当恰好访问到全部池各一次，且回指对称
     let mut visited = vec![false; owners.len()];
     let mut cursor = owners[0];
@@ -589,7 +589,11 @@ fn check_chain_(owners: &mut [NonNull<TestPool>], allocated: &[u64], cap: usize)
 
 /// 校验单个池：`used_count` / `free_count` 与账本一致，且从空闲链表表头出发能够恰好
 /// 走遍账本中标为空闲的全部槽位，不丢、不重、不越界、不成环。
-fn check_pool_invariants_(pool: &mut TestPool, allocated: u64, cap: usize) {
+fn check_pool_invariants_(
+    pool: &mut WeakPool<ScopeInner>,
+    allocated: u64,
+    cap: usize,
+) {
     let used = allocated.count_ones() as usize;
     assert_eq!(pool.used_count() as usize, used, "used_count 与账本不符");
     assert_eq!(pool.free_count() as usize, cap - used, "free_count 与账本不符");
@@ -634,7 +638,7 @@ fn check_pool_invariants_(pool: &mut TestPool, allocated: u64, cap: usize) {
 }
 
 /// 池满时链表已经没有表头可言，这里返回 `None`；未满时返回当前表头。
-fn last_free_index_(pool: &mut TestPool) -> Option<PoolIndex> {
+fn last_free_index_(pool: &mut WeakPool<ScopeInner>) -> Option<PoolIndex> {
     if pool.used_count() == pool.capacity() {
         Option::None
     } else {
@@ -842,19 +846,19 @@ fn weak_chunk_data_state_full_transition_path() {
     assert!(!state.data_state().is_data_alive());
 
     // Created → Owning
-    state.init_created();
-    assert_eq!(state.data_state(), DataState::Created);
+    state.try_mark_created();
+    assert_eq!(state.data_state(), DataState::Retained);
     assert!(state.data_state().is_data_alive());
-    assert!(state.try_set_state(DataState::Owning).is_some());
-    assert_eq!(state.data_state(), DataState::Owning);
+    assert!(state.try_set_state(DataState::Counting).is_some());
+    assert_eq!(state.data_state(), DataState::Counting);
 
     // Owning 之后不能再被认领成 Sharing / Created
     assert!(state.try_set_state(DataState::Sharing).is_none());
-    assert!(state.try_transition_state(DataState::Created, DataState::Sharing).is_none());
+    assert!(state.try_transition_state(DataState::Retained, DataState::Sharing).is_none());
 
     // Owning → Destroying → Destroyed → Finalized
-    assert_eq!(state.try_claim_destroy(), Some(DataState::Owning));
-    assert_eq!(state.data_state(), DataState::Destroying);
+    assert_eq!(state.try_claim_destroy(), Some(DataState::Counting));
+    assert_eq!(state.data_state(), DataState::Collected);
     assert!(!state.data_state().is_data_alive(), "Destroying 不算存活");
     assert_eq!(state.try_claim_destroy(), None, "销毁认领必须唯一");
 
@@ -897,7 +901,7 @@ fn weak_pool_of_slot_reverses_to_owning_pool() {
         let slots = unsafe { pool.slots().as_mut() };
         for index in 0..TEST_CAP as usize {
             let slot = NonNull::from(&mut slots[index]);
-            let derived = TestPool::of_slot_(slot).expect("槽位必须能反推出所属池");
+            let derived = WeakPool::<ScopeInner>::of_slot_(slot).expect("槽位必须能反推出所属池");
             assert_eq!(
                 derived.as_ptr(),
                 owner_ptr,

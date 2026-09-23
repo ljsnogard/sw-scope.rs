@@ -10,7 +10,7 @@
 //!   对象级钩子直接在放入点生成记录并覆盖类型级；
 //! - 钩子必须是**零尺寸类型**（函数项或非捕获闭包），捕获式闭包会在编译期被 `const` 断言拒绝。
 
-use core::{any::TypeId, mem, ptr};
+use core::{mem, ptr};
 
 #[cfg(feature = "core-alloc")]
 use alloc::collections::BTreeMap;
@@ -20,7 +20,8 @@ use crate::atomic_::SpinMutex;
 use super::chunk_::data_ptr_of_;
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// -- 记录
+// PreDrop 记录
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 /// 一份"该类型的对象进入清理列表时怎么处理"的类型级登记：先跑可选 `PreDrop` 钩子，
 /// 再析构数据。

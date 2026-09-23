@@ -5,13 +5,13 @@ use crate::*;
 
 #[cfg(test)]
 #[test]
-fn demo() {
-    fn owning_somewhere(retain: Retain<usize>) -> Retain<usize> {
+fn local_demo() {
+    fn reown_somewhere(retain: Retain<usize>) -> Retain<usize> {
         let mut x = retain.try_owning().unwrap();
         *x = 58;
-        // `Owning` 现在实现了 Drop，因此借用持续到它被析构；要归还 retain 必须先放手
-        drop(x);
-        retain
+        // 我们故意不 drop 来展示 Retain 的作用
+        // drop(x);
+        retain.clone()
     }
 
     fn share_everywhere(retain: Retain<usize>) -> Retain<usize> {
@@ -25,18 +25,21 @@ fn demo() {
     }
 
     let mut scope = Scope::new_local();
-    let retain = scope.put(42);
+    let x = Owning::try_new_local(42, &mut scope).unwrap();
+    let retain = x.retained();
+    drop(x);
     {
         let x = retain.try_owning().unwrap();
         assert_eq!(*x, 42);
     }
-    let retain = owning_somewhere(retain);
+    let retain = reown_somewhere(retain);
     {
         let x = retain.try_owning().unwrap();
         assert_eq!(*x, 58);
     }
     let retain = share_everywhere(retain);
 
-    assert!(retain.try_owning().is_none());
-    assert!(retain.try_sharing().is_some());
+    assert!(retain.try_owning().is_err());
+    let shared = retain.try_sharing().unwrap();
+    assert_eq!(*shared, 58);
 }

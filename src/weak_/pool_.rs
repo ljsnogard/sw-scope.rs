@@ -4,7 +4,7 @@ use core::{
     ptr::NonNull,
 };
 
-use crate::{scope_inner_::PoolIndex, weak_::WeakChunk};
+use crate::{scope_tree_::PoolIndex, weak_::WeakChunk};
 
 /// 一个专门用于存储 `Retain<T>` 所需弱引用槽位（slot）的内存池。
 ///
@@ -45,7 +45,7 @@ use crate::{scope_inner_::PoolIndex, weak_::WeakChunk};
 /// 归还条件不是"弱引用计数归零"这么单一，而要综合槽位状态判断：只有"没有任何 `Retain`"
 /// 且"数据已经析构（或从未需要析构）"时，槽位才会回到空闲链。判断依据见
 /// [`crate::weak_::DataState`]。
-pub(crate) struct WeakPool<const CELL_SIZE: usize, Root> {
+pub(crate) struct WeakPool {
     // 最多可以存储多少个 WeakChunk，也就是紧随池头之后的槽位数组长度
     capacity_: PoolIndex,
     // 已经分配出去的 WeakChunk 数量，注意 WeakPool 的分配顺序是不可知的
@@ -57,13 +57,11 @@ pub(crate) struct WeakPool<const CELL_SIZE: usize, Root> {
     latest_free_: PoolIndex,
 
     // 同一条内存链上的兄弟池，供池容量不足时串联扩展使用
-    prev_: Option<NonNull<WeakPool<CELL_SIZE, Root>>>,
-    next_: Option<NonNull<WeakPool<CELL_SIZE, Root>>>,
-    // 本池所属的域
-    root_: Option<NonNull<Root>>,
+    prev_: Option<NonNull<WeakPool>>,
+    next_: Option<NonNull<WeakPool>>,
 }
 
-impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
+impl WeakPool {
 
     /// 根据目标要容纳的 WeakChunk 数量，计算最小内存占用量
     pub fn min_size_for_max_count(count: PoolIndex) -> usize {
@@ -154,12 +152,12 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     }
 
     /// 池链上的下一个池。
-    pub const fn next(&self) -> Option<NonNull<WeakPool<CELL_SIZE, Root>>> {
+    pub const fn next(&self) -> Option<NonNull<WeakPool<Root>>> {
         self.next_
     }
 
     /// 池链上的上一个池。
-    pub const fn prev(&self) -> Option<NonNull<WeakPool<CELL_SIZE, Root>>> {
+    pub const fn prev(&self) -> Option<NonNull<WeakPool<Root>>> {
         self.prev_
     }
 
@@ -174,7 +172,7 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     }
 
     /// 把 `next` 接到本池之后，并回填其反向指针，从而把两个池串成双向链的一环。
-    pub fn link_siblings(&mut self, next: &mut WeakPool<CELL_SIZE, Root>) {
+    pub fn link_siblings(&mut self, next: &mut WeakPool<Root>) {
         let this = NonNull::from(&mut *self);
         let next_ptr = NonNull::from(&mut *next);
         self.next_ = Option::Some(next_ptr);

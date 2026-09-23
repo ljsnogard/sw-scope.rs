@@ -25,7 +25,7 @@ unsafe fn make_retain_<T>(
     let weak_ptr = NonNull::from(&mut *weak);
     // SAFETY: chunk_slot 可写；weak 是本测试栈上的有效身份槽位
     unsafe { (*chunk_slot.as_mut_ptr()).init_with_(weak_ptr, value) };
-    weak.chunk_state().init_created();
+    weak.chunk_state().try_mark_created();
     // 一个 Retain 对应一个弱计数
     weak.incr_weak_count();
     Retain::new(weak_ptr.cast())
@@ -49,7 +49,7 @@ fn owning_drop_returns_to_created_and_data_stays_alive() {
     let weak = unsafe { &*weak_slot.as_ptr() };
     assert_eq!(
         weak.data_state(),
-        DataState::Created,
+        DataState::Retained,
         "Owning 析构后应回到 Created"
     );
     let owning = retain.try_owning().expect("数据仍活着，应当能再次独占");
@@ -86,7 +86,7 @@ fn sharing_counts_and_returns_to_created() {
     assert_eq!(chunk.strong_count(), 0);
     assert_eq!(
         weak.data_state(),
-        DataState::Created,
+        DataState::Retained,
         "强计数归零后回到 Created"
     );
 }

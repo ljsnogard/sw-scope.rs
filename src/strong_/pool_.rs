@@ -4,7 +4,10 @@ use core::{
     ptr::{self, NonNull},
 };
 
-use crate::scope_inner_::PoolIndex;
+use crate::{
+    scope_::DEFAULT_CELL_SIZE,
+    scope_tree_::PoolIndex,
+};
 
 /// 承载 [`crate::strong_::StrongChunk`] 的内嵌式内存池。
 ///
@@ -27,18 +30,22 @@ use crate::scope_inner_::PoolIndex;
 /// # 是否需要开新池
 ///
 /// `used_count_` 与 `cell_count_` 的差额就是"本池还能再放多少 cell"，上层据此决定是继续
-/// 从本池分配，还是再申请一个 `StrongPool` 串到链上。这就是 `used_count_` 必须保留的原因。
+/// 从本池分配，还是再申请一个 `StrongPool` 串到链上。这就是 `used_count_` 的作用。
 #[repr(C)]
-pub(crate) struct StrongPool<const CELL_SIZE: usize> {
+pub(crate) struct StrongPool {
     /// 上一个内存链块地址
-    prev_pool_: Option<NonNull<StrongPool<CELL_SIZE>>>,
+    prev_pool_: Option<NonNull<StrongPool>>,
     /// 荷载可用的 cell 的数量
     cell_count_: PoolIndex,
     /// 分配已用的 cell 的数量
     used_count_: PoolIndex,
+    /// 最老的存活 StrongChunk
+    head_alive_: PoolIndex,
+    /// 最新一个仍存活的 StrongChunk
+    tail_alive_: PoolIndex,
 }
 
-impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
+impl StrongPool {
     /// 池头自身的大小。
     pub(crate) const THIS_SIZE: usize = mem::size_of::<Self>();
 
@@ -46,8 +53,8 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
     ///
     /// 对齐取"池头对齐"与 `CELL_SIZE` 的较大者，保证 cell 区起点满足 cell 步长。
     pub(crate) fn layout_for_(cell_count: PoolIndex) -> Layout {
-        let size = Self::THIS_SIZE + (cell_count as usize) * CELL_SIZE;
-        let align = mem::align_of::<Self>().max(CELL_SIZE);
+        let size = Self::THIS_SIZE + (cell_count as usize) * DEFAULT_CELL_SIZE;
+        let align = mem::align_of::<Self>().max(DEFAULT_CELL_SIZE);
         // SAFETY: size 是池头加上整数个 cell，align 是 2 的幂且不会造成溢出
         unsafe { Layout::from_size_align_unchecked(size, align) }
     }
@@ -73,6 +80,8 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
                 prev_pool_: prev,
                 cell_count_: cell_count,
                 used_count_: 0,
+                head_alive_: 0,
+                tail_alive_: 0,
             });
             Result::Ok(NonNull::new_unchecked(base))
         }
@@ -84,7 +93,7 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
     }
 
     /// 池链上的上一个池。
-    pub(crate) const fn prev_(&self) -> Option<NonNull<StrongPool<CELL_SIZE>>> {
+    pub(crate) const fn prev_(&self) -> Option<NonNull<StrongPool>> {
         self.prev_pool_
     }
 
@@ -101,7 +110,7 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
         let p = self as *const Self as *const u8;
         unsafe {
             let data = p.add(Self::THIS_SIZE);
-            let len = (self.cell_count_ as usize) * CELL_SIZE;
+            let len = (self.cell_count_ as usize) * DEFAULT_CELL_SIZE;
             let slice = ptr::slice_from_raw_parts(data, len);
             NonNull::new_unchecked(slice as *mut [u8])
         }
@@ -110,8 +119,8 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
     /// 尚未分配出去的那段 cell 空间，从第一个空闲位置直到池尾。
     pub(crate) const fn free_addr_(&self) -> NonNull<[u8]> {
         let p = self as *const Self as *const u8;
-        let used = (self.used_count_ as usize) * CELL_SIZE;
-        let total = (self.cell_count_ as usize) * CELL_SIZE;
+        let used = (self.used_count_ as usize) * DEFAULT_CELL_SIZE;
+        let total = (self.cell_count_ as usize) * DEFAULT_CELL_SIZE;
         unsafe {
             let data = p.add(Self::THIS_SIZE + used);
             let slice = ptr::slice_from_raw_parts(data, total - used);
@@ -130,18 +139,18 @@ impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
     pub(crate) fn allocate_(&mut self, layout: Layout) -> Result<NonNull<[u8]>, usize> {
         let data_addr = self as *mut Self as usize;
         let cell_addr = data_addr + Self::THIS_SIZE;
-        let used_bytes = (self.used_count_ as usize) * CELL_SIZE;
+        let used_bytes = (self.used_count_ as usize) * DEFAULT_CELL_SIZE;
         let free_start = cell_addr + used_bytes;
         let align = layout.align();
         // 向上对齐到 layout 要求的边界（align 是 2 的幂）
         let start = (free_start + align - 1) & !(align - 1);
         let end = start + layout.size();
-        let pool_end = cell_addr + (self.cell_count_ as usize) * CELL_SIZE;
+        let pool_end = cell_addr + (self.cell_count_ as usize) * DEFAULT_CELL_SIZE;
         if end > pool_end {
             return Result::Err(pool_end - free_start);
         }
         // 推进 used_count_，把对齐跳过的字节也算成已用
-        self.used_count_ = ((end - cell_addr).div_ceil(CELL_SIZE)) as PoolIndex;
+        self.used_count_ = ((end - cell_addr).div_ceil(DEFAULT_CELL_SIZE)) as PoolIndex;
         // SAFETY: start..end 落在本池 cell 区内，且 start 已按 layout 对齐
         unsafe {
             Result::Ok(NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
