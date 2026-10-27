@@ -16,15 +16,15 @@
 //!
 //! ```text
 //! RootScope {
-//!     scopes_: BPlusTree<…, NonNull<ScopeInner>, ()>,          // 所有域（按地址）
-//!     metas_:  BPlusTree<…, usize, *const ()>,                 // 强块元信息字（按地址）
-//!     inner_:  ScopeInner,                                    // 分配 ScopeInnerWithCfg 的域
-//!     alloc_:  &'static dyn Allocator,                        // 类型已擦除
+//!     scopes_: SpinMutex<BPlusTree<…, NonNull<ScopeInner>, ()>>, // 所有域（按地址）
+//!     metas_:  BPlusTree<…, usize, *const ()>,                   // 强块元信息字（按地址）
+//!     alloc_:  &'static (dyn Allocator + Send + Sync),           // 类型已擦除
 //! }
 //! ```
 //!
 //! 因而 [`super::ScopeInner`] 与 [`Scope`](crate::Scope) 都可以去掉泛型参数。弱池与强池
-//! 都由每个 [`super::ScopeInner`] 自己持有，root 不再保存树级共享弱池。
+//! 都由每个 [`super::ScopeInner`] 自己持有，root 不再保存树级共享弱池。实验分支里域实体
+//! 由 `alloc_` 分配一次（锁、ScopeInner 与每域分配器都在同一块内存里），树只登记地址。
 //!
 //! 旧实现的初始化、共享扩展与反推 root 的代码保留在文件末尾注释中，等 B+ 树操作补齐后
 //! 再决定哪些部分需要恢复。
@@ -37,6 +37,7 @@ use core::{
 };
 
 use atomex::{AtomexPtr, CmpxchResult};
+use atomic_sync::mutex::preemptive::SpinningMutexOwned;
 use bplustree_cmp::{BPlusTree, OrdComparer, TrComparer};
 
 use crate::{
@@ -58,7 +59,8 @@ pub type MetasBpTree = BPlusTree<TREE_M, OrdComparer<usize>, usize, *const ()>;
 /// 强块元信息字按地址登记在 `metas_` 里。弱池 / 强池都由各域自己持有。
 #[repr(C)]
 pub(crate) struct RootScope {
-    scopes_: ScopesBpTree,
+    /// 所有域实体（按锁内 `ScopeInner` 的地址索引）。树的修改由自旋锁串行化。
+    scopes_: SpinningMutexOwned<ScopesBpTree>,
 
     /// 强块元信息字：键是元信息地址，值是一个指针宽度的元数据字。
     ///
@@ -66,11 +68,15 @@ pub(crate) struct RootScope {
     /// 因此 `insert_meta_` 可以把该地址交给强块。
     metas_: MetasBpTree,
 
-    /// 专用于分配任意 ScopeInnerWithAlloc 的 Scope。
-    inner_: ScopeInner,
-
-    alloc_: &'static dyn Allocator,
+    /// 类型擦除后的分配器；所有域实体都由它分配。
+    alloc_: &'static (dyn Allocator + Send + Sync),
 }
+
+// SAFETY: `scopes_` 自带自旋锁；`metas_` 目前只在初始化 / 后续统一接入的 root 锁路径中访问；
+// `alloc_` 要求 `Send + Sync`；root 一旦发布到 `DEFAULT_ROOT_SCOPE` 就不再移动。
+unsafe impl Send for RootScope {}
+// SAFETY: 见上。
+unsafe impl Sync for RootScope {}
 
 impl RootScope {
     /// 并发地尝试初始化一个 RootScope，如果初始化成功返回 `Ok`，否则返回 `Err` 并携带
@@ -86,13 +92,13 @@ impl RootScope {
         allocator: A,
     ) -> Result<&'static RootScope, &'static RootScope>
     where
-        A: Allocator + 'static,
+        A: Allocator + Send + Sync + 'static,
     {
         fn alloc_root_scope_<TyAlloc>(
             alloc: TyAlloc,
         ) -> Result<NonNull<RootScope>, AllocError>
         where
-            TyAlloc: 'static + Allocator,
+            TyAlloc: 'static + Allocator + Send + Sync,
         {
             #[repr(C)]
             struct RootScopeRepr<TyAlloc> {
@@ -107,9 +113,9 @@ impl RootScope {
                 let p = &mut p[0] as *mut u8 as *mut RootScopeRepr<TyAlloc>;
                 &mut *p
             };
-            root.scope.scopes_ = ScopesBpTree::with_comparer(ScopePtrComparer).unwrap();
+            root.scope.scopes_ =
+                SpinningMutexOwned::new_owned(ScopesBpTree::with_comparer(ScopePtrComparer).unwrap());
             root.scope.metas_ = MetasBpTree::new().unwrap();
-            root.scope.inner_ = ScopeInner::root_();
             root.alloc = alloc;
             root.scope.alloc_ = &root.alloc;
             Result::Ok(NonNull::from_mut(&mut root.scope))
@@ -149,16 +155,14 @@ impl RootScope {
         Result::Ok(unsafe { root_ptr.as_ref() })
     }
 
-    /// 根 B+ 树的只读视图。
-    #[inline]
-    pub(crate) const fn scopes_(&self) -> &ScopesBpTree {
-        &self.scopes_
-    }
-
-    /// 根 B+ 树的可变视图；登记 / 移除域时使用。
-    #[inline]
-    pub(crate) fn scopes_mut_(&mut self) -> &mut ScopesBpTree {
-        &mut self.scopes_
+    /// 把一个域实体登记进 root 的树；键是锁内 `ScopeInner` 的地址。
+    pub(crate) fn register_scope_(&self, key: NonNull<ScopeInner>) {
+        let mut session = self.scopes_.lock_session();
+        let mut guard = match session.lock().wait() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => unreachable!("root scopes 自旋锁不应失败"),
+        };
+        let _ = guard.insert(key, ());
     }
 
     /// 登记一条强块元信息，返回元信息在树中的稳定地址。
@@ -210,35 +214,10 @@ impl RootScope {
         self.metas_.remove(addr)
     }
 
-    // /// 把一个域登记进 root 的 B+ 树；返回被覆盖的旧值（正常情况下为 `None`）。
-    // ///
-    // /// 这是新设计取代父子 / 兄弟链的核心入口：域之间的归属关系不再由域内指针表达，
-    // /// 而是由 root 的树统一记录。
-    // #[inline]
-    // pub(crate) fn insert_scope_(
-    //     &mut self,
-    //     key: ScopeKey,
-    //     inner: NonNull<ScopeInner>,
-    // ) -> Option<NonNull<ScopeInner>> {
-    //     self.scopes_.insert(key, inner)
-    // }
-
-    // /// 按 [`ScopeKey`] 查找域。
-    // #[inline]
-    // pub(crate) fn get_scope_(&self, key: ScopeKey) -> Option<NonNull<ScopeInner>> {
-    //     self.scopes_.get(key).map(|(_, inner)| *inner)
-    // }
-
-    // /// 从 root 的 B+ 树中摘除一个域。
-    // #[inline]
-    // pub(crate) fn remove_scope_(&mut self, key: ScopeKey) -> Option<NonNull<ScopeInner>> {
-    //     self.scopes_.remove(key)
-    // }
-
 
     /// 类型擦除后的分配器。
     #[inline]
-    pub(crate) fn allocator_(&self) -> &'static dyn Allocator {
+    pub(crate) fn allocator_(&self) -> &'static (dyn Allocator + Send + Sync) {
         self.alloc_
     }
 
@@ -262,12 +241,6 @@ impl TrComparer<NonNull<ScopeInner>> for ScopePtrComparer {
         let a = a.as_ptr() as usize;
         let b = b.as_ptr() as usize;
         <usize as Ord>::cmp(&a, &b)
-    }
-}
-
-impl ScopeInner {
-    fn root_() -> Self {
-        todo!()
     }
 }
 

@@ -2,30 +2,32 @@
 //!
 //! # 新设计（重构中）
 //!
-//! 旧实现里 `Scope` 直接持有 `ScopeInner` 的指针，并通过父域 / 子域 / 兄弟链组成代际树。
-//! 新设计改为：
+//! # 实验分支 feat/scope-lock
 //!
-//! - 每个 [`Scope`] 只保存"所属 [`RootScope`] + 在 root B+ 树中的 [`ScopeKey`]"；
-//! - 所有域的查找、登记与移除都通过 root 的 B+ 树完成；
-//! - `Scope` / `ScopeInner` 都不再带泛型参数。
+//! - 每个 [`Scope`] 只是一个指向 `ScopeHeader` 的指针；头部首字段是
+//!   `CooperativeRwLock<ScopeInner>`，因此 `ScopeInner` 内联在锁里，没有单独的堆分配；
+//! - 每域一份的池分配器 `A` 内联在实体尾部，`ScopeInner::allocator_` 指向它；
+//! - [`Scope`] 实现 `Clone`：锁外原子句柄计数，最后一个句柄只做关闭标记；
+//! - 所有放入操作先 `write_async()` 拿锁，再调用同步的 `ScopeInner` 方法。
 //!
-//! 旧实现的每个方法体都保留在本文件末尾的块注释里，便于对照。尚未迁移的运行路径统一用
-//! `todo!()` 标记，等 B+ 树操作与对象分配管线迁移完成后再补回。
+//! 实体由 `RootScope` 的分配器分配并登记到 root 的 `scopes_` 树；当前实验分支尚未实现
+//! 实体回收与 `?Sized` 元信息登记。旧实现保留在文件末尾的块注释中。
 
 use core::{
-    alloc::Layout,
+    alloc::{Allocator, Layout},
     mem::MaybeUninit,
-    ptr::{self, NonNull},
+    ptr::NonNull,
 };
 
-use abs_cancel::{TrCancellationToken, TrMayCancel};
+use abs_cancel::{NonCancellableToken, TrCancellationToken, TrMayCancel};
 use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
     abs_::{IntoEmplace, TrEmplace, TrPredrop, TrScope},
     index_::Retain,
-    scope_inner_::{self, ScopeInner},
-    scope_str_::ScopeStr, x_deps::abs_cancel,
+    scope_inner_::{self, DEFAULT_PAGE_SIZE, DEFAULT_ROOT_SCOPE, RootScope, ScopeHeader},
+    scope_str_::ScopeStr,
+    x_deps::abs_cancel,
 };
 
 pub use scope_inner_::TrScopeInnerConfig;
@@ -44,74 +46,99 @@ pub enum ScopeError {
     ClosedScope,
 }
 
-/// 一个自包含结构，位于 Root 树，其生命周期由其分配的所有 `Retain<T>` 共同决定。
+/// 一个域的公开句柄：指向 `ScopeHeader`，与其它克隆共享同一个实体。
 ///
-/// 新设计里它只是 root B+ 树中一个条目的句柄：`root_` 指出树，`key_` 指出条目。
-/// 旧实现直接持有 `&'static ScopeInner`，并靠父子链维持代际关系；见文件末尾注释。
+/// `ScopeHeader` 首字段是锁，所以本指针也等价于实验设计里的
+/// `NonNull<CooperativeRwLock<ScopeInner>>`。
 pub struct Scope {
-    inner_: NonNull<ScopeInner>
+    /// 指向实体公共头部；头部首字段是锁，因此该地址也是 `ScopeLock` 的地址。
+    header_: NonNull<ScopeHeader>,
 }
 
 impl Scope {
-    /// 尝试以某种配置来初始化根域
+    /// 尝试以某种配置来初始化根域。
+    ///
+    /// 当前实验分支只保证默认 root 初始化；`TyCfg` 的接入留给后续。
     pub fn try_init_root<TyCfg>() -> bool {
-        // 旧签名使用 `&'static AtomicPtr<ScopeInner>`，并在初始化后直接包装 root 的
-        // `ScopeInner`。新设计必须先让 `RootScope::try_init_default_root_scope_` 把 root
-        // 发布到 B+ 树，再为 root 自身分配一个 `ScopeKey`。
-        //
-        // let x = RootScope::try_init_default_root_scope_(
-        //     root_ptr,
-        //     page_size,
-        //     allocator,
-        // );
-        // x.map(Self::make_scope_)
-        //     .map_err(Self::make_scope_)
-        todo!()
+        let _ = core::marker::PhantomData::<TyCfg>;
+        let _ = Self::default_root_();
+        true
     }
 
     /// 从默认的 RootScope 中创建一个子 scope。
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        // 旧实现：
-        //
-        // let root = match RootScope::try_init_default_root_scope_(
-        //     &scope_inner_::DEFAULT_ROOT_SCOPE,
-        //     scope_inner_::DEFAULT_PAGE_SIZE,
-        //     alloc::alloc::Global,
-        // ) {
-        //     Result::Err(s) | Result::Ok(s) => s,
-        // };
-        // // 以 root 域为父创建子 Scope；root 自身没有父域，临时句柄析构时会被跳过
-        // let root_scope = Self::make_scope_(root);
-        // Self::new_from_parent(&root_scope)
-        Self::new_with_cfg::<scope_inner_::DefaultConfig>()
+        Self::new_with_alloc::<
+            alloc::alloc::Global,
+            scope_inner_::DefaultConfig<alloc::alloc::Global>,
+        >()
     }
 
+    /// 用默认的 `Global` 分配器，按给定配置创建域句柄。
     pub fn new_with_cfg<C>() -> Self
     where
         C: TrScopeInnerConfig,
     {
-        todo!()
+        Self::new_with_alloc::<alloc::alloc::Global, C>()
+    }
+
+    /// 按给定配置创建域句柄，池分配器使用 `A::default()`。
+    pub fn new_with_alloc<A, C>() -> Self
+    where
+        A: Allocator + Default + Send + Sync + 'static,
+        C: TrScopeInnerConfig,
+    {
+        Self::new_with_alloc_value::<A, C>(A::default())
+    }
+
+    /// 按给定配置与具体分配器值创建域句柄。
+    ///
+    /// `A` 是每域一份的池分配器，直接内联存放在实体尾部，不会单独堆分配。
+    ///
+    /// # Panics
+    ///
+    /// root 分配器无法提供实体内存时 panic；需要可恢复错误时请后续接入
+    /// `try_new_with_alloc_value`。
+    pub fn new_with_alloc_value<A, C>(alloc: A) -> Self
+    where
+        A: Allocator + Send + Sync + 'static,
+        C: TrScopeInnerConfig,
+    {
+        let root = Self::default_root_();
+        let page_size = <C::PageSize as crate::page_size::TrPageSizeSelect>::PAGE_SIZE;
+        match ScopeHeader::allocate_entity_::<A>(root, alloc, page_size) {
+            Result::Ok(header_) => Scope { header_ },
+            Result::Err(_) => panic!("分配 ScopeEntity 失败"),
+        }
     }
 
     pub async fn put_async<T>(&self, data: T) -> Result<Retain<T>, ScopeError> {
-        todo!()
+        scope_put_async_(self, data, NonCancellableToken::new()).await
+    }
+
+    /// 取默认 root；并发初始化时后到者拿到先到者发布的 root。
+    fn default_root_() -> &'static RootScope {
+        match RootScope::try_init_default_root_scope_(
+            &DEFAULT_ROOT_SCOPE,
+            DEFAULT_PAGE_SIZE,
+            alloc::alloc::Global,
+        ) {
+            Result::Ok(root) | Result::Err(root) => root,
+        }
+    }
+
+    /// 实体公共头部。
+    fn header_(&self) -> &ScopeHeader {
+        // SAFETY: 实体由 'static root 持有，且在句柄存活期间不会被释放
+        unsafe { self.header_.as_ref() }
     }
 }
 
 impl Scope {
-
     /// 在同一个 root 下创建 `parent` 的子域。
     pub fn new_from_parent(_parent: &Scope) -> Self {
-        // 旧实现（父子链）：
-        //
-        // // SAFETY: parent.inner_ptr_ 来自一个仍然存活的 Scope
-        // let inner = ScopeInner::new_child_(parent.inner_ptr_).expect("分配子 Scope 失败");
-        // Scope { inner_ptr_: inner }
-        //
-        // 新实现应当：向 parent.root_ 申请一个新的 ScopeKey，分配 `ScopeInner`，把它
-        // 插入 B+ 树；父子关系由树中的键记录（具体表示待定）。
-        todo!()
+        // 实验分支暂未在树中表达父子关系：先在同一 root 下创建一个独立域。
+        Self::new()
     }
 
     /// 显式清盘：遍历本域存活链，把仍然活着的数据逐个 `PreDrop` + 析构，再整块回收强池。
@@ -416,33 +443,37 @@ impl TrScope for Scope {
 
 impl core::cmp::PartialEq for Scope {
     fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self.inner_.as_ptr(), other.inner_.as_ptr())
+        self.header_ == other.header_
     }
 }
 
 impl core::cmp::Eq for Scope {}
 
+impl Clone for Scope {
+    fn clone(&self) -> Self {
+        self.header_().incr_handle_();
+        Scope {
+            header_: self.header_,
+        }
+    }
+}
+
+// SAFETY: 实体由 root 持有，句柄只做原子计数；ScopeInner 的访问由实体锁串行化。
+unsafe impl Send for Scope {}
+// SAFETY: 见上。
+unsafe impl Sync for Scope {}
+
 impl Drop for Scope {
-    /// 句柄析构：新设计里应当从 root 的 B+ 树中撤销本域的"句柄存活"标记，并按清盘方案 A
-    /// 决定是否关闭子域。
+    /// 句柄析构：减引用计数；最后一个句柄只做关闭标记。
     ///
-    /// 旧实现只把子树标记关闭、摘链、挂进待回收名单，因此 `Drop` 保持 **safe**。
+    /// 实验分支暂不回收实体：`Retain` 可能仍然指向实体拥有的弱槽位，而回收需要与
+    /// “最后一个 Retain 释放”以及 root 的待回收队列协调。实体本身由 root 持有，
+    /// 这里先保留，后续接入清盘 / 回收路径。
     fn drop(&mut self) {
-        // 旧实现：
-        //
-        // // SAFETY: Scope 持有一个有效的 ScopeInner
-        // let inner = unsafe { self.inner_ptr_.as_mut() };
-        // // 根域没有 Scope 句柄，不应走到这里；防御性跳过
-        // if !inner.has_parent_() {
-        //     return;
-        // }
-        // inner.mark_handle_dropped_();
-        // if !inner.is_closed_() {
-        //     // 非递归地把整棵子树标记关闭并挂进名单
-        //     inner.close_subtree_();
-        // }
-        // inner.reclaim_pending_();
-        todo!()
+        let header = self.header_();
+        if header.decr_handle_() == 1 {
+            header.mark_closed_();
+        }
     }
 }
 
@@ -460,6 +491,31 @@ where
     K: TrCancellationToken,
 {
     Result::Err(ScopeError::ClosedScope)
+}
+
+#[gen_may_cancel_future(ScopePut)]
+async fn scope_put_async_<'f, T, K>(
+    scope: &'f Scope,
+    value: T,
+    cancel: K,
+) -> Result<Retain<T>, ScopeError>
+where
+    T: 'f,
+    K: TrCancellationToken,
+{
+    if scope.header_().is_closed_() {
+        return Result::Err(ScopeError::ClosedScope);
+    }
+    let mut sess = scope.header_().lock_().acquire_session();
+    let mut guard = sess
+        .write_async()
+        .may_cancel_with(cancel)
+        .await
+        // TODO(实验): 锁错误（Cancelled / Poisoned）还没有独立的公开错误变体
+        .map_err(|_| ScopeError::ClosedScope)?;
+    guard
+        .put_value_(value)
+        .map_err(|_| ScopeError::MallocFailed)
 }
 
 #[gen_may_cancel_future(ScopePutWithFactoryPredrop, pub, new(pub(crate)))]
@@ -940,3 +996,104 @@ impl Drop for Scope {
 }
 
 */
+
+#[cfg(test)]
+mod tests_ {
+    use alloc::alloc::Global;
+    use core::{
+        alloc::{AllocError, Allocator, Layout},
+        mem,
+        ptr::NonNull,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use crate::{Scope, scope_inner_};
+
+    static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static GLOBAL: Global = Global;
+
+    /// 转发给 `Global` 并统计分配次数，用来证明 per-Scope 分配器确实被使用。
+    struct CountingAlloc;
+
+    // SAFETY: 只把分配 / 释放原样转交给 `Global`
+    unsafe impl Allocator for CountingAlloc {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            ALLOCS.fetch_add(1, Ordering::SeqCst);
+            GLOBAL.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            // SAFETY: 指针与布局来自上面的 allocate
+            unsafe { GLOBAL.deallocate(ptr, layout) }
+        }
+    }
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    /// 测试 Scope 的 Clone 共享同一个锁实体，且每域分配器参与池分配。
+    /// Test that cloned Scopes share one locked entity and the per-scope allocator is used.
+    ///
+    /// - 手段：用计数分配器创建一个域，克隆后分别放入两个值。
+    ///   / How: create a scope with a counting allocator, clone it, and put two values.
+    /// - 判断：两个句柄相等，两次放入都能读回原值，计数分配器至少被调用一次。
+    ///   / What: handles compare equal, both puts read back, and the counting allocator was
+    ///   called at least once.
+    #[compio::test]
+    async fn scope_clone_shares_locked_entity_and_uses_per_scope_allocator() {
+        assert_send_sync::<Scope>();
+
+        ALLOCS.store(0, Ordering::SeqCst);
+        let scope = Scope::new_with_alloc_value::<CountingAlloc, scope_inner_::DefaultConfig<Global>>(
+            CountingAlloc,
+        );
+        let clone = scope.clone();
+        assert!(scope == clone, "克隆句柄必须指向同一个实体");
+
+        let first = scope.put_async(11u32).await.expect("第一次放入应当成功");
+        let second = clone.put_async(22u32).await.expect("第二次放入应当成功");
+        assert_eq!(*first.try_owning().expect("第一个值应当可独占"), 11);
+        assert_eq!(*second.try_owning().expect("第二个值应当可独占"), 22);
+        assert!(
+            ALLOCS.load(Ordering::SeqCst) > 0,
+            "每域分配器应当参与池分配"
+        );
+
+        // 类型擦除析构尚未接通，先避免 `Retain::drop` 走到 `todo!()`
+        mem::forget(first);
+        mem::forget(second);
+    }
+
+    /// 测试多个线程通过各自的 Runtime 并发放入时，所有写操作都在同一把实体锁上排队。
+    /// Test that concurrent puts from multiple threads are serialized by the entity lock.
+    ///
+    /// - 手段：克隆同一个 `Scope` 到 4 个线程，每个线程建自己的 compio Runtime 并放入
+    ///   一个不同的值。
+    ///   / How: clone one scope into four threads, each with its own compio Runtime, and put
+    ///   a distinct value.
+    /// - 判断：所有线程都成功读回自己放入的值，说明锁与句柄计数在跨线程下可用。
+    ///   / What: every thread reads back its own value, showing the lock and handle count work
+    ///   across threads.
+    #[test]
+    fn scope_lock_serializes_puts_across_threads() {
+        let scope = Scope::new_with_alloc::<Global, scope_inner_::DefaultConfig<Global>>();
+        let mut threads = std::vec::Vec::new();
+        for round in 0..4u32 {
+            let scope = scope.clone();
+            threads.push(std::thread::spawn(move || {
+                let runtime = compio::runtime::Runtime::new().expect("创建 Runtime 应当成功");
+                runtime.block_on(async move {
+                    let retain = scope.put_async(round).await.expect("跨线程放入应当成功");
+                    let value = *retain.try_owning().expect("数据应当可独占");
+                    // 类型擦除析构尚未接通
+                    mem::forget(retain);
+                    value
+                })
+            }));
+        }
+        let values: std::vec::Vec<u32> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("线程不应 panic"))
+            .collect();
+        assert_eq!(values, std::vec![0, 1, 2, 3]);
+    }
+}

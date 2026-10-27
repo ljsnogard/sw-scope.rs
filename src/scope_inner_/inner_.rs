@@ -1,21 +1,20 @@
 use core::{
-    alloc::Allocator,
-    ptr::NonNull,
-    sync::atomic::AtomicUsize,
+    alloc::{AllocError, Allocator, Layout},
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use atomex::LocksOrderings;
 use atomic_sync::rwlock::cooperative_arena::CooperativeRwLock;
 
 use crate::{
-    scope_inner_::config_::TrScopeInnerConfig,
+    scope_inner_::RootScope,
     strong_::StrongPool,
     weak_::WeakPool,
     x_deps::{atomex, atomic_sync},
 };
 
 /// 一个域的内部表示。它总是与一个 Allocator 一起分配，组成 (ScopeInner, Allocator)。
-/// 因此，任何时候都必须保证 ScopeInner 的
 ///
 /// 新设计里它由 root 的 [`bplustree_cmp::BPlusTree`] 统一持有并索引，因此不再保存
 /// 父域 / 子域 / 兄弟链；这些字段的旧版本见文件末尾注释以及 `life_` / `teardown_` 的源码。
@@ -43,25 +42,159 @@ pub(crate) struct ScopeInner {
     /// 指向 Scope 所持有的最新一块强池。
     pub(super) strong_tail_: Option<NonNull<StrongPool>>,
 
-    /// 用于分配 WeakPool 和 StrongPool 的内存分配器
-    pub(super) allocator_: &'static dyn Allocator,
+    /// 指向本实体尾部的分配器值。
+    ///
+    /// 每域一份分配器，因此这里不能是 `&'static`；指针在实体落位后指向同一实体里的
+    /// `alloc_` 字段，实体的字段顺序保证 `ScopeInner` 先于分配器析构。
+    pub(super) allocator_: NonNull<dyn Allocator + Send + Sync>,
+
+    /// 开新弱池 / 强池时使用的页大小；由创建期的 `C::PageSize` 决定。
+    pub(super) page_size_: usize,
 }
 
-type ScopeRwLock<C> = CooperativeRwLock<
-    (),
+// SAFETY: 池链只在持有实体写锁时访问；弱槽位对 `Retain` 的并发访问走自身的原子状态；
+// 分配器要求 `Send + Sync`。实体一旦发布就不再移动。
+unsafe impl Send for ScopeInner {}
+// SAFETY: 见上。
+unsafe impl Sync for ScopeInner {}
+
+impl ScopeInner {
+    /// 造一个没有池、只绑定了分配器的空域。
+    pub(super) fn empty_(
+        allocator: NonNull<dyn Allocator + Send + Sync>,
+        page_size: usize,
+    ) -> Self {
+        ScopeInner {
+            flags_: AtomicUsize::new(0),
+            weak_head_: Option::None,
+            weak_tail_: Option::None,
+            strong_head_: Option::None,
+            strong_tail_: Option::None,
+            allocator_: allocator,
+            page_size_: page_size,
+        }
+    }
+}
+
+/// 固定的锁类型：`ScopeInner` 内联在 `UnsafeCell` 里，锁内核的分配器被擦成
+/// `&'static dyn Allocator`，因此 `Scope` 不需要知道创建期的 `C`。
+pub(crate) type ScopeLock = CooperativeRwLock<
+    ScopeInner,
     usize,
-    core::sync::atomic::AtomicUsize,
+    AtomicUsize,
     LocksOrderings,
-    <C as TrScopeInnerConfig>::LockAlloc,
+    &'static (dyn Allocator + Send + Sync),
 >;
 
+/// 实体中与 `A` 无关的公共头部。
+///
+/// `lock_` 放在首位，于是 `Scope` 持有的 `NonNull<ScopeLock>` 与 `NonNull<ScopeHeader>`
+/// 地址相同；需要句柄计数、root 或树键时可以直接回到头部。
 #[repr(C)]
-pub(crate) struct ScopeInnerWithCfg<A, C>
+pub(crate) struct ScopeHeader {
+    lock_: ScopeLock,
+    handles_: AtomicUsize,
+    closed_: AtomicBool,
+    root_: &'static RootScope,
+    key_: NonNull<ScopeInner>,
+}
+
+/// 一个域的完整实体：固定头部 + 每域一份的用户指定分配器。
+#[repr(C)]
+pub(crate) struct ScopeEntity<A>
 where
     A: Allocator,
-    C: TrScopeInnerConfig,
 {
-    inner_: ScopeInner,
-    rwlock_: ScopeRwLock<C>,
+    header_: ScopeHeader,
     alloc_: A,
+}
+
+impl ScopeHeader {
+    /// 用 root 的分配器申请并就地构造一个实体。
+    ///
+    /// `alloc` 是每域一份的池分配器，放在实体尾部；`ScopeInner::allocator_` 指向它，
+    /// 因此不会为分配器再单独做一次堆分配。
+    ///
+    /// # Errors
+    ///
+    /// root 分配器无法提供实体所需内存时返回 [`AllocError`]。
+    pub(crate) fn allocate_entity_<A>(
+        root: &'static RootScope,
+        alloc: A,
+        page_size: usize,
+    ) -> Result<NonNull<Self>, AllocError>
+    where
+        A: Allocator + Send + Sync + 'static,
+    {
+        let layout = Layout::new::<ScopeEntity<A>>();
+        let mem = root.allocator_().allocate(layout)?;
+        let base = mem.as_ptr() as *mut u8 as *mut ScopeEntity<A>;
+        // SAFETY: base 指向刚分配、尚未初始化的实体
+        let alloc_ptr =
+            unsafe { ptr::addr_of_mut!((*base).alloc_) } as *mut (dyn Allocator + Send + Sync);
+        // SAFETY: 地址来自刚分配的内存，非空
+        let allocator = unsafe { NonNull::new_unchecked(alloc_ptr) };
+        let inner = ScopeInner::empty_(allocator, page_size);
+        let lock = ScopeLock::new_in(inner, AtomicUsize::new(0), root.allocator_());
+        // SAFETY: base 是刚分配、独享且尚未写入的内存；两个字段分别就地写入
+        unsafe {
+            ptr::write(
+                ptr::addr_of_mut!((*base).header_),
+                ScopeHeader {
+                    lock_: lock,
+                    handles_: AtomicUsize::new(1),
+                    closed_: AtomicBool::new(false),
+                    root_: root,
+                    key_: NonNull::dangling(),
+                },
+            );
+            ptr::write(ptr::addr_of_mut!((*base).alloc_), alloc);
+        }
+        // 锁已落位，树键取锁内 ScopeInner 的地址
+        // SAFETY: base 已初始化，地址稳定
+        let key = unsafe { NonNull::new_unchecked((*base).header_.lock_.as_mut_ptr()) };
+        // SAFETY: 同上
+        unsafe { (*base).header_.key_ = key };
+        // SAFETY: header_ 已初始化，位于 base 首址
+        let header = unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*base).header_)) };
+        root.register_scope_(key);
+        Result::Ok(header)
+    }
+
+    #[inline]
+    pub(crate) fn lock_(&self) -> &ScopeLock {
+        &self.lock_
+    }
+
+    /// 最后一个 `Scope` 句柄是否已经析构。
+    #[inline]
+    pub(crate) fn is_closed_(&self) -> bool {
+        self.closed_.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn mark_closed_(&self) {
+        self.closed_.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn incr_handle_(&self) {
+        self.handles_.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 减少句柄计数，返回减少前的值；返回 1 表示本次是最后一个句柄。
+    #[inline]
+    pub(crate) fn decr_handle_(&self) -> usize {
+        self.handles_.fetch_sub(1, Ordering::AcqRel)
+    }
+
+    #[inline]
+    pub(crate) fn root_(&self) -> &'static RootScope {
+        self.root_
+    }
+
+    #[inline]
+    pub(crate) fn key_(&self) -> NonNull<ScopeInner> {
+        self.key_
+    }
 }

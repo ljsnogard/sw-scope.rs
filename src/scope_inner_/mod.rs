@@ -39,10 +39,7 @@ mod root_;
 // mod tests_;
 
 pub use config_::{DefaultConfig, TrScopeInnerConfig};
-pub(crate) use inner_::ScopeInner;
-// `ScopeInnerWithCfg` 是 Scope 层创建新域时的入口，等 `Scope::new_with_cfg` 接通后即被使用。
-#[allow(unused_imports)]
-pub(crate) use inner_::ScopeInnerWithCfg;
+pub(crate) use inner_::{ScopeHeader, ScopeInner};
 pub(crate) use root_::RootScope;
 
 // 旧导出（仅供对照）：

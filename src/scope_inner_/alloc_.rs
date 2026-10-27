@@ -26,7 +26,7 @@ use core::{
 use crate::{
     abs_::{TrEmplace, TrPredrop},
     index_::Retain,
-    scope_inner_::{DEFAULT_CELL_SIZE, DEFAULT_PAGE_SIZE, PoolIndex, ScopeInner},
+    scope_inner_::{DEFAULT_CELL_SIZE, PoolIndex, ScopeInner},
     strong_::{MetaAddr, StrongChunk, StrongPool},
     weak_::{WeakPool, WeakSlot},
 };
@@ -67,12 +67,16 @@ impl ScopeInner {
         let padding = layout.align().saturating_sub(1);
         let need_bytes = layout.size().checked_add(padding).ok_or(AllocError)?;
         let need_cells = need_bytes.div_ceil(DEFAULT_CELL_SIZE).max(1);
-        let cell_count = need_cells.max(DEFAULT_PAGE_SIZE / DEFAULT_CELL_SIZE);
+        let cell_count = need_cells.max(self.page_size_.max(DEFAULT_CELL_SIZE) / DEFAULT_CELL_SIZE);
         if cell_count > PoolIndex::MAX as usize {
             return Result::Err(AllocError);
         }
-        let pool =
-            StrongPool::try_new_(cell_count as PoolIndex, self.allocator_, self.strong_tail_)?;
+        let pool = StrongPool::try_new_(
+            cell_count as PoolIndex,
+            // SAFETY: allocator_ 指向本实体尾部、在实体析构前一直有效
+            unsafe { self.allocator_.as_ref() },
+            self.strong_tail_,
+        )?;
         if self.strong_head_.is_none() {
             self.strong_head_ = Option::Some(pool);
         }
@@ -98,7 +102,9 @@ impl ScopeInner {
             }
         }
         // 尾池已满（或还没有池）：开一个新池，登记所属域并接到链尾
-        let new = WeakPool::try_new_with_max_size(DEFAULT_PAGE_SIZE, self.allocator_).ok()?;
+        // SAFETY: allocator_ 指向本实体尾部、在实体析构前一直有效
+        let alloc = unsafe { self.allocator_.as_ref() };
+        let new = WeakPool::try_new_with_max_size(self.page_size_, alloc).ok()?;
         // SAFETY: new 是刚初始化的独占池
         let new_ref = unsafe { new.as_ptr().as_mut() }?;
         // 池只保存所属域的地址，不取得所有权
@@ -291,7 +297,7 @@ mod tests_ {
     use std::alloc::Global;
 
     use super::*;
-    use crate::{abs_::IntoEmplace, weak_::DataState};
+    use crate::{abs_::IntoEmplace, scope_inner_::DEFAULT_PAGE_SIZE, weak_::DataState};
 
     static GLOBAL: Global = Global;
 
@@ -325,14 +331,19 @@ mod tests_ {
     static COUNTING: CountingAlloc = CountingAlloc;
 
     /// 构造一个只带分配器的空域，供分配管线测试使用。
-    fn empty_scope_(alloc: &'static dyn Allocator) -> ScopeInner {
+    fn empty_scope_<A>(alloc: &'static A) -> ScopeInner
+    where
+        A: Allocator + Send + Sync,
+    {
+        let allocator: NonNull<dyn Allocator + Send + Sync> = NonNull::from(alloc);
         ScopeInner {
             flags_: AtomicUsize::new(0),
             weak_head_: Option::None,
             weak_tail_: Option::None,
             strong_head_: Option::None,
             strong_tail_: Option::None,
-            allocator_: alloc,
+            allocator_: allocator,
+            page_size_: DEFAULT_PAGE_SIZE,
         }
     }
 

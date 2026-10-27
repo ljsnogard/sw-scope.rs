@@ -64,7 +64,7 @@ impl StrongPool {
     /// `cell_count` 为 0，或底层分配器无法满足布局时返回 [`AllocError`]。
     pub(crate) fn try_new_(
         cell_count: PoolIndex,
-        alloc: &'static dyn Allocator,
+        alloc: &dyn Allocator,
         prev: Option<NonNull<Self>>,
     ) -> Result<NonNull<Self>, AllocError> {
         if cell_count == 0 {

@@ -115,7 +115,7 @@ impl WeakPool {
     /// 当 `cell_count` 为 0，或底层分配器无法满足布局要求时返回 [`AllocError`]。
     pub fn try_new_with_cell_count(
         cell_count: PoolIndex,
-        alloc: &'static dyn Allocator,
+        alloc: &dyn Allocator,
     ) -> Result<NonNull<Self>, AllocError> {
         if cell_count == 0 {
             return Result::Err(AllocError);
@@ -133,7 +133,7 @@ impl WeakPool {
     /// 当预算连一个槽位都放不下，或底层分配器无法满足布局要求时返回 [`AllocError`]。
     pub fn try_new_with_max_size(
         max_size: usize,
-        alloc: &'static dyn Allocator,
+        alloc: &dyn Allocator,
     ) -> Result<NonNull<Self>, AllocError> {
         let count = Self::max_count_within_max_size(max_size);
         if count == 0 || count > PoolIndex::MAX as usize {
