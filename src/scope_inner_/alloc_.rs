@@ -126,7 +126,7 @@ impl ScopeInner {
     /// 把一个尚未投入使用的弱槽位归还给所属池。
     ///
     /// 这是分配失败时的回滚路径：槽位尚未写入状态与强块指针，直接还给空闲链即可。
-    fn deallocate_weak_(&mut self, weak: NonNull<WeakSlot<()>>) {
+    pub(crate) fn deallocate_weak_(&mut self, weak: NonNull<WeakSlot<()>>) {
         let Option::Some(pool) = WeakPool::of_slot_(weak) else {
             return;
         };

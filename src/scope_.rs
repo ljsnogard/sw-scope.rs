@@ -1015,6 +1015,23 @@ mod tests_ {
     /// 转发给 `Global` 并统计分配次数，用来证明 per-Scope 分配器确实被使用。
     struct CountingAlloc;
 
+    /// 带状态的分配器，用来制造与 `CountingAlloc` / `Global` 不同尺寸的 `ScopeEntity`。
+    struct TaggedAlloc {
+        _tag: usize,
+    }
+
+    // SAFETY: 只把分配 / 释放原样转交给 `Global`
+    unsafe impl Allocator for TaggedAlloc {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            GLOBAL.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            // SAFETY: 指针与布局来自上面的 allocate
+            unsafe { GLOBAL.deallocate(ptr, layout) }
+        }
+    }
+
     // SAFETY: 只把分配 / 释放原样转交给 `Global`
     unsafe impl Allocator for CountingAlloc {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -1095,5 +1112,31 @@ mod tests_ {
             .map(|thread| thread.join().expect("线程不应 panic"))
             .collect();
         assert_eq!(values, std::vec![0, 1, 2, 3]);
+    }
+
+    /// 测试同一个 root 的强块池可以同时容纳不同 `A` 类型的域实体。
+    /// Test that one root strong pool can hold scope entities with different `A` types.
+    ///
+    /// - 手段：在同一 root 下分别用带状态的 `TaggedAlloc` 和 `Global` 创建两个域并放入值。
+    ///   / How: create two scopes under the same root, one with a stateful `TaggedAlloc` and one
+    ///   with `Global`, then put a value into each.
+    /// - 判断：两个域都能读回各自的值，说明异质 `ScopeEntity` 共存于 root 的强块池。
+    ///   / What: both scopes read back their own values, showing heterogeneous scope entities
+    ///   coexist in the root strong pool.
+    #[compio::test]
+    async fn root_entity_pool_holds_heterogeneous_scope_entities() {
+        let tagged = Scope::new_with_alloc_value::<TaggedAlloc, scope_inner_::DefaultConfig<Global>>(
+            TaggedAlloc { _tag: 7 },
+        );
+        let plain = Scope::new_with_alloc::<Global, scope_inner_::DefaultConfig<Global>>();
+        let first = tagged
+            .put_async(1u32)
+            .await
+            .expect("TaggedAlloc 域放入应当成功");
+        let second = plain.put_async(2u32).await.expect("Global 域放入应当成功");
+        assert_eq!(*first.try_owning().expect("第一个值应当可独占"), 1);
+        assert_eq!(*second.try_owning().expect("第二个值应当可独占"), 2);
+        mem::forget(first);
+        mem::forget(second);
     }
 }

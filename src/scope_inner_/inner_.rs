@@ -9,14 +9,14 @@ use atomic_sync::rwlock::cooperative_arena::CooperativeRwLock;
 
 use crate::{
     scope_inner_::RootScope,
-    strong_::StrongPool,
-    weak_::WeakPool,
+    strong_::{StrongChunk, StrongChunkBase, StrongPool},
+    weak_::{WeakPool, WeakSlot},
     x_deps::{atomex, atomic_sync},
 };
 
 /// 一个域的内部表示。它总是与一个 Allocator 一起分配，组成 (ScopeInner, Allocator)。
 ///
-/// 新设计里它由 root 的 [`bplustree_cmp::BPlusTree`] 统一持有并索引，因此不再保存
+/// 新设计里域实体作为 `StrongChunk` 存放在 root 自己的强块池里，因此不再保存
 /// 父域 / 子域 / 兄弟链；这些字段的旧版本见文件末尾注释以及 `life_` / `teardown_` 的源码。
 ///
 /// 域持有若干 [`StrongPool`] 组成的链，池内的对象位置终身不变（见 `StrongPool` 的文档）；
@@ -96,7 +96,11 @@ pub(crate) struct ScopeHeader {
     handles_: AtomicUsize,
     closed_: AtomicBool,
     root_: &'static RootScope,
-    key_: NonNull<ScopeInner>,
+    /// 本实体所在的强块与身份槽位，供未来把 chunk / slot 还给 root 池。
+    chunk_: NonNull<StrongChunkBase>,
+    weak_: NonNull<WeakSlot<()>>,
+    /// 单态化的析构入口：root 不需要知道 `A`，经此指针即可析构异质实体。
+    drop_: unsafe fn(NonNull<ScopeHeader>),
 }
 
 /// 一个域的完整实体：固定头部 + 每域一份的用户指定分配器。
@@ -126,39 +130,59 @@ impl ScopeHeader {
     where
         A: Allocator + Send + Sync + 'static,
     {
-        let layout = Layout::new::<ScopeEntity<A>>();
-        let mem = root.allocator_().allocate(layout)?;
-        let base = mem.as_ptr() as *mut u8 as *mut ScopeEntity<A>;
-        // SAFETY: base 指向刚分配、尚未初始化的实体
+        // 一个实体 = 一个 StrongChunk<ScopeEntity<A>, ()>；chunk 头 + 实体数据都在 root 池里。
+        let entity_layout = Layout::new::<ScopeEntity<A>>();
+        let Option::Some((chunk_layout, dat_offset)) =
+            StrongChunk::<ScopeEntity<A>>::layout_sized(entity_layout)
+        else {
+            return Result::Err(AllocError);
+        };
+        // 先取身份槽位，再从 root 的实体池分配 chunk；失败时把槽位还回去。
+        let allocated: Result<_, AllocError> = root.with_entity_pool_(|pool| {
+            let weak = match pool.allocate_weak_() {
+                Option::Some(weak) => weak,
+                Option::None => return Result::Err(AllocError),
+            };
+            match pool.allocate_(chunk_layout) {
+                Result::Ok((mem, order)) => Result::Ok((weak, mem, order)),
+                Result::Err(err) => {
+                    pool.deallocate_weak_(weak);
+                    Result::Err(err)
+                }
+            }
+        });
+        let (weak, mem, pool_order) = allocated?;
+        let base = mem.as_ptr() as *mut u8 as *mut StrongChunk<ScopeEntity<A>>;
+        // SAFETY: chunk_layout / dat_offset 来自同一布局；weak 与 mem 都是刚取出的独占资源
+        unsafe {
+            StrongChunk::<ScopeEntity<A>>::init_sized(base, weak, pool_order, (), dat_offset)
+        };
+        // SAFETY: 头部已初始化，data_ptr 落在 chunk 尾部的实体数据区
+        let entity = unsafe { &mut *base }.data_ptr();
+        // SAFETY: entity 指向尚未初始化的实体；alloc_ 字段地址稳定
         let alloc_ptr =
-            unsafe { ptr::addr_of_mut!((*base).alloc_) } as *mut (dyn Allocator + Send + Sync);
-        // SAFETY: 地址来自刚分配的内存，非空
+            unsafe { ptr::addr_of_mut!((*entity).alloc_) } as *mut (dyn Allocator + Send + Sync);
+        // SAFETY: 地址来自刚分配的实体，非空
         let allocator = unsafe { NonNull::new_unchecked(alloc_ptr) };
         let inner = ScopeInner::empty_(allocator, page_size);
         let lock = ScopeLock::new_in(inner, AtomicUsize::new(0), root.allocator_());
-        // SAFETY: base 是刚分配、独享且尚未写入的内存；两个字段分别就地写入
+        // SAFETY: chunk 数据区独占；头 / 分配器分别就地写入
         unsafe {
             ptr::write(
-                ptr::addr_of_mut!((*base).header_),
+                ptr::addr_of_mut!((*entity).header_),
                 ScopeHeader {
                     lock_: lock,
                     handles_: AtomicUsize::new(1),
                     closed_: AtomicBool::new(false),
                     root_: root,
-                    key_: NonNull::dangling(),
+                    chunk_: NonNull::new_unchecked(base as *mut StrongChunkBase),
+                    weak_: weak,
+                    drop_: drop_scope_entity_::<A>,
                 },
             );
-            ptr::write(ptr::addr_of_mut!((*base).alloc_), alloc);
+            ptr::write(ptr::addr_of_mut!((*entity).alloc_), alloc);
+            Result::Ok(NonNull::new_unchecked(entity.cast::<ScopeHeader>()))
         }
-        // 锁已落位，树键取锁内 ScopeInner 的地址
-        // SAFETY: base 已初始化，地址稳定
-        let key = unsafe { NonNull::new_unchecked((*base).header_.lock_.as_mut_ptr()) };
-        // SAFETY: 同上
-        unsafe { (*base).header_.key_ = key };
-        // SAFETY: header_ 已初始化，位于 base 首址
-        let header = unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*base).header_)) };
-        root.register_scope_(key);
-        Result::Ok(header)
     }
 
     #[inline]
@@ -192,9 +216,18 @@ impl ScopeHeader {
     pub(crate) fn root_(&self) -> &'static RootScope {
         self.root_
     }
+}
 
-    #[inline]
-    pub(crate) fn key_(&self) -> NonNull<ScopeInner> {
-        self.key_
-    }
+/// 单态化析构入口：root 只需要 `ScopeHeader` 里的一个函数指针，就能析构异质的
+/// `ScopeEntity<A>`。chunk / 弱槽位的归还留给 root 的回收路径（当前实验尚未接入）。
+///
+/// # Safety
+///
+/// `header` 必须指向一个仍然存活、且尚未析构的 `ScopeEntity<A>`。
+unsafe fn drop_scope_entity_<A>(header: NonNull<ScopeHeader>)
+where
+    A: Allocator + Send + Sync + 'static,
+{
+    // SAFETY: ScopeHeader 是 ScopeEntity<A> 的首字段
+    unsafe { ptr::drop_in_place(header.as_ptr() as *mut ScopeEntity<A>) };
 }
