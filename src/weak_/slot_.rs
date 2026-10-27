@@ -5,12 +5,9 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 
-use abs_cancel::{NonCancellableToken, TrCancellationToken};
-use abs_sync::x_deps::abs_cancel;
-use atomex::{AtomicFlags, CmpxchResult};
 use atomic_sync::{
     mutex::preemptive::MsbAsMutexSignal,
-    x_deps::{abs_sync, atomex},
+    x_deps::atomex::{AtomicFlags, CmpxchResult},
 };
 
 use crate::{
@@ -18,7 +15,7 @@ use crate::{
     strong_::{StrongChunk, StrongChunkBase},
 };
 
-use super::pre_drop_::PreDropRecord;
+use crate::strong_::PreDropRecord;
 
 /// 弱引用槽位。它既是 `Retain<T>` 的持有对象，也是**对象的身份与生命周期上下文**。
 ///
@@ -52,6 +49,17 @@ where
     slot_state_: WeakSlotState,
     /// 本槽位对应的强块。数据的析构与访问都要经过它。
     strong_chunk_: AtomicPtr<StrongChunkBase>,
+    /// 存活链上的前一个槽位；空表示链头。旧实现把存活链挂在槽位上，迁移期间保留。
+    prev_live_: AtomicPtr<WeakSlot<()>>,
+    /// 存活链上的后一个槽位；空表示链尾。
+    next_live_: AtomicPtr<WeakSlot<()>>,
+    /// 类型擦除的清理登记；空闲槽位为 [`None`]。
+    ///
+    /// 设计文档曾计划把它移到 `StrongChunk`；迁移完成前先留在槽位上，避免同时改动
+    /// 分配管线与树结构。
+    record_: Option<&'static PreDropRecord>,
+    /// `?Sized` 类型元数据（切片长度 / 虚表）；`Sized` 时为空指针。
+    meta_: *const (),
     /// `T` 只在类型上区分，不参与布局。
     _unused_t_: PhantomData<NonNull<StrongChunk<T>>>,
 }
@@ -176,17 +184,69 @@ impl WeakSlotState {
     /// **私有**：锁的释放只允许发生在 [`WeakChunkStateGuard`] 的 `Drop` 里，因此不提供
     /// 任何"手动解锁"入口，也不允许外部单独抢锁——否则就会出现"锁被抢到、却没人负责
     /// 释放"的状态。
-    fn acquire_<T, K>(&self, cancel: K) -> Option<WeakSlotGuard<'_, T>>
+    fn acquire_<T>(
+        &self,
+        owner: &WeakSlot<T>,
+        max_try: usize,
+    ) -> Option<WeakSlotGuard<'_, T>>
     where
         T: ?Sized,
-        K: TrCancellationToken,
     {
-        todo!()
+        // `max_try == 0` 表示不限次数（忙等）。旧实现由 `SpinFlag::acquire` 完成；
+        // 这里直接基于状态字的最高位做 CAS，语义相同：只有锁位为 0 时才能置位。
+        let mut current = self.weak_state_.value();
+        let mut tries = 0usize;
+        loop {
+            if !Self::is_locked_raw_(current) {
+                match self.weak_state_.try_once_compare_exchange_weak(
+                    current,
+                    |raw| !Self::is_locked_raw_(raw),
+                    |raw| raw | Self::LOCK_ST_MASK,
+                ) {
+                    CmpxchResult::Succ(_) => {
+                        return Option::Some(WeakSlotGuard {
+                            owner_: NonNull::from(owner),
+                            state_: NonNull::from(self),
+                            _unuse_t_: PhantomData,
+                        });
+                    }
+                    CmpxchResult::Fail(actual) | CmpxchResult::Unexpected(actual) => {
+                        current = actual;
+                    }
+                }
+            }
+            if max_try != 0 && tries >= max_try {
+                return Option::None;
+            }
+            tries = tries.saturating_add(1);
+            core::hint::spin_loop();
+        }
+    }
+
+    /// 状态字里的锁位是否已置位。
+    #[inline]
+    fn is_locked_raw_(raw: u32) -> bool {
+        raw & Self::LOCK_ST_MASK != 0
     }
 
     /// 释放状态锁。**只应由 [`WeakSlotGuard`] 的 `Drop` 调用。**
     fn release_lock_(&self) {
-        todo!()
+        let mut current = self.weak_state_.value();
+        loop {
+            if !Self::is_locked_raw_(current) {
+                return;
+            }
+            match self.weak_state_.try_once_compare_exchange_weak(
+                current,
+                Self::is_locked_raw_,
+                |raw| raw & !Self::LOCK_ST_MASK,
+            ) {
+                CmpxchResult::Succ(_) => return,
+                CmpxchResult::Fail(actual) | CmpxchResult::Unexpected(actual) => {
+                    current = actual;
+                }
+            }
+        }
     }
 
     // -- 读写 ---------------------------------------------------------------
@@ -210,18 +270,44 @@ impl WeakSlotState {
 
     #[inline]
     pub(crate) fn incr_weak_count(&self) -> usize {
-        todo!()
+        self.update_weak_count_(1)
     }
 
     #[inline]
     pub(crate) fn decr_weak_count(&self) -> usize {
-        todo!()
+        self.update_weak_count_(-1)
+    }
+
+    /// 在保持锁位与状态位不变的前提下给弱计数加上 `delta`，返回新计数。
+    ///
+    /// 用 CAS 重试而不是 `fetch_add`，是因为弱计数、状态与锁位共用一个字；只有把
+    /// "读出旧值 → 只改计数位"作为一个整体提交，才不会覆盖并发的状态迁移。
+    fn update_weak_count_(&self, delta: i32) -> usize {
+        let mut current = self.weak_state_.value();
+        loop {
+            let old_count = current & Self::WEAK_RC_MASK;
+            let new_count = if delta >= 0 {
+                old_count.wrapping_add(delta as u32)
+            } else {
+                old_count.wrapping_sub((-delta) as u32)
+            } & Self::WEAK_RC_MASK;
+            let next = (current & !Self::WEAK_RC_MASK) | new_count;
+            match self
+                .weak_state_
+                .try_once_compare_exchange_weak(current, |_| true, |_| next)
+            {
+                CmpxchResult::Succ(_) => return new_count as usize,
+                CmpxchResult::Fail(actual) | CmpxchResult::Unexpected(actual) => {
+                    current = actual;
+                }
+            }
+        }
     }
 
     /// 是否处于加锁状态。
     #[inline]
     pub(crate) fn is_locked(&self) -> bool {
-        todo!()
+        self.weak_state_.value() & Self::LOCK_ST_MASK != 0
     }
 
     // -- 状态迁移：CAS 隐藏在 `SpinFlag::try_update` 里 ----------------------
@@ -235,20 +321,48 @@ impl WeakSlotState {
     ///
     /// `desire` 返回 [`None`] 表示"不满足前提"，直接放弃；返回的目标状态与当前一致时视为
     /// 已经就位，同样返回当前状态。
-    fn transition_<FExpect, FDesire>(
-        &self,
-        expect: FExpect,
-        mut desire: FDesire,
-    ) -> CmpxchResult<DataState>
+    fn transition_<F>(&self, mut desire: F) -> Option<DataState>
     where
-        FExpect: FnMut(DataState) -> bool,
-        FDesire: FnMut(DataState) -> DataState,
+        F: FnMut(DataState) -> Option<DataState>,
     {
-        let v_expect = |s| expect(Self::state_of_(s));
-        let v_desire = |s| pack_(desire(Self::state_of_(s)), s);
-        self.weak_state_
-            .try_spin_compare_exchange_weak(v_expect, v_desire)
+        // 旧实现直接使用 `SpinFlag::try_update`（已随 `atomic_` 模块删除）。这里用
+        // `AtomicFlags` 的 CAS 原语重写：`desire` 返回 `None` 表示前提不成立，直接放弃。
+        let mut current = self.weak_state_.value();
+        loop {
+            let from = Self::state_of_(current);
+            let to = desire(from)?;
+            let next = if to == from {
+                current
+            } else {
+                Self::with_state_(current, to)
+            };
+            match self
+                .weak_state_
+                .try_once_compare_exchange_weak(current, |_| true, |_| next)
+            {
+                CmpxchResult::Succ(_) => return Option::Some(from),
+                CmpxchResult::Fail(actual) | CmpxchResult::Unexpected(actual) => {
+                    current = actual;
+                }
+            }
+        }
     }
+
+    // 旧实现（依赖已删除的 `SpinFlag::try_update`）：
+    //
+    // fn transition_<F>(&self, mut desire: F) -> Option<DataState>
+    // where
+    //     F: FnMut(DataState) -> Option<DataState>,
+    // {
+    //     self.weak_state_.try_update(|raw| {
+    //         let from = Self::state_of_(raw);
+    //         let to = desire(from)?;
+    //         if to == from {
+    //             return Option::Some((raw, from));
+    //         }
+    //         Option::Some((Self::with_state_(raw, to), from))
+    //     })
+    // }
 
     /// 仅当状态位当前为 `from` 时把它迁到 `to`，保持锁位与弱计数不变。
     ///
@@ -298,9 +412,12 @@ impl WeakSlotState {
 
     /// 把状态无条件搬到 `to`（保持锁位与两个计数不变）。
     pub(crate) fn mark_state(&self, to: DataState) {
-        let _ = self
-            .weak_state_
-            .try_update(|raw| Option::Some((Self::with_state_(raw, to), ())));
+        let _ = self.transition_(|_| Option::Some(to));
+        // 旧实现：
+        //
+        // let _ = self
+        //     .weak_state_
+        //     .try_update(|raw| Option::Some((Self::with_state_(raw, to), ())));
     }
 
     pub(crate) fn pool_order(&self) -> PoolIndex {
@@ -322,7 +439,7 @@ impl WeakSlotState {
     pub(crate) fn reset_all(&mut self) {
         // 归还时还锁着，说明有线程卡在升级/初始化路径里，这属于逻辑错误
         debug_assert!(!self.is_locked(), "归还槽位时状态锁应当已经释放");
-        self.weak_state_ = SpinFlag::new(0);
+        self.weak_state_ = AtomicFlags::new(AtomicU32::new(0));
     }
 
     /// 首次初始化一个从未使用过的槽位的状态字：无条件写入初值。
@@ -330,7 +447,7 @@ impl WeakSlotState {
     /// 与 [`WeakChunkState::reset_all`] 的区别是这里不做任何断言——此刻内存里是分配器
     /// 给的随机字节，没有"上一个使用者"可言。
     pub(crate) fn init_unallocated(&mut self) {
-        self.weak_state_ = SpinFlag::new(0);
+        self.weak_state_ = AtomicFlags::new(AtomicU32::new(0));
     }
 }
 
@@ -660,9 +777,17 @@ pub(crate) struct WeakSlotGuard<'a, T>
 where
     T: ?Sized,
 {
-    slot_ptr_: NonNull<WeakSlot<T>>,
+    /// 本守卫持有的槽位。
+    owner_: NonNull<WeakSlot<T>>,
+    /// 槽位状态字所在位置；守卫析构时据此解锁。
+    state_: NonNull<WeakSlotState>,
     _unuse_t_: PhantomData<&'a WeakSlot<T>>,
 }
+
+// 旧字段定义：
+//
+// slot_ptr_: NonNull<WeakSlot<T>>,
+// _unuse_t_: PhantomData<&'a WeakSlot<T>>,
 
 impl<'a, T> WeakSlotGuard<'a, T>
 where
@@ -675,14 +800,11 @@ where
     /// 唯一可能 panic 的步骤是抢锁本身，而它发生在"持有锁"之前。抢到锁之后再执行的只有
     /// 一次结构体字面量构造（指针运算 + `PhantomData`），既不分配也不调用用户代码，
     /// 因此不存在"锁已置位、却没人负责释放"的窗口。锁一旦置位，守卫就已经在返回路上。
-    fn try_acquire_<K>(
+    fn try_acquire_(
         owner: &'a WeakSlot<T>,
-        cancel: K,
-    ) -> Option<Self>
-    where
-        K: TrCancellationToken,
-    {
-        owner.slot_state_.acquire_::<T, K>(cancel)
+        max_try: usize,
+    ) -> Option<Self> {
+        owner.slot_state_.acquire_::<T>(owner, max_try)
     }
 
     /// 忙等抢锁并交出守卫：`max_try == 0` 表示不限重试次数，因此必然成功。
@@ -690,7 +812,7 @@ where
     /// 与 [`WeakChunkStateGuard::try_acquire_`] 共用同一条抢锁路径，只是参数不同。
     fn spin_acquire_(owner: &'a WeakSlot<T>) -> Self {
         // 不限次数的抢锁不会失败，因此这里可以解包
-        Self::try_acquire_(owner, NonCancellableToken::new())
+        Self::try_acquire_(owner, 0)
             .expect("不限次数的抢锁必定成功")
     }
 

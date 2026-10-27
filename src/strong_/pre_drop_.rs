@@ -12,6 +12,21 @@
 
 use core::{mem, ptr};
 
+#[cfg(feature = "core-alloc")]
+use alloc::collections::BTreeMap;
+
+#[cfg(feature = "core-alloc")]
+use atomic_sync::mutex::preemptive::SpinningMutexOwned;
+
+use crate::weak_::data_ptr_of_;
+
+/// 登记表使用的自旋锁。
+///
+/// 旧实现里的 `SpinMutex` 来自已删除的 `atomic_` 模块；这里改用 `atomic_sync` 提供的
+/// 具体锁类型。二者语义相同：把表包在锁里，守卫析构时释放。
+#[cfg(feature = "core-alloc")]
+type SpinMutex<T> = SpinningMutexOwned<T>;
+
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- 记录
 
@@ -173,7 +188,7 @@ impl PreDropRegistry {
     /// 建一张空表（要分配，因此不是 `const fn`）。
     pub(crate) fn new() -> Self {
         PreDropRegistry {
-            entries_: SpinMutex::new(BTreeMap::new()),
+            entries_: SpinMutex::new_owned(BTreeMap::new()),
         }
     }
 
@@ -185,7 +200,14 @@ impl PreDropRegistry {
         &self,
         access: impl FnOnce(&mut BTreeMap<typeid::ConstTypeId, &'static PreDropRecord>) -> R,
     ) -> R {
-        self.entries_.with_locked(access)
+        // 旧实现依赖 `SpinMutex::with_locked`；新锁类型没有同名辅助方法，这里显式地
+        // 取得锁会话与守卫。`wait()` 只在锁被破坏时失败，登记表没有别的失败路径。
+        let mut session = self.entries_.lock_session();
+        let mut guard = match session.lock().wait() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => unreachable!("PreDropRegistry 的自旋锁不应失败"),
+        };
+        access(&mut guard)
     }
 
     /// 为类型 `T` 注册（或覆盖）一个类型级钩子。

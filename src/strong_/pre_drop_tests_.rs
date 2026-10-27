@@ -12,8 +12,8 @@ use core::{
 
 use alloc::string::String;
 
-use super::{PreDropRecord, PreDropRegistry, WeakSlot, resolve_};
-use crate::strong_::StrongChunk;
+use super::{PreDropRecord, PreDropRegistry, resolve_};
+use crate::{strong_::StrongChunk, weak_::WeakSlot};
 
 /// 按值收下一个零尺寸钩子，只用它的类型取登记；用于在测试里推断 `Fin`。
 fn record_with_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(_hook: Fin) -> &'static PreDropRecord {

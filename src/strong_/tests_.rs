@@ -188,7 +188,7 @@ fn weak_chunk_rebuilds_unsized_data_from_metadata() {
 ///   状态保持在 `Owning`。这正是升级路径"判据唯一"的依据。
 #[test]
 fn weak_state_upgrade_primitive_is_exclusive() {
-    let mut weak = make_identity_();
+    let weak = make_identity_();
     let state = &weak.chunk_state();
     state.init_created();
 
@@ -206,7 +206,7 @@ fn weak_state_upgrade_primitive_is_exclusive() {
 ///   "`Sharing` 计数归零后由最后一个持有者认领析构"这条路径的状态侧行为。
 #[test]
 fn weak_state_sharing_path_claims_destroy_exactly_once() {
-    let mut weak = make_identity_();
+    let weak = make_identity_();
     let state = &weak.chunk_state();
     state.init_created();
 
@@ -235,7 +235,7 @@ fn strong_pool_bump_allocation_is_aligned() {
 
     static GLOBAL: Global = Global;
 
-    let pool_ptr = StrongPool::<8>::try_new_(64, &GLOBAL, Option::None).expect("建池应当成功");
+    let pool_ptr = StrongPool::try_new_(64, &GLOBAL, Option::None).expect("建池应当成功");
     {
         // SAFETY: pool_ptr 是刚初始化的独占池
         let pool = unsafe { pool_ptr.as_ref() };
@@ -271,5 +271,5 @@ fn strong_pool_bump_allocation_is_aligned() {
         assert!(pool.used_count_() <= pool.cell_count_());
     }
     // SAFETY: pool_ptr 由 GLOBAL 按 layout_for_(64) 分配，且此时借用已结束
-    unsafe { GLOBAL.deallocate(pool_ptr.cast(), StrongPool::<8>::layout_for_(64)) };
+    unsafe { GLOBAL.deallocate(pool_ptr.cast(), StrongPool::layout_for_(64)) };
 }

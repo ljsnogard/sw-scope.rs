@@ -2,14 +2,10 @@ use core::{
     alloc::{AllocError, Allocator, Layout},
     mem,
     ptr::NonNull,
-    sync::atomic::AtomicU16,
 };
 
-use atomic_sync::x_deps::atomex::AtomicFlags;
-
 use crate::{
-    page_size_::TrPageSizeSelect,
-    scope_inner_::PoolIndex,
+    scope_inner_::{PoolIndex, RootScope},
     weak_::WeakSlot,
 };
 
@@ -53,11 +49,12 @@ use crate::{
 /// 且"数据已经析构（或从未需要析构）"时，槽位才会回到空闲链。判断依据见
 /// [`crate::weak_::DataState`]。
 #[repr(C)]
-pub(crate) struct WeakPool
-{
+pub(crate) struct WeakPool {
     // 最多可以存储多少个 WeakChunk，也就是紧随池头之后的槽位数组长度
-    // 最高位用于表示 WeakPool 锁状态
-    capacity_: AtomicFlags<u16>,
+    //
+    // 旧实现用 `AtomicFlags<u16>` 的最高位兼作池锁；新设计先把池锁去掉，
+    // 等弱池的同步方案确定后再恢复。原字段见文件末尾注释。
+    capacity_: PoolIndex,
     // 已经分配出去的 WeakChunk 数量，注意 WeakPool 的分配顺序是不可知的
     alloc_count_: PoolIndex,
     // 槽位数组相对池头的偏移量（按 WeakChunk 个数计算，而非字节）
@@ -67,11 +64,23 @@ pub(crate) struct WeakPool
     latest_free_: PoolIndex,
 
     // 同一条内存链上的兄弟池，供池容量不足时串联扩展使用
-    prev_: Option<NonNull<WeakPool>,
-    next_: Option<NonNull<WeakPool>,
-    // 本池所属的域
-    scope_: Option<NonNull<ScopeInner>>,
+    prev_: Option<NonNull<WeakPool>>,
+    next_: Option<NonNull<WeakPool>>,
+    // 本池所属的 root（整棵树共享弱池，root 才是池的持有者）
+    root_: Option<NonNull<RootScope>>,
 }
+
+// 旧字段定义（池头自带原子锁、所属域叫 `scope_`）：
+//
+// pub(crate) struct WeakPool {
+//     capacity_: AtomicFlags<u16>,
+//     alloc_count_: PoolIndex,
+//     cell_offset_: PoolIndex,
+//     latest_free_: PoolIndex,
+//     prev_: Option<NonNull<WeakPool>>,
+//     next_: Option<NonNull<WeakPool>>,
+//     scope_: Option<NonNull<ScopeInner>>,
+// }
 
 impl WeakPool {
 
@@ -164,27 +173,27 @@ impl WeakPool {
     }
 
     /// 池链上的下一个池。
-    pub const fn next(&self) -> Option<NonNull<WeakPool<P>>> {
+    pub const fn next(&self) -> Option<NonNull<WeakPool>> {
         self.next_
     }
 
     /// 池链上的上一个池。
-    pub const fn prev(&self) -> Option<NonNull<WeakPool<P>>> {
+    pub const fn prev(&self) -> Option<NonNull<WeakPool>> {
         self.prev_
     }
 
-    /// 本池所属的域。
-    pub const fn root(&self) -> Option<NonNull<Root>> {
+    /// 本池所属的 root。
+    pub const fn root(&self) -> Option<NonNull<RootScope>> {
         self.root_
     }
 
-    /// 绑定本池所属的域。
-    pub fn set_root(&mut self, root: NonNull<Root>) {
+    /// 绑定本池所属的 root。
+    pub fn set_root(&mut self, root: NonNull<RootScope>) {
         self.root_ = Option::Some(root);
     }
 
     /// 把 `next` 接到本池之后，并回填其反向指针，从而把两个池串成双向链的一环。
-    pub fn link_siblings(&mut self, next: &mut WeakPool<CELL_SIZE, Root>) {
+    pub fn link_siblings(&mut self, next: &mut WeakPool) {
         let this = NonNull::from(&mut *self);
         let next_ptr = NonNull::from(&mut *next);
         self.next_ = Option::Some(next_ptr);
@@ -368,7 +377,7 @@ impl WeakPool {
             return Option::None;
         }
         let offset = addr - slot_start;
-        if offset % Self::SLOT_SIZE != 0 {
+        if !offset.is_multiple_of(Self::SLOT_SIZE) {
             return Option::None;
         }
         Option::Some((offset / Self::SLOT_SIZE) as PoolIndex)

@@ -5,7 +5,8 @@ use core::{
 };
 
 use crate::{
-    scope_inner_::PoolIndex, strong_::PreDropRecord, weak_::WeakSlot,
+    strong_::PreDropRecord,
+    weak_::WeakSlot,
 };
 
 /// Arena 中承载用户数据的一个块。
@@ -39,16 +40,19 @@ pub(crate) struct StrongChunkBase {
     /// 强引用计数（仅 `Sharing<T>` 有效）。
     refc_: AtomicU32,
 
-    /// 本 chunk 距离池首的偏移量（以 Cell 计）
-    pool_order_: PoolIndex,
+    // 以下三个字段是旧的"池内链表 + 每块自带 PreDrop 登记"设计留下的；新的身份/登记
+    // 信息保存在 `WeakSlot` 上，因此暂时注释掉，待确认强块头部布局后再决定是否恢复。
+    //
+    // /// 本 chunk 距离池首的偏移量（以 Cell 计）
+    // pool_order_: PoolIndex,
 
-    /// 上一个 StrongChunkBase 的偏移量（以 Cell 计）
-    next_chunk_: PoolIndex,
+    // /// 上一个 StrongChunkBase 的偏移量（以 Cell 计）
+    // next_chunk_: PoolIndex,
 
     /// 指回本块的身份弱槽位。
     weak_chunk_: NonNull<WeakSlot<()>>,
 
-    predrop_rec_: PreDropRecord,
+    // predrop_rec_: PreDropRecord,
 }
 
 

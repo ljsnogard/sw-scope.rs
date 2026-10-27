@@ -8,7 +8,7 @@ use crate::{
     weak_::{DataState, WeakSlot},
 };
 
-/// Like Box<T> but scoped.
+/// Like `Box<T>` but scoped.
 pub struct Owning<'a, T>
 where
     T: 'a + ?Sized,
@@ -17,7 +17,7 @@ where
     _lifetime_a_: PhantomData<&'a T>,
 }
 
-/// Like Arc<T> but scoped.
+/// Like `Arc<T>` but scoped.
 pub struct Sharing<'a, T>
 where
     T: 'a + ?Sized,
@@ -190,7 +190,7 @@ where
     T: ?Sized,
 {
 
-    /// 尝试从 Weak<T> 提升为 Retain<T>。
+    /// 尝试从 `Weak<T>` 提升为 `Retain<T>`。
     /// 当且仅当 `DataState::Allocated` 时会成功
     pub fn try_owning(&self) -> Option<Owning<'_, T>> {
         let chunk = unsafe { self.weak_chunk_.as_ref() };
@@ -198,7 +198,7 @@ where
         Option::Some(Owning::new(raw_to_strong_::<T>(strong)))
     }
 
-    /// 尝试从 Weak<T> 提升为 Shared<T>。
+    /// 尝试从 `Weak<T>` 提升为 `Shared<T>`。
     /// 当且仅当 `DataState::Allocated` 时会成功。
     pub fn try_sharing(&self) -> Option<Sharing<'_, T>> {
         let chunk = unsafe { self.weak_chunk_.as_ref() };

@@ -4,7 +4,10 @@ use core::{
     ptr::{self, NonNull},
 };
 
-use crate::scope_inner_::PoolIndex;
+use crate::scope_inner_::{DEFAULT_CELL_SIZE, PoolIndex};
+
+/// 强池的 cell 步长；旧实现由 `ScopeInner<const CELL_SIZE>` 提供。
+const CELL_SIZE: usize = DEFAULT_CELL_SIZE;
 
 /// 承载 [`crate::strong_::StrongChunk`] 的内嵌式内存池。
 ///
@@ -84,7 +87,7 @@ impl StrongPool {
     }
 
     /// 池链上的上一个池。
-    pub(crate) const fn prev_(&self) -> Option<NonNull<StrongPool<CELL_SIZE>>> {
+    pub(crate) const fn prev_(&self) -> Option<NonNull<StrongPool>> {
         self.prev_pool_
     }
 
