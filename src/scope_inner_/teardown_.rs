@@ -4,7 +4,7 @@
 
 use core::{alloc::Layout, ptr::NonNull, sync::atomic::Ordering};
 
-use crate::{strong_::StrongPool, weak_::{WeakChunk, WeakPool}};
+use crate::{strong_::StrongPool, weak_::{WeakSlot, WeakPool}};
 
 use super::{PoolIndex, RootExtension, ScopeInner};
 
@@ -174,7 +174,7 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
     /// [`WeakPool::index_of_`] 校验槽位确实落在该池的槽位数组内。
     fn weak_pool_of_(
         &self,
-        weak: NonNull<WeakChunk<()>>,
+        weak: NonNull<WeakSlot<()>>,
     ) -> Option<(
         NonNull<WeakPool<CELL_SIZE, RootExtension<CELL_SIZE>>>,
         PoolIndex,

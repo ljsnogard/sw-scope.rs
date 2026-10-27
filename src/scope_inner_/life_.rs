@@ -11,7 +11,7 @@ use core::{
 
 use super::ScopeInner;
 
-impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
+impl ScopeInner {
     /// 标志位：该域（及其子树）已被标记清盘。
     pub(crate) const FLAG_CLOSED: usize = 1 << 0;
     /// 标志位：指向本域的 `Scope` 句柄已经析构。回收要求这一位置位（见 A 方案）。

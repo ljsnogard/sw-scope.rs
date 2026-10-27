@@ -13,10 +13,10 @@ use crate::{
     index_::Retain,
     scope_inner_::{self, RootScope, RootScopeRef},
     scope_str_::ScopeStr,
-    weak_::PreDropRecord,
+    strong_::PreDropRecord,
 };
 
-pub use scope_inner_::{DEFAULT_CELL_SIZE, ScopeInner};
+pub use scope_inner_::ScopeInner;
 
 #[derive(Debug)]
 pub enum ScopeError {
@@ -35,11 +35,9 @@ pub enum ScopeError {
 /// 一个自包含结构，位于 Root 树，其生命周期由其分配的所有 Retain<T> 共同决定。
 /// 即，当其分配的所有 Retain 指针都不再存活，且其所有子 Scope 也不存活，这个
 /// `Scope` 的内存才会被回收。
-pub struct Scope<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
-    inner_ptr_: NonNull<ScopeInner<CELL_SIZE>>,
-}
+pub struct Scope(&'static ScopeInner);
 
-impl Scope<DEFAULT_CELL_SIZE> {
+impl Scope {
     /// 从默认的 RootScope 中创建一个子 scope
     #[allow(clippy::new_without_default)]
     #[cfg(feature = "core-alloc")]
@@ -57,11 +55,11 @@ impl Scope<DEFAULT_CELL_SIZE> {
     }
 }
 
-impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
+impl Scope {
     /// 获取或者创建一个 root scope。若当前进程内已存在 root scope 则通过 Err
     /// 返回已创建的 root scope
     pub fn root<A>(
-        root_ptr: &'static AtomicPtr<ScopeInner<CELL_SIZE>>,
+        root_ptr: &'static AtomicPtr<ScopeInner>,
         page_size: usize,
         allocator: A,
     ) -> Result<Self, Self>
@@ -281,14 +279,14 @@ impl<const CELL_SIZE: usize> Scope<CELL_SIZE> {
         }
     }
 
-    fn make_scope_(root_scope_ref: RootScopeRef<CELL_SIZE>) -> Self {
+    fn make_scope_(root_scope_ref: RootScopeRef) -> Self {
         Scope {
             inner_ptr_: NonNull::from(root_scope_ref),
         }
     }
 }
 
-impl<const CELL_SIZE: usize>  TrScope for &mut Scope<CELL_SIZE> {
+impl TrScope for &mut Scope {
     type Err = ScopeError;
 
     #[inline]
@@ -373,9 +371,9 @@ impl<const CELL_SIZE: usize> core::cmp::PartialEq for Scope<CELL_SIZE> {
     }
 }
 
-impl<const CELL_SIZE: usize> core::cmp::Eq for Scope<CELL_SIZE> {}
+impl core::cmp::Eq for Scope {}
 
-impl<const CELL_SIZE: usize> Drop for Scope<CELL_SIZE> {
+impl Drop for Scope {
     /// 按清盘方案 A：只把子树**标记关闭、摘链、挂进待回收名单**，再尝试回收已经静默的域。
     ///
     /// 真正的析构与内存回收发生在"句柄已析构 + 已关闭 + 静默"之后（可能很久以后），

@@ -11,13 +11,13 @@ use core::{
 use crate::{
     abs_::TrEmplace,
     index_::Retain,
-    strong_::{StrongChunk, StrongChunkBase, StrongPool},
-    weak_::{PreDropRecord, WeakChunk, WeakPool, meta_to_raw_, resolve_},
+    strong_::{PreDropRecord, StrongChunk, StrongChunkBase, StrongPool},
+    weak_::{WeakSlot, WeakPool, meta_to_raw_, resolve_},
 };
 
 use super::{DEFAULT_PAGE_SIZE, PoolIndex, RootExtension, ScopeInner};
 
-impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
+impl ScopeInner {
     /// 只统计最新的一个内存链中可分配空间大小，因为其他空间默认不会被提前释放，
     /// 因此不必统计。`Scope` 或者说所有 Arena 的使用者就是为了一次性兜底释放，
     /// 才会选用 Arena 而不是直接用智能指针。
@@ -43,7 +43,7 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
             }
         }
         // 需要新池：容量取"够放下这一块"与默认页大小的较大者
-        let need = (StrongPool::<CELL_SIZE>::THIS_SIZE + layout.size()).div_ceil(CELL_SIZE) + 1;
+        let need = (StrongPool::THIS_SIZE + layout.size()).div_ceil(CELL_SIZE) + 1;
         let cell_count = need.max(DEFAULT_PAGE_SIZE / CELL_SIZE);
         if cell_count > PoolIndex::MAX as usize {
             return Result::Err(AllocError);
@@ -63,7 +63,7 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
     /// 从树共享的弱池链上取一个槽位；尾池满了就开一个新池接到链尾。
     ///
     /// 返回 [`None`] 只会在底层分配器失败时发生。
-    pub(crate) fn allocate_weak_(&mut self) -> Option<NonNull<WeakChunk<()>>> {
+    pub(crate) fn allocate_weak_(&mut self) -> Option<NonNull<WeakSlot<()>>> {
         let root = self.root_extension_();
         let head = root.weak_pools_head_()?;
         // 沿兄弟链走到尾池
@@ -97,12 +97,12 @@ impl<const CELL_SIZE: usize> ScopeInner<CELL_SIZE> {
         let slots = pool.slots();
         // SAFETY: index < capacity_，落点必在槽位数组内
         Option::Some(unsafe {
-            NonNull::new_unchecked(slots.as_ptr().cast::<WeakChunk<()>>().add(index as usize))
+            NonNull::new_unchecked(slots.as_ptr().cast::<WeakSlot<()>>().add(index as usize))
         })
     }
 
     /// 把刚分配好的弱槽位追加到存活链尾。
-    pub(crate) fn push_live_(&mut self, weak: NonNull<WeakChunk<()>>) {
+    pub(crate) fn push_live_(&mut self, weak: NonNull<WeakSlot<()>>) {
         // SAFETY: weak 是本域刚分配的槽位
         let weak_ref = unsafe { weak.as_ref() };
         weak_ref.set_prev_live(self.live_tail_.map_or(ptr::null_mut(), NonNull::as_ptr));

@@ -4,7 +4,9 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::weak_::{PreDropRecord, WeakChunk};
+use crate::{
+    scope_inner_::PoolIndex, strong_::PreDropRecord, weak_::WeakSlot,
+};
 
 /// Arena 中承载用户数据的一个块。
 ///
@@ -36,13 +38,23 @@ where
 pub(crate) struct StrongChunkBase {
     /// 强引用计数（仅 `Sharing<T>` 有效）。
     refc_: AtomicU32,
+
+    /// 本 chunk 距离池首的偏移量（以 Cell 计）
+    pool_order_: PoolIndex,
+
+    /// 上一个 StrongChunkBase 的偏移量（以 Cell 计）
+    next_chunk_: PoolIndex,
+
     /// 指回本块的身份弱槽位。
-    weak_chunk_: NonNull<WeakChunk<()>>,
+    weak_chunk_: NonNull<WeakSlot<()>>,
+
+    predrop_rec_: PreDropRecord,
 }
+
 
 impl StrongChunkBase {
     /// 构造空白头部。`weak_chunk` 必须由分配路径立刻补上。
-    pub(crate) const fn empty_(weak_chunk: NonNull<WeakChunk<()>>) -> Self {
+    pub(crate) const fn empty_(weak_chunk: NonNull<WeakSlot<()>>) -> Self {
         StrongChunkBase {
             refc_: AtomicU32::new(0),
             weak_chunk_: weak_chunk,
@@ -51,7 +63,7 @@ impl StrongChunkBase {
 
     /// 本块的身份弱槽位。
     #[inline]
-    pub(crate) const fn weak_chunk(&self) -> NonNull<WeakChunk<()>> {
+    pub(crate) const fn weak_chunk(&self) -> NonNull<WeakSlot<()>> {
         self.weak_chunk_
     }
 
@@ -167,7 +179,7 @@ where
 
     /// 本块的身份弱槽位。
     #[inline]
-    pub(crate) fn weak_chunk(&self) -> NonNull<WeakChunk<()>> {
+    pub(crate) fn weak_chunk(&self) -> NonNull<WeakSlot<()>> {
         self.base_.weak_chunk()
     }
 
@@ -181,7 +193,7 @@ where
     /// 是本块的身份槽位。
     pub(crate) unsafe fn init_fresh_(
         &mut self,
-        weak_chunk: NonNull<WeakChunk<()>>,
+        weak_chunk: NonNull<WeakSlot<()>>,
         data: *mut T,
         record: &'static PreDropRecord,
     ) {
@@ -200,7 +212,7 @@ where
     /// `weak_chunk` 必须是本块的身份槽位；数据必须已经构造在数据区，且本块尚未登记过。
     pub(crate) unsafe fn bind_fresh_(
         &mut self,
-        weak_chunk: NonNull<WeakChunk<()>>,
+        weak_chunk: NonNull<WeakSlot<()>>,
         meta_: *const (),
         record: &'static PreDropRecord,
     ) {
@@ -209,7 +221,7 @@ where
         // SAFETY: base_ 是首字段，addr_of_mut! 取到的是合法的薄指针
         let base = unsafe { ptr::addr_of_mut!((*this).base_) };
         // SAFETY: weak_chunk 是本对象的身份槽位，且此刻独占使用
-        let weak = unsafe { &mut *(weak_chunk.as_ptr() as *mut WeakChunk<T>) };
+        let weak = unsafe { &mut *(weak_chunk.as_ptr() as *mut WeakSlot<T>) };
         weak.set_strong_chunk(base);
         // 空操作登记（既不需要 Drop 也没有钩子）直接存 None，省掉一个无意义的指针
         let record_ = if record.is_noop_() {
@@ -229,7 +241,7 @@ impl<T> StrongChunk<T> {
     /// `weak_chunk` 必须是本块的身份槽位，且本块尚未登记过任何数据。
     pub(crate) unsafe fn init_with_record_(
         &mut self,
-        weak_chunk: NonNull<WeakChunk<()>>,
+        weak_chunk: NonNull<WeakSlot<()>>,
         value: T,
         record: &'static PreDropRecord,
     ) {
@@ -250,7 +262,7 @@ impl<T> StrongChunk<T> {
     /// `weak_chunk` 必须是本块的身份槽位，且本块尚未登记过任何数据。
     pub(crate) unsafe fn init_with_(
         &mut self,
-        weak_chunk: NonNull<WeakChunk<()>>,
+        weak_chunk: NonNull<WeakSlot<()>>,
         value: T,
     ) {
         // SAFETY: 由调用方保证 weak_chunk 是身份槽位

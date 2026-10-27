@@ -17,10 +17,13 @@ use core::{
     sync::atomic::{AtomicUsize, AtomicPtr}
 };
 
-use crate::strong_::StrongPool;
-use crate::weak_::WeakChunk;
+use bplustree_cmp::BPlusTree;
+
+use crate::{page_size_::TrPageSizeSelect, scope_inner_::{config_::TrScopeInnerConfig, root_::RootScope}, strong_::StrongPool, weak_::WeakPool};
+use crate::weak_::WeakSlot;
 
 mod alloc_;
+mod config_;
 mod life_;
 mod root_;
 mod teardown_;
@@ -28,17 +31,12 @@ mod teardown_;
 #[cfg(test)]
 mod tests_;
 
-pub(crate) use root_::{RootScope, RootScopeRef};
-pub(crate) use root_::RootExtension;
-
-pub(crate) const DEFAULT_PAGE_SIZE: usize = 4 * 4096usize;
-
-pub const DEFAULT_CELL_SIZE: usize = core::mem::size_of::<usize>();
-pub type PoolIndex = u16;
 
 /// 默认 root 的发布点（指向 root 的 [`ScopeInner`]）；空指针表示尚未初始化。
-pub(crate) static DEFAULT_ROOT_SCOPE: AtomicPtr<ScopeInner<DEFAULT_CELL_SIZE>> =
-    AtomicPtr::new(ptr::null_mut());
+pub(crate) static DEFAULT_ROOT_SCOPE: AtomicPtr<RootScope> = AtomicPtr::new(ptr::null_mut());
+
+/// 不使用最高位的16位下标，即有效的下标范围是 0..2^15
+pub(crate) type U15Index = u16;
 
 /// 一个域的内部表示。
 ///
@@ -50,30 +48,18 @@ pub(crate) static DEFAULT_ROOT_SCOPE: AtomicPtr<ScopeInner<DEFAULT_CELL_SIZE>> =
 /// [`RootExtension`]（[`RootScope`] 中与分配器无关的那部分），本结构只保存分配器指针：
 /// 它既用于分配，也用于**反向定位 root**（见 [`ScopeInner::root_`]）。
 #[repr(C)]
-pub struct ScopeInner<const CELL_SIZE: usize = DEFAULT_CELL_SIZE> {
+pub struct ScopeInner<C>
+where
+    C: Sized + TrScopeInnerConfig,
+{
     /// 域标志位：`CLOSED` / `HANDLE_DROPPED`（取代原先的"子域数量"计数）
     flags_: AtomicUsize,
-    /// 父域指针
-    parent_scope_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
-    /// 同父下的兄弟双向链
-    prev_sibling_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
-    next_sibling_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
-    /// 自己派生的子域双向链
-    first_child_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
-    last_child_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
-    /// 整棵树共享的"待回收名单"（只在 root 上有意义）：域被关闭后挂到这里，静默即可回收
-    pending_head_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
-    pending_tail_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
-    /// 名单内下一个；只在域已被关闭、挂在名单上时有效
-    pending_next_: Option<NonNull<ScopeInner<CELL_SIZE>>>,
-    /// 指向 Scope 所持有的第一块内存池
-    chain_head_: Option<NonNull<StrongPool<CELL_SIZE>>>,
-    /// 指向 Scope 所持有的最新一块内存池
-    chain_tail_: Option<NonNull<StrongPool<CELL_SIZE>>>,
-    /// 存活链链头（弱槽位）
-    live_head_: Option<NonNull<WeakChunk<()>>>,
-    /// 存活链链尾（弱槽位）
-    live_tail_: Option<NonNull<WeakChunk<()>>>,
+
+    weak_pool_: Option<NonNull<WeakPool>>,
+
+    /// 指向 Scope 所持有的可用 strong pool
+    strong_head_: Option<NonNull<StrongPool>>,
+
     /// 指向 root 中内联的具体分配器；既用于分配，也用于反推 [`RootExtension`] 的基址。
-    allocator_: &'static dyn Allocator,
+    allocator_: C::PoolAlloc,
 }

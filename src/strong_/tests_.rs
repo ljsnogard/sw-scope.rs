@@ -6,12 +6,12 @@ use core::{
 };
 
 use super::*;
-use crate::weak_::{DataState, WeakChunk};
+use crate::weak_::{DataState, WeakSlot};
 
 /// 造一个仅用于测试的"身份槽位"：栈上的 `WeakChunk<()>`，并推进到 `Created`，
 /// 模拟一次成功分配之后的状态。
-fn make_identity_() -> WeakChunk<()> {
-    let slot = WeakChunk::<()>::stack_empty_();
+fn make_identity_() -> WeakSlot<()> {
+    let slot = WeakSlot::<()>::stack_empty_();
     // 真实路径上这一步由分配流程完成
     let _ = slot
         .chunk_state()
@@ -26,7 +26,7 @@ fn make_identity_() -> WeakChunk<()> {
 /// `weak` 必须指向一个存活的身份槽位，且活得比返回值更久；`slot` 同理。
 unsafe fn make_chunk_(
     slot: &mut MaybeUninit<StrongChunk<u64>>,
-    weak: *mut WeakChunk<()>,
+    weak: *mut WeakSlot<()>,
     value: u64,
 ) -> &mut StrongChunk<u64> {
     // SAFETY: 由调用方保证 slot 可写、weak 有效
@@ -47,10 +47,10 @@ fn strong_chunk_layout_is_compact_and_aligned() {
     assert_eq!(size_of::<StrongChunkBase>(), 16);
     assert_eq!(align_of::<StrongChunkBase>(), 8);
 
-    let weak_size = size_of::<WeakChunk<()>>();
-    assert_eq!(weak_size, size_of::<WeakChunk<u8>>());
-    assert_eq!(weak_size, size_of::<WeakChunk<[u8]>>());
-    assert_eq!(align_of::<WeakChunk<()>>(), 8);
+    let weak_size = size_of::<WeakSlot<()>>();
+    assert_eq!(weak_size, size_of::<WeakSlot<u8>>());
+    assert_eq!(weak_size, size_of::<WeakSlot<[u8]>>());
+    assert_eq!(align_of::<WeakSlot<()>>(), 8);
 
     // 数据区在块内的偏移按实际投影测量，必须是 8 的倍数（头部与数据同对齐）
     let probe = MaybeUninit::<StrongChunk<u64>>::uninit();
@@ -71,7 +71,7 @@ fn strong_chunk_binds_identity_both_ways() {
     // SAFETY: slot 与 weak 都在本测试的栈上存活
     let chunk = unsafe { make_chunk_(&mut slot, &mut weak, 0x0123_4567_89AB_CDEF) };
 
-    let weak_ptr: NonNull<WeakChunk<()>> = NonNull::from(&mut weak).cast();
+    let weak_ptr: NonNull<WeakSlot<()>> = NonNull::from(&mut weak).cast();
     assert_eq!(chunk.weak_chunk().as_ptr(), weak_ptr.as_ptr());
     assert_eq!(
         weak.strong_chunk().map(|p| p.as_ptr()),
@@ -132,7 +132,7 @@ fn strong_chunk_drop_is_type_erased_but_effective() {
 #[test]
 fn strong_state_upgrade_paths() {
     let mut weak = make_identity_();
-    let weak_ptr = &mut weak as *mut WeakChunk<()>;
+    let weak_ptr = &mut weak as *mut WeakSlot<()>;
     let mut slot = MaybeUninit::<StrongChunk<u64>>::uninit();
     // SAFETY: slot 与 weak 都在本测试的栈上存活
     let chunk = unsafe { make_chunk_(&mut slot, weak_ptr, 7) };
@@ -145,7 +145,7 @@ fn strong_state_upgrade_paths() {
     assert!(chunk.is_data_alive(), "独占持有期间数据依然活着");
 
     let mut weak2 = make_identity_();
-    let weak2_ptr = &mut weak2 as *mut WeakChunk<()>;
+    let weak2_ptr = &mut weak2 as *mut WeakSlot<()>;
     let mut slot2 = MaybeUninit::<StrongChunk<u64>>::uninit();
     // SAFETY: slot2 与 weak2 都在本测试的栈上存活
     let chunk2 = unsafe { make_chunk_(&mut slot2, weak2_ptr, 9) };

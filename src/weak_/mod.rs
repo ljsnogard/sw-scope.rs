@@ -1,23 +1,8 @@
-mod chunk_;
 mod pool_;
-mod pre_drop_;
-
-#[cfg(all(test, feature = "core-alloc"))]
-mod pre_drop_tests_;
+mod slot_;
 
 #[cfg(test)]
 mod tests_;
 
-pub(crate) use chunk_::meta_from_raw_;
-pub(crate) use chunk_::meta_of_;
-pub(crate) use chunk_::meta_to_raw_;
-pub(crate) use chunk_::DataState;
-pub(crate) use chunk_::WeakChunk;
 pub(crate) use pool_::WeakPool;
-pub(crate) use pre_drop_::PreDropRecord;
-
-// 类型级注册表依赖 `alloc::vec::Vec`，因此只在 `core-alloc` 下提供
-#[cfg(feature = "core-alloc")]
-pub(crate) use pre_drop_::resolve_;
-#[cfg(feature = "core-alloc")]
-pub(crate) use pre_drop_::PreDropRegistry;
+pub(crate) use slot_::{DataState, WeakSlot, meta_from_raw_, meta_of_, meta_to_raw_};

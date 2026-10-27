@@ -12,7 +12,7 @@ use core::{
 
 use alloc::string::String;
 
-use super::{PreDropRecord, PreDropRegistry, WeakChunk, resolve_};
+use super::{PreDropRecord, PreDropRegistry, WeakSlot, resolve_};
 use crate::strong_::StrongChunk;
 
 /// 按值收下一个零尺寸钩子，只用它的类型取登记；用于在测试里推断 `Fin`。
@@ -164,10 +164,10 @@ fn probe_hook(probe: &mut Probe) {
 ///
 /// 返回值借用自 `slot`，调用方必须让 `slot` 活得比使用期更久。
 unsafe fn make_probe_chunk_(slot: &mut MaybeUninit<StrongChunk<Probe>>) -> *mut u8 {
-    let mut weak_slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    let mut weak_slot = MaybeUninit::<WeakSlot<()>>::uninit();
     // SAFETY: weak_slot 可写；init_slots 会把它当作未初始化内存初始化
     let weak = unsafe { &mut *weak_slot.as_mut_ptr() };
-    WeakChunk::<()>::init_slots(core::slice::from_mut(weak), 1);
+    WeakSlot::<()>::init_slots(core::slice::from_mut(weak), 1);
 
     let chunk = slot.as_mut_ptr();
     // SAFETY: chunk 可写；weak 是本测试栈上的有效身份槽位

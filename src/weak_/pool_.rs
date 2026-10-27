@@ -2,9 +2,16 @@ use core::{
     alloc::{AllocError, Allocator, Layout},
     mem,
     ptr::NonNull,
+    sync::atomic::AtomicU16,
 };
 
-use crate::{scope_inner_::PoolIndex, weak_::WeakChunk};
+use atomic_sync::x_deps::atomex::AtomicFlags;
+
+use crate::{
+    page_size_::TrPageSizeSelect,
+    scope_inner_::PoolIndex,
+    weak_::WeakSlot,
+};
 
 /// 一个专门用于存储 `Retain<T>` 所需弱引用槽位（slot）的内存池。
 ///
@@ -45,11 +52,14 @@ use crate::{scope_inner_::PoolIndex, weak_::WeakChunk};
 /// 归还条件不是"弱引用计数归零"这么单一，而要综合槽位状态判断：只有"没有任何 `Retain`"
 /// 且"数据已经析构（或从未需要析构）"时，槽位才会回到空闲链。判断依据见
 /// [`crate::weak_::DataState`]。
-pub(crate) struct WeakPool<const CELL_SIZE: usize, Root> {
+#[repr(C)]
+pub(crate) struct WeakPool
+{
     // 最多可以存储多少个 WeakChunk，也就是紧随池头之后的槽位数组长度
-    capacity_: PoolIndex,
+    // 最高位用于表示 WeakPool 锁状态
+    capacity_: AtomicFlags<u16>,
     // 已经分配出去的 WeakChunk 数量，注意 WeakPool 的分配顺序是不可知的
-    used_length_: PoolIndex,
+    alloc_count_: PoolIndex,
     // 槽位数组相对池头的偏移量（按 WeakChunk 个数计算，而非字节）
     cell_offset_: PoolIndex,
     // 空闲槽位虚拟链表的表头；仅当 used_length_ < capacity_ 时有效，
@@ -57,13 +67,13 @@ pub(crate) struct WeakPool<const CELL_SIZE: usize, Root> {
     latest_free_: PoolIndex,
 
     // 同一条内存链上的兄弟池，供池容量不足时串联扩展使用
-    prev_: Option<NonNull<WeakPool<CELL_SIZE, Root>>>,
-    next_: Option<NonNull<WeakPool<CELL_SIZE, Root>>>,
+    prev_: Option<NonNull<WeakPool>,
+    next_: Option<NonNull<WeakPool>,
     // 本池所属的域
-    root_: Option<NonNull<Root>>,
+    scope_: Option<NonNull<ScopeInner>>,
 }
 
-impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
+impl WeakPool {
 
     /// 根据目标要容纳的 WeakChunk 数量，计算最小内存占用量
     pub fn min_size_for_max_count(count: PoolIndex) -> usize {
@@ -120,12 +130,12 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
 
     /// 池当前已经分配出去的槽位数量。
     pub const fn used_count(&self) -> PoolIndex {
-        self.used_length_
+        self.alloc_count_
     }
 
     /// 池当前的空闲槽位数量。
     pub const fn free_count(&self) -> PoolIndex {
-        self.capacity_ - self.used_length_
+        self.capacity_ - self.alloc_count_
     }
 
     /// 空闲槽位链表当前的表头；仅当池未满时有意义。
@@ -154,12 +164,12 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     }
 
     /// 池链上的下一个池。
-    pub const fn next(&self) -> Option<NonNull<WeakPool<CELL_SIZE, Root>>> {
+    pub const fn next(&self) -> Option<NonNull<WeakPool<P>>> {
         self.next_
     }
 
     /// 池链上的上一个池。
-    pub const fn prev(&self) -> Option<NonNull<WeakPool<CELL_SIZE, Root>>> {
+    pub const fn prev(&self) -> Option<NonNull<WeakPool<P>>> {
         self.prev_
     }
 
@@ -188,14 +198,14 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     /// 调用方填写。
     pub fn allocate(&mut self) -> Option<PoolIndex> {
         // used_length_ == capacity_ 意味着链表已空，此时 latest_free_ 不再有意义
-        if self.used_length_ == self.capacity_ {
+        if self.alloc_count_ == self.capacity_ {
             return Option::None;
         }
         let index = self.latest_free_;
         // SAFETY: 池未满时 index 必定落在 0..capacity_ 内，见上方关于链表的说明
         let slot = unsafe { self.slot_mut_at_(index) };
         self.latest_free_ = slot.next_freed();
-        self.used_length_ += 1;
+        self.alloc_count_ += 1;
         Option::Some(index)
     }
 
@@ -205,7 +215,7 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     /// 归还之前判断并完成。当 `index` 不是本池当前已分配的槽位时返回 `false`，池的状态
     /// 不变。
     pub fn deallocate(&mut self, index: PoolIndex) -> bool {
-        if index >= self.capacity_ || self.used_length_ == 0 {
+        if index >= self.capacity_ || self.alloc_count_ == 0 {
             return false;
         }
         let head = self.latest_free_;
@@ -213,7 +223,7 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
         let slot = unsafe { self.slot_mut_at_(index) };
         slot.link_as_freed(head);
         self.latest_free_ = index;
-        self.used_length_ -= 1;
+        self.alloc_count_ -= 1;
         true
     }
 
@@ -225,15 +235,15 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     }
 
     /// 列出全部槽位，其中可能包含尚未使用的。
-    pub fn slots(&mut self) -> NonNull<[WeakChunk<()>]> {
+    pub fn slots(&mut self) -> NonNull<[WeakSlot<()>]> {
         let this = self as *mut Self as *mut u8;
         let offset = self.cell_offset_ as usize * Self::SLOT_SIZE;
-        let chunks = unsafe { this.byte_add(offset) as *mut WeakChunk<()> };
+        let chunks = unsafe { this.byte_add(offset) as *mut WeakSlot<()> };
         let ptr = core::ptr::slice_from_raw_parts_mut(chunks, self.capacity_ as usize);
         unsafe { NonNull::new_unchecked(ptr) }
     }
     /// 一个槽位的大小，池中所有槽位一律按 `WeakChunk<()>` 解释
-    const SLOT_SIZE: usize = mem::size_of::<WeakChunk<()>>();
+    const SLOT_SIZE: usize = mem::size_of::<WeakSlot<()>>();
 
     /// 池头占据的槽位数：向上取整，保证槽位数组起点仍满足 `WeakChunk<()>` 的对齐要求。
     ///
@@ -256,10 +266,10 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     /// 按数组下标写死、终生只读（归还槽位也不会重置），因此对空闲槽位同样有效。
     ///
     /// 返回 `None` 表示该地址不可能是本类池的槽位（越界或未按池对齐）。
-    pub(crate) fn of_slot_(weak: NonNull<WeakChunk<()>>) -> Option<NonNull<Self>> {
+    pub(crate) fn of_slot_(weak: NonNull<WeakSlot<()>>) -> Option<NonNull<Self>> {
         let addr = weak.as_ptr() as usize;
         // 先按槽位对齐校验，避免对错位地址解引用去读 `pool_order_`
-        if !addr.is_multiple_of(mem::align_of::<WeakChunk<()>>()) {
+        if !addr.is_multiple_of(mem::align_of::<WeakSlot<()>>()) {
             return Option::None;
         }
         // SAFETY: addr 已按槽位对齐；调用方保证它指向一个本类池分配出的（含空闲）槽位
@@ -280,7 +290,7 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     fn layout_of_(cell_count: PoolIndex) -> Layout {
         let size = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE
             + (cell_count as usize) * Self::SLOT_SIZE;
-        let align = mem::align_of::<Self>().max(mem::align_of::<WeakChunk<()>>());
+        let align = mem::align_of::<Self>().max(mem::align_of::<WeakSlot<()>>());
         // SAFETY: size 只是池头大小加上 cell_count * 槽位大小，align 不超过两者对齐的
         // 较大值，既不会溢出也不会违反 Layout 的约束。
         unsafe { Layout::from_size_align_unchecked(size, align) }
@@ -298,16 +308,16 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
         // 否则"写入"与"读取"会落在两块不同的地址上。
         let header_bytes = Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE;
         let all_slots = core::ptr::slice_from_raw_parts_mut(
-            unsafe { (base as *mut u8).byte_add(header_bytes) } as *mut WeakChunk<()>,
+            unsafe { (base as *mut u8).byte_add(header_bytes) } as *mut WeakSlot<()>,
             cell_count as usize,
         );
         // 池头与槽位数组都在同一块刚刚分配、尚未共享出去的内存上，因此独占地写入是安全的。
         unsafe {
             let pool = &mut *base;
             let slots = &mut *all_slots;
-            WeakChunk::<()>::init_slots(slots, cell_count);
+            WeakSlot::<()>::init_slots(slots, cell_count);
             pool.capacity_ = cell_count;
-            pool.used_length_ = 0;
+            pool.alloc_count_ = 0;
             pool.cell_offset_ = Self::HEADER_SLOT_COUNT as PoolIndex;
             pool.latest_free_ = 0;
             pool.prev_ = Option::None;
@@ -323,11 +333,11 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     /// # Safety
     ///
     /// `index` 必须小于 `capacity_`，否则返回的引用会越出槽位数组。
-    unsafe fn slot_at_(&self, index: PoolIndex) -> &WeakChunk<()> {
+    unsafe fn slot_at_(&self, index: PoolIndex) -> &WeakSlot<()> {
         let this = self as *const Self as *const u8;
         let offset = self.cell_offset_ as usize * Self::SLOT_SIZE;
         let slot =
-            unsafe { this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *const WeakChunk<()> };
+            unsafe { this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *const WeakSlot<()> };
         // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
         unsafe { &*slot }
     }
@@ -337,11 +347,11 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     /// # Safety
     ///
     /// `index` 必须小于 `capacity_`，否则返回的引用会越出槽位数组。
-    unsafe fn slot_mut_at_(&mut self, index: PoolIndex) -> &mut WeakChunk<()> {
+    unsafe fn slot_mut_at_(&mut self, index: PoolIndex) -> &mut WeakSlot<()> {
         let this = self as *mut Self as *mut u8;
         let offset = self.cell_offset_ as usize * Self::SLOT_SIZE;
         let slot =
-            unsafe { this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *mut WeakChunk<()> };
+            unsafe { this.byte_add(offset + index as usize * Self::SLOT_SIZE) as *mut WeakSlot<()> };
         // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
         unsafe { &mut *slot }
     }
@@ -350,7 +360,7 @@ impl<const CELL_SIZE: usize, Root> WeakPool<CELL_SIZE, Root> {
     ///
     /// 供清盘路径"由槽位反查所属池"使用：池链上的池地址互不相同，逐池做一次地址范围判断
     /// 即可定位。
-    pub(crate) fn index_of_(&self, weak: NonNull<WeakChunk<()>>) -> Option<PoolIndex> {
+    pub(crate) fn index_of_(&self, weak: NonNull<WeakSlot<()>>) -> Option<PoolIndex> {
         let slot_start = self as *const Self as usize + self.cell_offset_ as usize * Self::SLOT_SIZE;
         let slot_end = slot_start + self.capacity_ as usize * Self::SLOT_SIZE;
         let addr = weak.as_ptr() as usize;

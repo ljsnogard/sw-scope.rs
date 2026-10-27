@@ -5,11 +5,8 @@ use core::{
 
 use crate::{
     strong_::StrongChunk,
-    weak_::{DataState, WeakChunk},
+    weak_::{DataState, WeakSlot},
 };
-
-#[cfg(test)]
-mod tests_;
 
 /// Like Box<T> but scoped.
 pub struct Owning<'a, T>
@@ -36,7 +33,7 @@ where
 {
     /// We are guaranteed that `WeakChunk<T>` always outlives everything in
     /// the `Weak<T>`;
-    weak_chunk_: NonNull<WeakChunk<T>>,
+    weak_chunk_: NonNull<WeakSlot<T>>,
 }
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -210,7 +207,7 @@ where
     }
     /// 构造一个句柄。分配管线（Batch 2）落地前，生产路径还没有调用点。
     #[allow(dead_code)]
-    pub(crate) const fn new(chunk: NonNull<WeakChunk<T>>) -> Self {
+    pub(crate) const fn new(chunk: NonNull<WeakSlot<T>>) -> Self {
         Retain { weak_chunk_: chunk }
     }
 }
@@ -237,7 +234,7 @@ where
     /// 释放一个句柄：弱计数减 1；减到 0 时尝试走"确定性析构"。
     fn drop(&mut self) {
         // SAFETY: Retain 自己保证 WeakChunk 活着；T 只影响类型，不影响槽位布局
-        let weak = unsafe { self.weak_chunk_.cast::<WeakChunk<()>>().as_ref() };
+        let weak = unsafe { self.weak_chunk_.cast::<WeakSlot<()>>().as_ref() };
         if weak.decr_weak_count() != 0 {
             return;
         }
@@ -251,7 +248,7 @@ where
 ///
 /// 这是三处引用计数收尾（`Owning::drop` / `Sharing::drop` / `Retain::drop`）共用的判断，
 /// 保证"恰好销毁一次"只由 `try_claim_destroy` 的 CAS 裁决。返回本次是否完成了析构。
-fn claim_and_destroy_if_unreachable_(weak: &WeakChunk<()>) -> bool {
+fn claim_and_destroy_if_unreachable_(weak: &WeakSlot<()>) -> bool {
     if weak.weak_count() != 0 || weak.data_state() != DataState::Created {
         return false;
     }

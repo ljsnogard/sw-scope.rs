@@ -5,8 +5,15 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 
+use abs_cancel::{NonCancellableToken, TrCancellationToken};
+use abs_sync::x_deps::abs_cancel;
+use atomex::{AtomicFlags, CmpxchResult};
+use atomic_sync::{
+    mutex::preemptive::MsbAsMutexSignal,
+    x_deps::{abs_sync, atomex},
+};
+
 use crate::{
-    atomic_::{MsbAsMutexSignal, SpinFlag},
     scope_inner_::PoolIndex,
     strong_::{StrongChunk, StrongChunkBase},
 };
@@ -15,9 +22,7 @@ use super::pre_drop_::PreDropRecord;
 
 /// 弱引用槽位。它既是 `Retain<T>` 的持有对象，也是**对象的身份与生命周期上下文**。
 ///
-/// # 为什么它是最长寿的一环
-///
-/// `Retain<T>` 是类似 GC Handle 的东西：句柄传递到哪里，生命周期便带到哪里。而
+/// `Retain<T>` 是类似 GC Handle 的指针：句柄传递到哪里，生命周期便带到哪里。而
 /// `Owning<'a, T>` / `Sharing<'a, T>` 都是从 `Retain` 上"借"出来的伴生视图，它们的 `'a`
 /// 绑定在 `&Retain` 上，**不可能比产生它们的那个 `Retain` 活得更久**。因此：
 ///
@@ -39,26 +44,14 @@ use super::pre_drop_::PreDropRecord;
 /// 弱槽位与强块分属两个池，这里是弱池里的数组元素。槽位尺寸与 `T` 无关：`T` 只出现在
 /// [`PhantomData`] 中，因此池可以统一按 `WeakChunk<()>` 的步长定位槽位。
 #[repr(C)]
-pub(crate) struct WeakChunk<T>
+pub(crate) struct WeakSlot<T>
 where
     T: ?Sized,
 {
     /// 状态、弱计数与空闲链链接。
-    chunk_state_: WeakChunkState,
-    /// 存活链的链头方向链接（指向上一个存活对象）；这是"存活链挂弱槽位"的落点。
-    prev_live_: AtomicPtr<WeakChunk<()>>,
-    /// 存活链的链尾方向链接。
-    next_live_: AtomicPtr<WeakChunk<()>>,
+    slot_state_: WeakSlotState,
     /// 本槽位对应的强块。数据的析构与访问都要经过它。
     strong_chunk_: AtomicPtr<StrongChunkBase>,
-    /// 类型擦除的清理登记，指向**每类型一份**的 [`PreDropRecord`]；空闲槽位为 [`None`]。
-    ///
-    /// 记录里不含数据区地址：它由 `strong_chunk_` 首址加上单态化入口自己算出的偏移重建。
-    record_: Option<&'static PreDropRecord>,
-    /// `T: ?Sized` 的类型元数据（切片长度 / 虚表）；`Sized` 时为空。
-    ///
-    /// 这是**逐对象**信息，所以不能进"每类型一份"的记录里，只能留在槽位上。
-    meta_: *const (),
     /// `T` 只在类型上区分，不参与布局。
     _unused_t_: PhantomData<NonNull<StrongChunk<T>>>,
 }
@@ -130,13 +123,13 @@ impl DataState {
 type LockSignal = MsbAsMutexSignal<u32>;
 
 /// 状态字：锁位由 [`LockSignal`] 给出，其余位是状态与弱计数。
-type StateWord = SpinFlag<u32, AtomicU32, LockSignal>;
+type StateWord = AtomicFlags<u32, AtomicU32>;
 
 /// 状态字的位布局：高 1 位锁、次 3 位 [`DataState`]、低 28 位**弱**引用计数。
 ///
 /// 强引用计数**不在这里**，它由 [`StrongChunkBase`] 自己管理：两者数的是完全不同的东西。
 #[repr(C)]
-pub(crate) struct WeakChunkState {
+pub(crate) struct WeakSlotState {
     /// 在所属 `WeakPool` 中的索引（0 开始），也用于从槽位反推池地址。
     ///
     /// 只取决于槽位在池内数组中的位置，池在构造时一次写死，此后终生只读。
@@ -151,11 +144,17 @@ pub(crate) struct WeakChunkState {
 
 /// 把状态与计数打包成一个字。
 const fn pack_(state: DataState, count: u32) -> u32 {
-    ((state as u32) << WeakChunkState::DATA_SHIFT) | (count & WeakChunkState::WEAK_RC_MASK)
+    ((state as u32) << WeakSlotState::DATA_SHIFT) | (count & WeakSlotState::WEAK_RC_MASK)
 }
 
-impl WeakChunkState {
+impl WeakSlotState {
+    /// 最高位用于表示锁状态
+    const LOCK_ST_MASK: u32 = 0x8000_0000;
+
+    /// 最高位后3位用于表示 DataState
     const DATA_ST_MASK: u32 = 0x7000_0000;
+
+    /// 低 28 位表示弱引用计数
     const WEAK_RC_MASK: u32 = 0x0FFF_FFFF;
     const DATA_SHIFT: u32 = 28;
 
@@ -163,10 +162,10 @@ impl WeakChunkState {
     ///
     /// 因为 [`SpinFlag::new`] 要构造原子字，所以本函数不是 `const fn`。
     pub(crate) fn empty_() -> Self {
-        WeakChunkState {
+        WeakSlotState {
             pool_order_: 0,
             next_freed_: 0,
-            weak_state_: SpinFlag::new(0),
+            weak_state_: AtomicFlags::new(AtomicU32::new(0)),
         }
     }
 
@@ -177,13 +176,17 @@ impl WeakChunkState {
     /// **私有**：锁的释放只允许发生在 [`WeakChunkStateGuard`] 的 `Drop` 里，因此不提供
     /// 任何"手动解锁"入口，也不允许外部单独抢锁——否则就会出现"锁被抢到、却没人负责
     /// 释放"的状态。
-    fn acquire_(&self, max_try: usize) -> bool {
-        self.weak_state_.try_acquire(max_try)
+    fn acquire_<T, K>(&self, cancel: K) -> Option<WeakSlotGuard<'_, T>>
+    where
+        T: ?Sized,
+        K: TrCancellationToken,
+    {
+        todo!()
     }
 
-    /// 释放状态锁。**只应由 [`WeakChunkStateGuard`] 的 `Drop` 调用。**
+    /// 释放状态锁。**只应由 [`WeakSlotGuard`] 的 `Drop` 调用。**
     fn release_lock_(&self) {
-        let _ = self.weak_state_.release();
+        todo!()
     }
 
     // -- 读写 ---------------------------------------------------------------
@@ -196,36 +199,34 @@ impl WeakChunkState {
 
     #[inline]
     pub(crate) fn data_state(&self) -> DataState {
-        Self::state_of_(self.weak_state_.read())
+        Self::state_of_(self.weak_state_.value())
     }
 
     /// 弱引用计数。
     #[inline]
     pub(crate) fn weak_count(&self) -> usize {
-        (self.weak_state_.read() & Self::WEAK_RC_MASK) as usize
+        (self.weak_state_.value() & Self::WEAK_RC_MASK) as usize
     }
 
     #[inline]
     pub(crate) fn incr_weak_count(&self) -> usize {
-        let s = self.weak_state_.fetch_add(1);
-        ((s & Self::WEAK_RC_MASK) + 1) as usize
+        todo!()
     }
 
     #[inline]
     pub(crate) fn decr_weak_count(&self) -> usize {
-        let s = self.weak_state_.fetch_sub(1);
-        ((s & Self::WEAK_RC_MASK) - 1) as usize
+        todo!()
     }
 
     /// 是否处于加锁状态。
     #[inline]
     pub(crate) fn is_locked(&self) -> bool {
-        self.weak_state_.is_locked()
+        todo!()
     }
 
     // -- 状态迁移：CAS 隐藏在 `SpinFlag::try_update` 里 ----------------------
 
-    /// 把字里的状态位换成 `to`，保持锁位与弱计数不变。
+    /// 把字里的状态位从 `from` 换成 `to`，保持锁位与弱计数不变。
     fn with_state_(raw: u32, to: DataState) -> u32 {
         (raw & !Self::DATA_ST_MASK) | ((to as u32) << Self::DATA_SHIFT)
     }
@@ -234,18 +235,19 @@ impl WeakChunkState {
     ///
     /// `desire` 返回 [`None`] 表示"不满足前提"，直接放弃；返回的目标状态与当前一致时视为
     /// 已经就位，同样返回当前状态。
-    fn transition_<F>(&self, mut desire: F) -> Option<DataState>
+    fn transition_<FExpect, FDesire>(
+        &self,
+        expect: FExpect,
+        mut desire: FDesire,
+    ) -> CmpxchResult<DataState>
     where
-        F: FnMut(DataState) -> Option<DataState>,
+        FExpect: FnMut(DataState) -> bool,
+        FDesire: FnMut(DataState) -> DataState,
     {
-        self.weak_state_.try_update(|raw| {
-            let from = Self::state_of_(raw);
-            let to = desire(from)?;
-            if to == from {
-                return Option::Some((raw, from));
-            }
-            Option::Some((Self::with_state_(raw, to), from))
-        })
+        let v_expect = |s| expect(Self::state_of_(s));
+        let v_desire = |s| pack_(desire(Self::state_of_(s)), s);
+        self.weak_state_
+            .try_spin_compare_exchange_weak(v_expect, v_desire)
     }
 
     /// 仅当状态位当前为 `from` 时把它迁到 `to`，保持锁位与弱计数不变。
@@ -335,45 +337,45 @@ impl WeakChunkState {
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-impl<T> WeakChunk<T>
+impl<T> WeakSlot<T>
 where
     T: ?Sized,
 {
     #[inline]
     pub fn data_state(&self) -> DataState {
-        self.chunk_state_.data_state()
+        self.slot_state_.data_state()
     }
 
     /// 读取槽位当前的弱引用计数。
     #[inline]
     pub fn weak_count(&self) -> usize {
-        self.chunk_state_.weak_count()
+        self.slot_state_.weak_count()
     }
 
     #[inline]
     pub fn incr_weak_count(&self) -> usize {
-        self.chunk_state_.incr_weak_count()
+        self.slot_state_.incr_weak_count()
     }
 
     #[inline]
     pub fn decr_weak_count(&self) -> usize {
-        self.chunk_state_.decr_weak_count()
+        self.slot_state_.decr_weak_count()
     }
 
     /// 直接抬高弱引用计数，仅供测试构造"还有 `Retain` 在世"的场景。
     #[cfg(test)]
     pub fn incr_use_count(&self) -> usize {
-        self.chunk_state_.incr_weak_count()
+        self.slot_state_.incr_weak_count()
     }
 
     #[inline]
     pub fn pool_order(&self) -> PoolIndex {
-        self.chunk_state_.pool_order()
+        self.slot_state_.pool_order()
     }
 
     #[inline]
     pub fn next_freed(&self) -> PoolIndex {
-        self.chunk_state_.next_freed()
+        self.slot_state_.next_freed()
     }
 
     // -- 状态锁 -------------------------------------------------------------
@@ -382,21 +384,21 @@ where
     ///
     /// 成功返回守卫；竞争者持有锁时返回 [`None`]。这是"尝试性"语义，不做阻塞等待。
     /// 锁的释放只由守卫的析构负责。
-    pub fn try_lock(&self, max_try: usize) -> Option<WeakChunkStateGuard<'_, T>> {
-        WeakChunkStateGuard::try_acquire_(self, max_try)
+    pub fn try_lock(&self, max_try: usize) -> Option<WeakSlotGuard<'_, T>> {
+        WeakSlotGuard::try_acquire_(self, max_try)
     }
 
     /// [`WeakChunk::try_lock`] 的别名，与状态层上的命名保持对应。
     #[inline]
-    pub fn try_acq_state_guard(&self, max_try: usize) -> Option<WeakChunkStateGuard<'_, T>> {
+    pub fn try_acq_state_guard(&self, max_try: usize) -> Option<WeakSlotGuard<'_, T>> {
         self.try_lock(max_try)
     }
 
     /// 忙等直到拿到状态锁。
     ///
     /// 供确信锁会很快释放的阻塞式路径使用；锁总会在守卫析构时释放，因此不会永久自旋。
-    pub fn lock_busy(&self) -> WeakChunkStateGuard<'_, T> {
-        WeakChunkStateGuard::spin_acquire_(self)
+    pub fn lock_busy(&self) -> WeakSlotGuard<'_, T> {
+        WeakSlotGuard::spin_acquire_(self)
     }
 
     // -- 强块与析构登记 -----------------------------------------------------
@@ -428,7 +430,7 @@ where
             return Result::Err(self.data_state());
         };
         match self
-            .chunk_state_
+            .slot_state_
             .try_transition_state(DataState::Created, DataState::Owning)
         {
             Option::Some(_) => Result::Ok(chunk),
@@ -450,7 +452,7 @@ where
             return Result::Err(self.data_state());
         };
         if self
-            .chunk_state_
+            .slot_state_
             .try_transition_state(DataState::Created, DataState::Sharing)
             .is_some()
         {
@@ -491,9 +493,9 @@ where
             } else {
                 (i + 1) as PoolIndex
             };
-            slot.chunk_state_.pool_order_ = i as PoolIndex;
-            slot.chunk_state_.set_next_freed(next);
-            slot.chunk_state_.init_unallocated();
+            slot.slot_state_.pool_order_ = i as PoolIndex;
+            slot.slot_state_.set_next_freed(next);
+            slot.slot_state_.init_unallocated();
             slot.set_strong_chunk(ptr::null_mut());
             slot.set_prev_live(ptr::null_mut());
             slot.set_next_live(ptr::null_mut());
@@ -504,14 +506,14 @@ where
 
     /// 槽位状态（锁、弱计数与空闲链链接）。
     #[inline]
-    pub(crate) fn chunk_state(&self) -> &WeakChunkState {
-        &self.chunk_state_
+    pub(crate) fn chunk_state(&self) -> &WeakSlotState {
+        &self.slot_state_
     }
 
     /// 槽位状态的可变引用，供弱池在分配 / 归还时改写空闲链。
     #[inline]
-    pub(crate) fn chunk_state_mut(&mut self) -> &mut WeakChunkState {
-        &mut self.chunk_state_
+    pub(crate) fn chunk_state_mut(&mut self) -> &mut WeakSlotState {
+        &mut self.slot_state_
     }
 
     /// 类型擦除的清理登记；空闲槽位为 [`None`]。
@@ -529,8 +531,8 @@ where
     /// 造一个栈上的空槽位，仅供单元测试使用。
     #[cfg(test)]
     pub(crate) fn stack_empty_() -> Self {
-        WeakChunk {
-            chunk_state_: WeakChunkState::empty_(),
+        WeakSlot {
+            slot_state_: WeakSlotState::empty_(),
             prev_live_: AtomicPtr::new(ptr::null_mut()),
             next_live_: AtomicPtr::new(ptr::null_mut()),
             strong_chunk_: AtomicPtr::new(ptr::null_mut()),
@@ -602,22 +604,22 @@ where
     // -- 存活链 -------------------------------------------------------------
 
     #[inline]
-    pub(crate) fn next_live(&self) -> *mut WeakChunk<()> {
+    pub(crate) fn next_live(&self) -> *mut WeakSlot<()> {
         self.next_live_.load(Ordering::Acquire)
     }
 
     #[inline]
-    pub(crate) fn prev_live(&self) -> *mut WeakChunk<()> {
+    pub(crate) fn prev_live(&self) -> *mut WeakSlot<()> {
         self.prev_live_.load(Ordering::Acquire)
     }
 
     #[inline]
-    pub(crate) fn set_next_live(&self, next: *mut WeakChunk<()>) {
+    pub(crate) fn set_next_live(&self, next: *mut WeakSlot<()>) {
         self.next_live_.store(next, Ordering::Relaxed);
     }
 
     #[inline]
-    pub(crate) fn set_prev_live(&self, prev: *mut WeakChunk<()>) {
+    pub(crate) fn set_prev_live(&self, prev: *mut WeakSlot<()>) {
         self.prev_live_.store(prev, Ordering::Relaxed);
     }
 
@@ -627,8 +629,8 @@ where
     ///
     /// 仅供 `WeakPool` 在归还槽位时调用。
     pub(crate) fn link_as_freed(&mut self, next: PoolIndex) {
-        self.chunk_state_.set_next_freed(next);
-        self.chunk_state_.reset_all();
+        self.slot_state_.set_next_freed(next);
+        self.slot_state_.reset_all();
         self.set_strong_chunk(ptr::null_mut());
         self.set_prev_live(ptr::null_mut());
         self.set_next_live(ptr::null_mut());
@@ -654,19 +656,15 @@ where
 ///
 /// 本守卫 `Deref` 到 [`WeakChunk`]，因此可以在临界区内改动槽位字段。`Drop` 负责释放
 /// 锁位——即使临界区里 panic，锁也一定被归还。
-pub(crate) struct WeakChunkStateGuard<'a, T>
+pub(crate) struct WeakSlotGuard<'a, T>
 where
     T: ?Sized,
 {
-    /// 指向槽位内的状态字。持有它等于持锁。
-    state_: NonNull<WeakChunkState>,
-    /// 用于在 `Drop` 时找回所属槽位。
-    owner_: NonNull<WeakChunk<T>>,
-    /// 借用标记。
-    _borrow: PhantomData<&'a WeakChunk<T>>,
+    slot_ptr_: NonNull<WeakSlot<T>>,
+    _unuse_t_: PhantomData<&'a WeakSlot<T>>,
 }
 
-impl<'a, T> WeakChunkStateGuard<'a, T>
+impl<'a, T> WeakSlotGuard<'a, T>
 where
     T: ?Sized,
 {
@@ -677,61 +675,52 @@ where
     /// 唯一可能 panic 的步骤是抢锁本身，而它发生在"持有锁"之前。抢到锁之后再执行的只有
     /// 一次结构体字面量构造（指针运算 + `PhantomData`），既不分配也不调用用户代码，
     /// 因此不存在"锁已置位、却没人负责释放"的窗口。锁一旦置位，守卫就已经在返回路上。
-    fn try_acquire_(owner: &'a WeakChunk<T>, max_try: usize) -> Option<Self> {
-        let owner_ = NonNull::from(owner);
-        // SAFETY: chunk_state_ 是 WeakChunk 的字段；只投影地址，不解引用
-        let state_ = unsafe {
-            NonNull::new_unchecked(
-                ptr::addr_of!((*owner_.as_ptr()).chunk_state_) as *mut WeakChunkState
-            )
-        };
-        // SAFETY: state_ 指向 owner 的状态字，owner 的生命周期覆盖返回值
-        if unsafe { state_.as_ref() }.acquire_(max_try) {
-            Option::Some(WeakChunkStateGuard {
-                state_,
-                owner_,
-                _borrow: PhantomData,
-            })
-        } else {
-            Option::None
-        }
+    fn try_acquire_<K>(
+        owner: &'a WeakSlot<T>,
+        cancel: K,
+    ) -> Option<Self>
+    where
+        K: TrCancellationToken,
+    {
+        owner.slot_state_.acquire_::<T, K>(cancel)
     }
 
     /// 忙等抢锁并交出守卫：`max_try == 0` 表示不限重试次数，因此必然成功。
     ///
     /// 与 [`WeakChunkStateGuard::try_acquire_`] 共用同一条抢锁路径，只是参数不同。
-    fn spin_acquire_(owner: &'a WeakChunk<T>) -> Self {
+    fn spin_acquire_(owner: &'a WeakSlot<T>) -> Self {
         // 不限次数的抢锁不会失败，因此这里可以解包
-        Self::try_acquire_(owner, 0).expect("不限次数的抢锁必定成功")
+        Self::try_acquire_(owner, NonCancellableToken::new())
+            .expect("不限次数的抢锁必定成功")
     }
 
     /// 本守卫持有的槽位。
     #[inline]
-    pub(crate) fn chunk(&self) -> &'a WeakChunk<T> {
+    pub(crate) fn chunk(&self) -> &'a WeakSlot<T> {
         // SAFETY: owner_ 来自调用方的借用，守卫的生命周期不超过它
         unsafe { self.owner_.as_ref() }
     }
 
     /// 在临界区内取可变引用。锁保证同一时刻只有一个守卫，因此独占成立。
     #[inline]
-    pub(crate) fn chunk_mut(&mut self) -> &'a mut WeakChunk<T> {
+    pub(crate) fn chunk_mut(&mut self) -> &'a mut WeakSlot<T> {
         // SAFETY: 持锁即独占；守卫的 Drop 会释放锁
         unsafe { &mut *self.owner_.as_ptr() }
     }
 }
 
-impl<'a, T> core::ops::Deref for WeakChunkStateGuard<'a, T>
+impl<'a, T> core::ops::Deref for WeakSlotGuard<'a, T>
 where
     T: ?Sized,
 {
-    type Target = WeakChunk<T>;
+    type Target = WeakSlot<T>;
 
     fn deref(&self) -> &Self::Target {
         self.chunk()
     }
 }
 
-impl<'a, T> core::ops::DerefMut for WeakChunkStateGuard<'a, T>
+impl<'a, T> core::ops::DerefMut for WeakSlotGuard<'a, T>
 where
     T: ?Sized,
 {
@@ -740,7 +729,7 @@ where
     }
 }
 
-impl<'a, T> Drop for WeakChunkStateGuard<'a, T>
+impl<'a, T> Drop for WeakSlotGuard<'a, T>
 where
     T: ?Sized,
 {
@@ -800,7 +789,7 @@ pub(crate) unsafe fn raw_to_meta_<T: ?Sized + ptr::Pointee>(raw: *const ()) -> T
 }
 
 /// 读取弱槽位登记的 `?Sized` 类型元数据（`Sized` 时为空）。
-pub(crate) fn meta_of_(weak: &WeakChunk<()>) -> *const () {
+pub(crate) fn meta_of_(weak: &WeakSlot<()>) -> *const () {
     weak.meta_
 }
 

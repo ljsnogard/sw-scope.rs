@@ -12,7 +12,7 @@ use core::{
 };
 
 use crate::scope_inner_::{PoolIndex, ScopeInner};
-use crate::weak_::{DataState, WeakChunk, WeakPool};
+use crate::weak_::{DataState, WeakSlot, WeakPool};
 
 /// 测试统一使用"以 `ScopeInner<8>` 为根"的弱池；`Root` 参数在池内部是不透明的。
 type WeakChunkPool<const CELL_SIZE: usize> = WeakPool<CELL_SIZE, ScopeInner<CELL_SIZE>>;
@@ -27,16 +27,16 @@ type WeakChunkPool<const CELL_SIZE: usize> = WeakPool<CELL_SIZE, ScopeInner<CELL
 fn weak_chunk_size_is_type_agnostic() {
     use core::mem::{align_of, size_of};
 
-    let base_size = size_of::<WeakChunk<()>>();
-    let base_align = align_of::<WeakChunk<()>>();
+    let base_size = size_of::<WeakSlot<()>>();
+    let base_align = align_of::<WeakSlot<()>>();
 
-    assert_eq!(base_size, size_of::<WeakChunk<u8>>());
-    assert_eq!(base_size, size_of::<WeakChunk<u128>>());
-    assert_eq!(base_size, size_of::<WeakChunk<[u8]>>());
+    assert_eq!(base_size, size_of::<WeakSlot<u8>>());
+    assert_eq!(base_size, size_of::<WeakSlot<u128>>());
+    assert_eq!(base_size, size_of::<WeakSlot<[u8]>>());
 
-    assert_eq!(base_align, align_of::<WeakChunk<u8>>());
-    assert_eq!(base_align, align_of::<WeakChunk<u128>>());
-    assert_eq!(base_align, align_of::<WeakChunk<[u8]>>());
+    assert_eq!(base_align, align_of::<WeakSlot<u8>>());
+    assert_eq!(base_align, align_of::<WeakSlot<u128>>());
+    assert_eq!(base_align, align_of::<WeakSlot<[u8]>>());
 
     // 64 位平台上的目标布局（Batch B 之后）：
     // 8(状态) + 8(prev_live) + 8(next_live) + 8(strong_chunk) + 8(record) + 8(meta) = 48
@@ -59,7 +59,7 @@ fn weak_chunk_pool_capacity_math() {
 
     type Pool = WeakChunkPool<8>;
 
-    let slot = size_of::<WeakChunk<()>>();
+    let slot = size_of::<WeakSlot<()>>();
     // 池头按槽位个数向上取整，槽位起点因此始终对齐
     assert_eq!(Pool::min_size_for_max_count(0), size_of::<Pool>().div_ceil(slot) * slot);
 
@@ -681,11 +681,11 @@ fn weak_chunk_pool_invariant_checker_detects_corruption() {
 ///   且锁位确实被释放。这条测试同时说明守卫是"持有即独占、析构即归还"的。
 #[test]
 fn weak_chunk_state_lock_is_exclusive_and_released_by_guard() {
-    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    let mut slot = MaybeUninit::<WeakSlot<()>>::uninit();
     // SAFETY: 先把 1 个槽位初始化干净，再取可变引用
     let chunk = unsafe {
         let ptr = slot.as_mut_ptr();
-        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        WeakSlot::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
         &mut *ptr
     };
 
@@ -706,11 +706,11 @@ fn weak_chunk_state_lock_is_exclusive_and_released_by_guard() {
 /// - 判断：能拿到守卫并读到正确的 `pool_order`；守卫析构后 `try_lock` 仍能成功。
 #[test]
 fn weak_chunk_lock_busy_acquires_and_releases() {
-    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    let mut slot = MaybeUninit::<WeakSlot<()>>::uninit();
     // SAFETY: 初始化 1 个槽位后取可变引用
     let chunk = unsafe {
         let ptr = slot.as_mut_ptr();
-        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        WeakSlot::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
         &mut *ptr
     };
 
@@ -737,17 +737,17 @@ fn weak_chunk_state_lock_is_mutually_exclusive_across_threads() {
     const ROUNDS: usize = 64;
 
     /// 把裸指针包起来以便跨线程传递；真正的同步由槽位状态锁负责。
-    struct SharedPtr(*mut WeakChunk<()>);
+    struct SharedPtr(*mut WeakSlot<()>);
     // SAFETY: 各线程只在持有状态锁时解引用该指针
     unsafe impl Send for SharedPtr {}
     // SAFETY: 同上；锁保证同一时刻只有一个线程在临界区内
     unsafe impl Sync for SharedPtr {}
 
-    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    let mut slot = MaybeUninit::<WeakSlot<()>>::uninit();
     // SAFETY: 先初始化这一个槽位，之后各线程只通过共享引用访问它
     let shared = unsafe {
         let ptr = slot.as_mut_ptr();
-        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        WeakSlot::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
         Arc::new(SharedPtr(ptr))
     };
 
@@ -798,11 +798,11 @@ fn weak_chunk_state_lock_is_mutually_exclusive_across_threads() {
 ///   （代码里根本不存在这样的入口）。若解锁只靠显式调用，这里会永久锁死。
 #[test]
 fn weak_chunk_lock_is_released_when_guard_drops_during_panic() {
-    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    let mut slot = MaybeUninit::<WeakSlot<()>>::uninit();
     // SAFETY: 初始化 1 个槽位后取可变引用
     let chunk = unsafe {
         let ptr = slot.as_mut_ptr();
-        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        WeakSlot::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
         &mut *ptr
     };
 
@@ -828,11 +828,11 @@ fn weak_chunk_lock_is_released_when_guard_drops_during_panic() {
 ///   与定义一致；整个过程中弱计数不受影响。
 #[test]
 fn weak_chunk_data_state_full_transition_path() {
-    let mut slot = MaybeUninit::<WeakChunk<()>>::uninit();
+    let mut slot = MaybeUninit::<WeakSlot<()>>::uninit();
     // SAFETY: 初始化 1 个槽位后取可变引用
     let chunk = unsafe {
         let ptr = slot.as_mut_ptr();
-        WeakChunk::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        WeakSlot::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
         &mut *ptr
     };
     let state = &chunk.chunk_state();

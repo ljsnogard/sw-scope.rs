@@ -29,16 +29,16 @@ use crate::scope_inner_::PoolIndex;
 /// `used_count_` 与 `cell_count_` 的差额就是"本池还能再放多少 cell"，上层据此决定是继续
 /// 从本池分配，还是再申请一个 `StrongPool` 串到链上。这就是 `used_count_` 必须保留的原因。
 #[repr(C)]
-pub(crate) struct StrongPool<const CELL_SIZE: usize> {
+pub(crate) struct StrongPool {
     /// 上一个内存链块地址
-    prev_pool_: Option<NonNull<StrongPool<CELL_SIZE>>>,
+    prev_pool_: Option<NonNull<StrongPool>>,
     /// 荷载可用的 cell 的数量
     cell_count_: PoolIndex,
     /// 分配已用的 cell 的数量
     used_count_: PoolIndex,
 }
 
-impl<const CELL_SIZE: usize> StrongPool<CELL_SIZE> {
+impl StrongPool {
     /// 池头自身的大小。
     pub(crate) const THIS_SIZE: usize = mem::size_of::<Self>();
 

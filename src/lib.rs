@@ -1,4 +1,4 @@
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![feature(coerce_unsized)]
 #![feature(ptr_metadata)]
 #![feature(try_trait_v2)]
@@ -7,7 +7,6 @@
 #![no_std]
 
 mod abs_;
-mod atomic_;
 
 #[cfg(any(test, feature = "std"))]
 extern crate std;
@@ -16,9 +15,11 @@ extern crate std;
 extern crate alloc;
 
 mod index_;
+mod page_size_;
 mod scope_;
 mod scope_inner_;
 mod scope_str_;
+mod tunings_;
 
 mod strong_;
 mod weak_;
