@@ -16,9 +16,6 @@ mod abs_;
 #[cfg(any(test, feature = "std"))]
 extern crate std;
 
-#[cfg(feature = "core-alloc")]
-extern crate alloc;
-
 mod index_;
 mod page_size_;
 mod scope_;
@@ -38,3 +35,10 @@ pub use scope_::{Scope, ScopeError};
 // 新设计里 root 是 B+ 树的持有者，`Scope::root` 需要在公开签名中引用它。
 pub use scope_inner_::RootScope;
 pub use scope_str_::ScopeStr;
+
+pub mod x_deps {
+    pub use atomic_sync;
+    pub use bplustree_cmp;
+
+    pub use atomic_sync::x_deps::{abs_cancel, abs_sync, funty};
+}

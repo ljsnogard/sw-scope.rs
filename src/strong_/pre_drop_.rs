@@ -3,7 +3,7 @@
 //! 设计背景、决策日志与实验目标见 `dev-notes/weak-20260922-1135.md`。要点：
 //!
 //! - 每个具体 `T`（以及带对象级钩子的每个 `(T, Fin)`）只生成**一份**登记，通过"关联常量 +
-//!   取引用"提升进静态内存；弱槽位只保存一个 `&'static PreDropRecord`；
+//!   取引用"提升进静态内存；强块头部只保存一个 `&'static PreDropRecord`；
 //! - 记录自身只含一个类型擦除入口，**不含**数据地址与 `?Sized` 元数据：前者由入口按 `T`
 //!   单态化重建，后者仍逐对象保存在弱槽位里；
 //! - 类型级钩子由整棵树共享的 [`PreDropRegistry`] 按**类型 ID** 查找（物理位置见 D2d），
@@ -12,10 +12,6 @@
 
 use core::{mem, ptr};
 
-#[cfg(feature = "core-alloc")]
-use alloc::collections::BTreeMap;
-
-#[cfg(feature = "core-alloc")]
 use atomic_sync::mutex::preemptive::SpinningMutexOwned;
 
 use crate::weak_::data_ptr_of_;
@@ -24,7 +20,6 @@ use crate::weak_::data_ptr_of_;
 ///
 /// 旧实现里的 `SpinMutex` 来自已删除的 `atomic_` 模块；这里改用 `atomic_sync` 提供的
 /// 具体锁类型。二者语义相同：把表包在锁里，守卫析构时释放。
-#[cfg(feature = "core-alloc")]
 type SpinMutex<T> = SpinningMutexOwned<T>;
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -154,94 +149,88 @@ unsafe fn pre_drop_entry_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(
     unsafe { ptr::drop_in_place(data) };
 }
 
-// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-// -- 类型级注册表
-
-/// 类型级 `PreDrop` 钩子的注册表，挂在 root 树上、随整棵树回收。
-///
-/// 存在的理由：不能为了 `PreDrop` 逼使用者给每个类型实现一个 trait；只对自己关心的类型
-/// 在这里登记一次即可，其余类型走"无钩子"的默认记录。
-///
-/// # 键的选择
-///
-/// 键是**类型 ID**（[`core::any::TypeId`]，由 [`typeid::of`] 取得）。不再用
-/// [`core::any::type_name`]，也不用"每类型一份常量的地址"：
-///
-/// - `type_name` 的文档明确声明"不保证唯一"，跨 crate / 版本重名时会让不同类型的钩子串味；
-/// - 每类型常量的地址会被编译器合并（内容相同的记录地址相同），同样不能当身份；
-/// - [`typeid::of`] 对**非 `'static`、`?Sized`** 的 `T` 同样可用，这正是 `Retain<T>`
-///   允许携带借用所需要的（标准库的 `TypeId::of` 要求 `T: 'static`，不满足）。
-///
-/// 表用 [`BTreeMap`]：条目按类型 ID 有序，查找 / 插入是 `O(log n)`，且不需要为"哈希"再多
-/// 引入一套随机状态。
-#[cfg(feature = "core-alloc")]
-pub(crate) struct PreDropRegistry {
-    /// 自旋锁直接锁住登记表：跨 Scope 树共享，注册与查找都必须串行化。
-    ///
-    /// "锁住的内容"由 [`SpinMutex`] 的泛型参数给出，因此这里不需要再手写
-    /// `UnsafeCell` 与 `unsafe impl Sync/Send`。
-    entries_: SpinMutex<BTreeMap<typeid::ConstTypeId, &'static PreDropRecord>>,
-}
-
-#[cfg(feature = "core-alloc")]
-impl PreDropRegistry {
-    /// 建一张空表（要分配，因此不是 `const fn`）。
-    pub(crate) fn new() -> Self {
-        PreDropRegistry {
-            entries_: SpinMutex::new_owned(BTreeMap::new()),
-        }
-    }
-
-    /// 在持锁状态下访问内部表。
-    ///
-    /// 把"抢锁 + 取可变引用"合成一次调用，调用方拿不到能脱离临界区的 `&mut`；解锁由
-    /// [`SpinMutex`] 的守卫在析构时完成，因此临界区内 panic 也不会把锁落下。
-    fn with_entries_<R>(
-        &self,
-        access: impl FnOnce(&mut BTreeMap<typeid::ConstTypeId, &'static PreDropRecord>) -> R,
-    ) -> R {
-        // 旧实现依赖 `SpinMutex::with_locked`；新锁类型没有同名辅助方法，这里显式地
-        // 取得锁会话与守卫。`wait()` 只在锁被破坏时失败，登记表没有别的失败路径。
-        let mut session = self.entries_.lock_session();
-        let mut guard = match session.lock().wait() {
-            Result::Ok(guard) => guard,
-            Result::Err(_) => unreachable!("PreDropRegistry 的自旋锁不应失败"),
-        };
-        access(&mut guard)
-    }
-
-    /// 为类型 `T` 注册（或覆盖）一个类型级钩子。
-    ///
-    /// `hook` 本身只是用来推断 `Fin` 的类型，零尺寸、按值收下即丢弃。
-    pub(crate) fn register_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(&self, _hook: Fin) {
-        let key = typeid::ConstTypeId::of::<T>();
-        let record = PreDropRecord::of_with::<T, Fin>();
-        self.with_entries_(|entries| {
-            entries.insert(key, record);
-        });
-    }
-
-    /// 查找类型 `T` 的类型级登记。
-    pub(crate) fn lookup_<T: ?Sized>(&self) -> Option<&'static PreDropRecord> {
-        let key = typeid::ConstTypeId::of::<T>();
-        self.with_entries_(|entries| entries.get(&key).copied())
-    }
-}
-
-/// 依"对象级 > 类型级 > 默认"选出类型 `T` 的有效登记。
-///
-/// 对象级与类型级都没有时退回 [`PreDropRecord::of::<T>`]；对 `!needs_drop` 的类型，那份记录
-/// 的入口是空的，等价于"什么都不做"。
-#[cfg(feature = "core-alloc")]
-pub(crate) fn resolve_<T: ?Sized>(
-    registry: Option<&PreDropRegistry>,
-    object_level: Option<&'static PreDropRecord>,
-) -> &'static PreDropRecord {
-    if let Option::Some(record) = object_level {
-        return record;
-    }
-    if let Option::Some(record) = registry.and_then(|registry| registry.lookup_::<T>()) {
-        return record;
-    }
-    PreDropRecord::of::<T>()
-}
+// /// 类型级 `PreDrop` 钩子的注册表，挂在 root 树上、随整棵树回收。
+// ///
+// /// 存在的理由：不能为了 `PreDrop` 逼使用者给每个类型实现一个 trait；只对自己关心的类型
+// /// 在这里登记一次即可，其余类型走"无钩子"的默认记录。
+// ///
+// /// # 键的选择
+// ///
+// /// 键是**类型 ID**（[`core::any::TypeId`]，由 [`typeid::of`] 取得）。不再用
+// /// [`core::any::type_name`]，也不用"每类型一份常量的地址"：
+// ///
+// /// - `type_name` 的文档明确声明"不保证唯一"，跨 crate / 版本重名时会让不同类型的钩子串味；
+// /// - 每类型常量的地址会被编译器合并（内容相同的记录地址相同），同样不能当身份；
+// /// - [`typeid::of`] 对**非 `'static`、`?Sized`** 的 `T` 同样可用，这正是 `Retain<T>`
+// ///   允许携带借用所需要的（标准库的 `TypeId::of` 要求 `T: 'static`，不满足）。
+// ///
+// /// 表用 [`BTreeMap`]：条目按类型 ID 有序，查找 / 插入是 `O(log n)`，且不需要为"哈希"再多
+// /// 引入一套随机状态。
+// pub(crate) struct PreDropRegistry {
+//     /// 自旋锁直接锁住登记表：跨 Scope 树共享，注册与查找都必须串行化。
+//     ///
+//     /// "锁住的内容"由 [`SpinMutex`] 的泛型参数给出，因此这里不需要再手写
+//     /// `UnsafeCell` 与 `unsafe impl Sync/Send`。
+//     entries_: SpinMutex<BTreeMap<typeid::ConstTypeId, &'static PreDropRecord>>,
+// }
+//
+// impl PreDropRegistry {
+//     /// 建一张空表（要分配，因此不是 `const fn`）。
+//     pub(crate) fn new() -> Self {
+//         PreDropRegistry {
+//             entries_: SpinMutex::new_owned(BTreeMap::new()),
+//         }
+//     }
+//
+//     /// 在持锁状态下访问内部表。
+//     ///
+//     /// 把"抢锁 + 取可变引用"合成一次调用，调用方拿不到能脱离临界区的 `&mut`；解锁由
+//     /// [`SpinMutex`] 的守卫在析构时完成，因此临界区内 panic 也不会把锁落下。
+//     fn with_entries_<R>(
+//         &self,
+//         access: impl FnOnce(&mut BTreeMap<typeid::ConstTypeId, &'static PreDropRecord>) -> R,
+//     ) -> R {
+//         // 旧实现依赖 `SpinMutex::with_locked`；新锁类型没有同名辅助方法，这里显式地
+//         // 取得锁会话与守卫。`wait()` 只在锁被破坏时失败，登记表没有别的失败路径。
+//         let mut session = self.entries_.lock_session();
+//         let mut guard = match session.lock().wait() {
+//             Result::Ok(guard) => guard,
+//             Result::Err(_) => unreachable!("PreDropRegistry 的自旋锁不应失败"),
+//         };
+//         access(&mut guard)
+//     }
+//
+//     /// 为类型 `T` 注册（或覆盖）一个类型级钩子。
+//     ///
+//     /// `hook` 本身只是用来推断 `Fin` 的类型，零尺寸、按值收下即丢弃。
+//     pub(crate) fn register_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(&self, _hook: Fin) {
+//         let key = typeid::ConstTypeId::of::<T>();
+//         let record = PreDropRecord::of_with::<T, Fin>();
+//         self.with_entries_(|entries| {
+//             entries.insert(key, record);
+//         });
+//     }
+//
+//     /// 查找类型 `T` 的类型级登记。
+//     pub(crate) fn lookup_<T: ?Sized>(&self) -> Option<&'static PreDropRecord> {
+//         let key = typeid::ConstTypeId::of::<T>();
+//         self.with_entries_(|entries| entries.get(&key).copied())
+//     }
+// }
+//
+// /// 依"对象级 > 类型级 > 默认"选出类型 `T` 的有效登记。
+// ///
+// /// 对象级与类型级都没有时退回 [`PreDropRecord::of::<T>`]；对 `!needs_drop` 的类型，那份记录
+// /// 的入口是空的，等价于"什么都不做"。
+// pub(crate) fn resolve_<T: ?Sized>(
+//     registry: Option<&PreDropRegistry>,
+//     object_level: Option<&'static PreDropRecord>,
+// ) -> &'static PreDropRecord {
+//     if let Option::Some(record) = object_level {
+//         return record;
+//     }
+//     if let Option::Some(record) = registry.and_then(|registry| registry.lookup_::<T>()) {
+//         return record;
+//     }
+//     PreDropRecord::of::<T>()
+// }

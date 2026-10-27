@@ -96,10 +96,13 @@ pub struct ScopeInner {
     /// 指向 Scope 所持有的最新一块强池。
     chain_tail_: Option<NonNull<StrongPool>>,
 
-    /// 存活链链头（弱槽位）。
+    /// 旧设计的存活链链头（弱槽位）。
+    ///
+    /// 新设计不再逐槽位维护存活链，而是由 `WeakSlotState::for_each_live_slot_` 从池链
+    /// 与槽位状态反推；这两个字段待 `ScopeInner` 迁移时移除。
     live_head_: Option<NonNull<WeakSlot<()>>>,
 
-    /// 存活链链尾（弱槽位）。
+    /// 旧设计的存活链链尾（弱槽位）；含义同 [`ScopeInner::live_head_`]。
     live_tail_: Option<NonNull<WeakSlot<()>>>,
 
     /// 指向 root 的具体分配器（已擦除）；既用于分配，也用于回到 root 的 B+ 树。

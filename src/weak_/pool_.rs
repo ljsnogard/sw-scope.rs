@@ -5,7 +5,7 @@ use core::{
 };
 
 use crate::{
-    scope_inner_::{PoolIndex, RootScope},
+    scope_inner_::{PoolIndex, ScopeInner},
     weak_::WeakSlot,
 };
 
@@ -17,15 +17,14 @@ use crate::{
 /// 紧随其后，并记录在 `cell_offset_` 中。因此由任意槽位地址减去 `cell_offset_` 与池头
 /// 大小，即可反推出所属池的地址；`WeakChunkState::pool_order_` 正是为此保留的槽位序号。
 /// `cell_offset_` 记录的是槽位数组相对池头的**槽位个数**（向上取整），因此槽位数组的
-/// 起点始终按 `WeakChunk<()>` 对齐；它不假设池头大小恰好是槽位大小的整数倍。
+/// 起点始终按 [`WeakSlot<()>`] 对齐；它不假设池头大小恰好是槽位大小的整数倍。
 ///
-/// 虽然带有 `CELL_SIZE` 参数，但槽位的实际存储与它无关：池中槽位一律按
-/// [`WeakChunk<()>`] 解释，`WeakChunk<T>` 之于任意 `T` 只在类型上区分，尺寸恒等于
-/// `WeakChunk<()>`，正是靠这一点池才能在不为每种 `T` 单独布局的前提下复用槽位。
-/// 又由于索引一律是 [`PoolIndex`]（u16），池的槽位数天然被限制在 `PoolIndex::MAX`
-/// 以内。
+/// 池中槽位一律按 [`WeakSlot<()>`] 解释，`WeakSlot<T>` 之于任意 `T` 只在类型上区分，
+/// 尺寸恒等于 `WeakSlot<()>`，正是靠这一点池才能在不为每种 `T` 单独布局的前提下复用
+/// 槽位。又由于索引一律是 [`PoolIndex`]（u16），池的槽位数天然被限制在
+/// `PoolIndex::MAX` 以内。
 ///
-/// `Root` 是本池所属域的类型，池只负责把它存下来再原样交还，不关心它是什么。
+/// 本池所属的 root 由 [`RootScope`] 保存；池只负责把它存下来再原样交还。
 ///
 /// # 空闲槽位链表
 ///
@@ -40,8 +39,18 @@ use crate::{
 ///   按数组下标写死，此处不再触碰。
 /// - 池尚未耗尽便有槽位归还：归还者成为新的链表头，其 `next_freed_` 被写成先前的
 ///   `latest_free_`，于是所有空闲槽位始终可从 `latest_free_` 一条链走到底。
-/// - 当 `used_length_ == capacity_` 时链表已空，此时 `latest_free_` 的取值不再有意义，
+/// - 当 `alloc_count_ == capacity_` 时链表已空，此时 `latest_free_` 的取值不再有意义，
 ///   也无须维护。
+///
+/// # 存活链为什么不需要逐槽位指针
+///
+/// 分配总是从空闲链头摘取：**从未使用的槽位按全局下标递增分配**，而归还的槽位会被
+/// 优先复用。于是"按全局下标顺序扫描、跳过空闲槽位"就得到一条相对有序的构造顺序；
+/// 被复用的槽位会回到它原来的下标位置，所以是"相对"而非严格时间顺序。
+///
+/// 反推从链尾池的最后一个空闲槽位开始，走到池尾后回绕到链头，最终回到起点。这样
+/// 不需要在每个槽位里维护 `prev_live_` / `next_live_`，只需要读槽位状态即可。完整
+/// 算法见 [`WeakPool::for_each_live_from_`]。
 ///
 /// # 槽位何时归还
 ///
@@ -67,7 +76,7 @@ pub(crate) struct WeakPool {
     prev_: Option<NonNull<WeakPool>>,
     next_: Option<NonNull<WeakPool>>,
     // 本池所属的 root（整棵树共享弱池，root 才是池的持有者）
-    root_: Option<NonNull<RootScope>>,
+    scope_: Option<NonNull<ScopeInner>>,
 }
 
 // 旧字段定义（池头自带原子锁、所属域叫 `scope_`）：
@@ -182,14 +191,14 @@ impl WeakPool {
         self.prev_
     }
 
-    /// 本池所属的 root。
-    pub const fn root(&self) -> Option<NonNull<RootScope>> {
-        self.root_
+    /// 本池所属的 ScopeInner。
+    pub const fn root(&self) -> Option<NonNull<ScopeInner>> {
+        self.scope_
     }
 
     /// 绑定本池所属的 root。
-    pub fn set_root(&mut self, root: NonNull<RootScope>) {
-        self.root_ = Option::Some(root);
+    pub fn set_scope(&mut self, scope: NonNull<ScopeInner>) {
+        self.scope_ = Option::Some(scope);
     }
 
     /// 把 `next` 接到本池之后，并回填其反向指针，从而把两个池串成双向链的一环。
@@ -331,7 +340,7 @@ impl WeakPool {
             pool.latest_free_ = 0;
             pool.prev_ = Option::None;
             pool.next_ = Option::None;
-            pool.root_ = Option::None;
+            pool.scope_ = Option::None;
         }
         // SAFETY: base 来自分配器返回的非空内存块，必然非空
         unsafe { NonNull::new_unchecked(base) }
@@ -382,4 +391,127 @@ impl WeakPool {
         }
         Option::Some((offset / Self::SLOT_SIZE) as PoolIndex)
     }
+    /// 找到本池中**下标最大**的空闲槽位。
+    ///
+    /// 空闲的判定是状态字为 [`DataState::Reclaimed`](crate::weak_::DataState::Reclaimed)：
+    /// 从未分配过的槽位与归还回来的槽位都满足它。
+    pub(crate) fn last_free_index_(&self) -> Option<PoolIndex> {
+        let mut index = self.capacity_;
+        while index > 0 {
+            index -= 1;
+            // SAFETY: index 从 capacity_-1 递减到 0，始终落在槽位数组内
+            let slot = unsafe { self.slot_at_(index) };
+            if slot.is_free_() {
+                return Option::Some(index);
+            }
+        }
+        Option::None
+    }
+
+    /// 从任意池出发，按"全局槽位顺序"遍历整条池链上的所有存活槽位。
+    ///
+    /// 全局槽位顺序是：从链头池到链尾池，每个池内部从下标 0 到 `capacity_-1`。
+    /// 遍历起点是**链尾池的最后一个空闲槽位**；从这个位置向前走，走到链尾池末尾后
+    /// 回绕到链头池，直到走回起点为止。
+    ///
+    /// # 为什么不需要槽位里的存活链指针
+    ///
+    /// 弱池的分配是严格的"逐个 Slot"推进：
+    ///
+    /// - 新池的空闲链是 `0 -> 1 -> ... -> capacity-1 -> capacity`，分配从链头摘取，
+    ///   所以**从未使用过的槽位按全局下标递增的顺序被分配**；
+    /// - 某个槽位被归还时会被放到空闲链头，下一次分配**优先**复用它，而不是先推进到
+    ///   更大的下标。
+    ///
+    /// 因此，除"被复用的归还槽位"之外，一个槽位的全局下标顺序就是它的构造顺序；空闲
+    /// 槽位则是这条顺序上的空洞。只要把所有槽位按全局下标顺序扫一遍、跳过空闲槽位，
+    /// 就得到一条**相对有序的构造顺序**的存活链。被复用的槽位会回到它原来的下标位置，
+    /// 因此这里得到的是"相对"而不是严格的分配时间顺序——这正是不需要逐槽位存活链
+    /// 指针所换来的代价。
+    ///
+    /// 起点选在链尾池的最后一个空闲槽位，是为了让遍历从"最新一段已经分配过的范围"
+    /// 开始，前方紧接的空闲尾巴与链头回绕部分都能被同一条循环覆盖；如果链尾池已满，
+    /// 则从它的下标 0 开始。整个过程只读槽位状态，不需要任何逐槽位的 `prev`/`next`。
+    ///
+    /// # 复杂度
+    ///
+    /// 时间与所有池的槽位总数成正比，额外空间为 O(1)（只维护池游标与下标）。
+    pub(crate) fn for_each_live_from_(
+        any_pool: NonNull<WeakPool>,
+        visit: &mut impl FnMut(NonNull<WeakSlot<()>>),
+    ) {
+        // 先找到链尾：存活链的起点只看链尾池。
+        let mut tail = any_pool;
+        loop {
+            // SAFETY: 调用方保证 any_pool 指向有效池；链上的池都由同一分配器持有
+            let next = unsafe { tail.as_ref() }.next();
+            match next {
+                Option::Some(next) => tail = next,
+                Option::None => break,
+            }
+        }
+
+        // 再找到链头，供回绕使用。
+        let mut head = tail;
+        loop {
+            // SAFETY: 同上
+            let prev = unsafe { head.as_ref() }.prev();
+            match prev {
+                Option::Some(prev) => head = prev,
+                Option::None => break,
+            }
+        }
+
+        // 起点：链尾池的最后一个空闲槽位；池满则从 0 开始。
+        // SAFETY: tail 有效
+        let start = unsafe { tail.as_ref() }
+            .last_free_index_()
+            .map_or(0, |index| index as usize);
+        // SAFETY: tail 有效；start < capacity_
+        let tail_capacity = unsafe { tail.as_ref() }.capacity_ as usize;
+
+        // 1) 链尾池：start..capacity
+        unsafe { tail.as_ref() }.visit_live_range_(start, tail_capacity, visit);
+
+        // 2) 链头到链尾之前的池：整个池
+        let mut cursor = head;
+        while cursor != tail {
+            // SAFETY: cursor 是链上的有效池
+            let pool = unsafe { cursor.as_ref() };
+            pool.visit_live_range_(0, pool.capacity_ as usize, visit);
+            match pool.next() {
+                Option::Some(next) => cursor = next,
+                // 链应当在到达 tail 前一直有 next；防御性回绕，避免死循环
+                Option::None => break,
+            }
+        }
+
+        // 3) 链尾池：0..start，补完回绕部分
+        if start > 0 {
+            // SAFETY: tail 有效
+            unsafe { tail.as_ref() }.visit_live_range_(0, start, visit);
+        }
+    }
+
+    /// 访问本池 `[start, end)` 内所有存活槽位。
+    ///
+    /// 空闲槽位（状态为 [`DataState::Reclaimed`](crate::weak_::DataState::Reclaimed)）
+    /// 是构造顺序上的空洞，直接跳过。
+    fn visit_live_range_(
+        &self,
+        start: usize,
+        end: usize,
+        visit: &mut impl FnMut(NonNull<WeakSlot<()>>),
+    ) {
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.capacity_ as usize);
+        for index in start..end {
+            // SAFETY: index 落在 [0, capacity_) 内
+            let slot = unsafe { self.slot_at_(index as PoolIndex) };
+            if !slot.is_free_() {
+                visit(NonNull::from(slot).cast());
+            }
+        }
+    }
+
 }

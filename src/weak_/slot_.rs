@@ -5,17 +5,18 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 
+use abs_cancel::{NonCancellableToken, TrCancellationToken};
+use atomex::{AtomicFlags, CmpxchResult};
 use atomic_sync::{
     mutex::preemptive::MsbAsMutexSignal,
-    x_deps::atomex::{AtomicFlags, CmpxchResult},
+    x_deps::{abs_cancel, atomex},
 };
 
 use crate::{
     scope_inner_::PoolIndex,
     strong_::{StrongChunk, StrongChunkBase},
+    weak_::WeakPool,
 };
-
-use crate::strong_::PreDropRecord;
 
 /// 弱引用槽位。它既是 `Retain<T>` 的持有对象，也是**对象的身份与生命周期上下文**。
 ///
@@ -23,48 +24,50 @@ use crate::strong_::PreDropRecord;
 /// `Owning<'a, T>` / `Sharing<'a, T>` 都是从 `Retain` 上"借"出来的伴生视图，它们的 `'a`
 /// 绑定在 `&Retain` 上，**不可能比产生它们的那个 `Retain` 活得更久**。因此：
 ///
-/// > 数据还活着 ⇒ 至少有一个 `Retain` 活着 ⇒ 这个 `WeakChunk` 还活着。
+/// > 数据还活着 ⇒ 至少有一个 `Retain` 活着 ⇒ 这个 `WeakSlot` 还活着。
 ///
-/// 这条不等式是后续所有设计的地基：
-/// - 存活链的链接、清理登记都可以安全地放在弱槽位里——强块的数据区活着的整个期间，
-///   弱槽位都不可能被回收复用；
-/// - `?Sized` 的析构也因此可行：重建胖指针所需的元数据有地方长期保存。
+/// 这条不等式是后续所有设计的地基：弱槽位在强块数据活着的整个期间都不会被回收复用，
+/// 因此它可以安全地承担对象身份、状态与空闲链，而不需要强块反过来保存逐对象的身份。
+///
+/// # 新设计中的职责划分
+///
+/// - 弱槽位只保存状态字（[`WeakSlotState`]）与指向强块的指针；
+/// - `PreDrop` 登记与 `?Sized` 元数据保存在强块头部（`StrongChunkBase`）；
+/// - **存活链不再逐槽位保存 `prev` / `next`**：它由池链、槽位下标与「空闲/已分配」
+///   状态在现场反推，见 [`WeakSlotState::for_each_live_slot_`]。
 ///
 /// # 何时可以被回收
 ///
-/// **不是** `weak_count` 归零就算数。槽位的回收要综合 [`WeakChunkState::weak_state_`]
+/// **不是** `weak_count` 归零就算数。槽位的回收要综合 [`WeakSlotState::weak_state_`]
 /// 里的状态与两个计数判断：当"没有任何 `Retain`"且"数据已经析构（或从未需要析构）"时，
 /// 槽位才归还给 [`crate::weak_::WeakPool`]。
 ///
 /// # 布局
 ///
 /// 弱槽位与强块分属两个池，这里是弱池里的数组元素。槽位尺寸与 `T` 无关：`T` 只出现在
-/// [`PhantomData`] 中，因此池可以统一按 `WeakChunk<()>` 的步长定位槽位。
+/// [`PhantomData`] 中，因此池可以统一按 `WeakSlot<()>` 的步长定位槽位。
 #[repr(C)]
 pub(crate) struct WeakSlot<T>
 where
     T: ?Sized,
 {
     /// 状态、弱计数与空闲链链接。
-    slot_state_: WeakSlotState,
-    /// 本槽位对应的强块。数据的析构与访问都要经过它。
-    strong_chunk_: AtomicPtr<StrongChunkBase>,
-    /// 存活链上的前一个槽位；空表示链头。旧实现把存活链挂在槽位上，迁移期间保留。
-    prev_live_: AtomicPtr<WeakSlot<()>>,
-    /// 存活链上的后一个槽位；空表示链尾。
-    next_live_: AtomicPtr<WeakSlot<()>>,
-    /// 类型擦除的清理登记；空闲槽位为 [`None`]。
     ///
-    /// 设计文档曾计划把它移到 `StrongChunk`；迁移完成前先留在槽位上，避免同时改动
-    /// 分配管线与树结构。
-    record_: Option<&'static PreDropRecord>,
-    /// `?Sized` 类型元数据（切片长度 / 虚表）；`Sized` 时为空指针。
-    meta_: *const (),
+    /// **必须是第一个字段**：`WeakSlotState::acquire_` 只收到 `&self`，要靠这个布局
+    /// 不变量把状态地址直接当作 `WeakSlot` 地址使用。见本文件末尾的编译期断言。
+    slot_state_: WeakSlotState,
+    /// 本槽位对应的强块。数据的析构、类型擦除信息与 `PreDrop` 都在强块头部，
+    /// 弱槽位只负责指出它。
+    strong_chunk_: AtomicPtr<StrongChunkBase>,
     /// `T` 只在类型上区分，不参与布局。
     _unused_t_: PhantomData<NonNull<StrongChunk<T>>>,
 }
 
-/// `WeakChunk` 的生命周期状态。**这是"数据要不要析构"的唯一权威来源**，
+// `WeakSlotState` 是 `WeakSlot` 的首字段：`#[repr(C)]` 保证其偏移为 0。
+// 这条不变量是 `WeakSlotState::acquire_` 只凭自身地址反推 `WeakSlot` 的前提。
+const _: () = assert!(core::mem::offset_of!(WeakSlot<()>, slot_state_) == 0);
+
+/// `WeakSlot` 的生命周期状态。**这是"数据要不要析构"的唯一权威来源**，
 /// `StrongChunk` 侧不再有对应的状态枚举。
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -89,8 +92,8 @@ pub(crate) enum DataState {
 
     /// 已退出存活链、弱引用计数归零，可随所属池一并回收。
     ///
-    /// 这是"已纳入 GC 队列"的终态：存活链本身就是待清理队列的实体，状态位只负责
-    /// 记录"这块钱销毁到哪一步"。
+    /// 这是"已纳入 GC 队列"的终态：存活链由池链与槽位状态反推，状态位负责记录
+    /// "这块数据销毁到哪一步"。
     Finalized = 0x06,
 }
 
@@ -146,7 +149,7 @@ pub(crate) struct WeakSlotState {
     /// 协助 `WeakPool` 串联空闲槽位。
     next_freed_: PoolIndex,
 
-    /// 状态字；锁位、状态位与弱计数的读写全部经由 [`SpinFlag`] 的操作。
+    /// 状态字；锁位、状态位与弱计数的读写全部经由 [`AtomicFlags`] 的操作。
     weak_state_: StateWord,
 }
 
@@ -168,7 +171,7 @@ impl WeakSlotState {
 
     /// 槽位尚未被分配给任何对象时的初值。
     ///
-    /// 因为 [`SpinFlag::new`] 要构造原子字，所以本函数不是 `const fn`。
+    /// 因为 [`AtomicFlags::new`] 要构造原子字，所以本函数不是 `const fn`。
     pub(crate) fn empty_() -> Self {
         WeakSlotState {
             pool_order_: 0,
@@ -177,26 +180,41 @@ impl WeakSlotState {
         }
     }
 
-    // -- 锁：语义操作由 `SpinFlag` 提供，CAS 不出现在本类型里 -----------------
+    // -- 锁：以状态字最高位为锁信号 -------------------------------------------
 
-    /// 抢占状态锁：以最高位为锁信号，`max_try == 0` 表示忙等。
+    /// 抢占状态锁：以最高位为锁信号。
     ///
-    /// **私有**：锁的释放只允许发生在 [`WeakChunkStateGuard`] 的 `Drop` 里，因此不提供
+    /// `cancel` 是**自旋过程中放弃抢锁**的信号：本方法至少尝试一次 CAS；若没抢到，
+    /// 每轮自旋前检查令牌，已取消就返回 [`None`]。因此：
+    ///
+    /// - 传 [`NonCancellableToken`] 表示一直忙等；
+    /// - 传 [`CancelledToken`](abs_sync::x_deps::abs_cancel::CancelledToken) 表示
+    ///   "只试一次"的非阻塞语义（第一次没抢到就放弃）。
+    ///
+    /// **私有**：锁的释放只允许发生在 [`WeakSlotGuard`] 的 `Drop` 里，因此不提供
     /// 任何"手动解锁"入口，也不允许外部单独抢锁——否则就会出现"锁被抢到、却没人负责
     /// 释放"的状态。
-    fn acquire_<T>(
-        &self,
-        owner: &WeakSlot<T>,
-        max_try: usize,
-    ) -> Option<WeakSlotGuard<'_, T>>
+    ///
+    /// 调用方不需要再传 `&WeakSlot`：`WeakSlotState` 是 `WeakSlot` 的首字段，状态地址
+    /// 就是槽位地址。
+    fn acquire_<T, K>(&self, cancel: K) -> Option<WeakSlotGuard<'_, T>>
     where
         T: ?Sized,
+        K: TrCancellationToken,
     {
-        // `max_try == 0` 表示不限次数（忙等）。旧实现由 `SpinFlag::acquire` 完成；
-        // 这里直接基于状态字的最高位做 CAS，语义相同：只有锁位为 0 时才能置位。
-        let mut current = self.weak_state_.value();
-        let mut tries = 0usize;
+        // `WeakSlotState` 是 `WeakSlot` 的第一个字段（`#[repr(C)]` + 编译期断言），
+        // 因此状态自身的地址就是槽位的地址，不需要调用方再传 `&WeakSlot`。
+        //
+        // SAFETY: 上面的布局不变量保证该转换不会移动地址；`T` 只影响
+        // `WeakSlot<T>` 中 `PhantomData` 的类型，不影响布局。
+        let owner = unsafe { NonNull::new_unchecked(self as *const Self as *mut WeakSlot<T>) };
+
+        // 这里直接基于状态字的最高位做 CAS：只有锁位为 0 时才能置位。
+        //
+        // 每一轮都重新读取状态字：竞争者持锁时 CAS 根本不会执行，若继续使用旧的
+        // `current` 就会永远看不到对方释放锁，形成忙等死锁。
         loop {
+            let current = self.weak_state_.value();
             if !Self::is_locked_raw_(current) {
                 match self.weak_state_.try_once_compare_exchange_weak(
                     current,
@@ -205,20 +223,19 @@ impl WeakSlotState {
                 ) {
                     CmpxchResult::Succ(_) => {
                         return Option::Some(WeakSlotGuard {
-                            owner_: NonNull::from(owner),
+                            owner_: owner,
                             state_: NonNull::from(self),
                             _unuse_t_: PhantomData,
                         });
                     }
-                    CmpxchResult::Fail(actual) | CmpxchResult::Unexpected(actual) => {
-                        current = actual;
-                    }
+                    // 竞争失败：下一轮重新读状态字即可。
+                    CmpxchResult::Fail(_) | CmpxchResult::Unexpected(_) => {}
                 }
             }
-            if max_try != 0 && tries >= max_try {
+            // 至少尝试过一次之后，才把取消信号作为放弃抢锁的依据。
+            if cancel.is_cancelled() {
                 return Option::None;
             }
-            tries = tries.saturating_add(1);
             core::hint::spin_loop();
         }
     }
@@ -310,7 +327,38 @@ impl WeakSlotState {
         self.weak_state_.value() & Self::LOCK_ST_MASK != 0
     }
 
-    // -- 状态迁移：CAS 隐藏在 `SpinFlag::try_update` 里 ----------------------
+    /// 仅凭本状态反推整条存活链，并按"相对构造顺序"逐个访问存活槽位。
+    ///
+    /// # 为什么只凭 `WeakSlotState` 就够了
+    ///
+    /// 1. `WeakSlotState` 是 `WeakSlot` 的首字段，所以状态地址就是槽位地址；
+    /// 2. 槽位里的 `pool_order_` 是它在弱池中的下标，且池头大小固定，因此由槽位地址
+    ///    减去 `HEADER_BYTES + pool_order * SLOT_SIZE` 就得到所属 [`WeakPool`]；
+    /// 3. 每个池都带 `prev_` / `next_` 兄弟链，从任意池都能走到链尾；
+    /// 4. 链尾池的槽位状态足以区分"已分配"与"空闲"，于是可以从链尾池的最后一个空闲
+    ///    槽位开始，按全局下标顺序回绕遍历所有池，跳过空闲槽位。
+    ///
+    /// 这套推导成立的关键是弱池的分配顺序：新槽位按全局下标递增分配，归还的槽位会被
+    /// 优先复用。因此"全局下标顺序去掉空闲空洞"就是一条相对有序的构造顺序；被复用的
+    /// 槽位会回到原下标位置，所以是"相对"顺序，而不是精确的分配时间顺序。
+    ///
+    /// 详细算法见 [`WeakPool::for_each_live_from_`]。
+    ///
+    /// # 归属范围
+    ///
+    /// 遍历范围是"本状态所在池的整条兄弟链"。若一条池链只属于一个 `Scope`，结果就是
+    /// 该 `Scope` 的全部存活槽位；若多个 `Scope` 共享同一条池链，上层还需要按归属
+    /// 进一步过滤。
+    pub(crate) fn for_each_live_slot_(&self, mut visit: impl FnMut(NonNull<WeakSlot<()>>)) {
+        // SAFETY: `WeakSlotState` 是 `WeakSlot` 的首字段（见本文件的编译期断言）
+        let slot = unsafe { NonNull::new_unchecked(self as *const Self as *mut WeakSlot<()>) };
+        // 槽位一定落在某个弱池里；找不到池说明调用方给了非池内槽位，直接不遍历。
+        if let Option::Some(pool) = WeakPool::of_slot_(slot) {
+            WeakPool::for_each_live_from_(pool, &mut visit);
+        }
+    }
+
+    // -- 状态迁移：CAS 隐藏在 `transition_` 里 -------------------------------
 
     /// 把字里的状态位从 `from` 换成 `to`，保持锁位与弱计数不变。
     fn with_state_(raw: u32, to: DataState) -> u32 {
@@ -435,7 +483,7 @@ impl WeakSlotState {
     /// 归还槽位时把状态字重置为"未分配"初值。
     ///
     /// 仅供 `WeakPool` 在归还槽位时调用；分配器给的是未初始化内存，**首次**初始化槽位
-    /// 必须走 [`WeakChunkState::init_unallocated`]，否则会对随机内容做断言。
+    /// 必须走 [`WeakSlotState::init_unallocated`]，否则会对随机内容做断言。
     pub(crate) fn reset_all(&mut self) {
         // 归还时还锁着，说明有线程卡在升级/初始化路径里，这属于逻辑错误
         debug_assert!(!self.is_locked(), "归还槽位时状态锁应当已经释放");
@@ -444,7 +492,7 @@ impl WeakSlotState {
 
     /// 首次初始化一个从未使用过的槽位的状态字：无条件写入初值。
     ///
-    /// 与 [`WeakChunkState::reset_all`] 的区别是这里不做任何断言——此刻内存里是分配器
+    /// 与 [`WeakSlotState::reset_all`] 的区别是这里不做任何断言——此刻内存里是分配器
     /// 给的随机字节，没有"上一个使用者"可言。
     pub(crate) fn init_unallocated(&mut self) {
         self.weak_state_ = AtomicFlags::new(AtomicU32::new(0));
@@ -461,6 +509,15 @@ where
     #[inline]
     pub fn data_state(&self) -> DataState {
         self.slot_state_.data_state()
+    }
+
+    /// 槽位当前是否空闲。
+    ///
+    /// "空闲"等价于状态为 [`DataState::Reclaimed`]：从未分配过的槽位与归还回池的
+    /// 槽位都是这个状态。存活链推导据此把空闲槽位当作顺序上的空洞跳过。
+    #[inline]
+    pub(crate) fn is_free_(&self) -> bool {
+        self.data_state() == DataState::Reclaimed
     }
 
     /// 读取槽位当前的弱引用计数。
@@ -497,18 +554,26 @@ where
 
     // -- 状态锁 -------------------------------------------------------------
 
-    /// 尝试获取本槽位的状态锁，最多自旋 `max_try` 次。
+    /// 尝试获取本槽位的状态锁；`cancel` 是自旋过程中放弃抢锁的信号。
     ///
-    /// 成功返回守卫；竞争者持有锁时返回 [`None`]。这是"尝试性"语义，不做阻塞等待。
+    /// 至少尝试一次 CAS：成功立即返回守卫；没抢到且令牌已取消时返回 [`None`]。
+    /// 因此传 [`NonCancellableToken`] 是忙等，传
+    /// [`CancelledToken`](abs_sync::x_deps::abs_cancel::CancelledToken) 是"只试一次"。
     /// 锁的释放只由守卫的析构负责。
-    pub fn try_lock(&self, max_try: usize) -> Option<WeakSlotGuard<'_, T>> {
-        WeakSlotGuard::try_acquire_(self, max_try)
+    pub fn try_lock<K>(&self, cancel: K) -> Option<WeakSlotGuard<'_, T>>
+    where
+        K: TrCancellationToken,
+    {
+        WeakSlotGuard::try_acquire_(self, cancel)
     }
 
-    /// [`WeakChunk::try_lock`] 的别名，与状态层上的命名保持对应。
+    /// [`WeakSlot::try_lock`] 的别名，与状态层上的命名保持对应。
     #[inline]
-    pub fn try_acq_state_guard(&self, max_try: usize) -> Option<WeakSlotGuard<'_, T>> {
-        self.try_lock(max_try)
+    pub fn try_acq_state_guard<K>(&self, cancel: K) -> Option<WeakSlotGuard<'_, T>>
+    where
+        K: TrCancellationToken,
+    {
+        self.try_lock(cancel)
     }
 
     /// 忙等直到拿到状态锁。
@@ -590,7 +655,11 @@ where
     /// - 按数组下标写死 `pool_order_`，此后终生只读；
     /// - 把空闲链接串成顺序链：`i` 指向 `i + 1`，末位指向 `capacity`，于是分配路径
     ///   无须区分「从未分配过的槽位」与「归还回来的槽位」；
-    /// - 把状态、计数、存活链链接与清理登记一律拉到干净初值（分配器给的是未初始化内存）。
+    /// - 把状态、计数与强块指针一律拉到干净初值（分配器给的是未初始化内存）。
+    ///
+    /// 存活链不再保存在槽位上：它由池链与空闲链在需要时反推，见
+    /// [`WeakSlotState::for_each_live_slot_`]。`PreDrop` 与 `?Sized` 元数据也已移到
+    /// `StrongChunkBase`，槽位只保留状态与强块指针。
     ///
     /// # Panics
     ///
@@ -614,10 +683,6 @@ where
             slot.slot_state_.set_next_freed(next);
             slot.slot_state_.init_unallocated();
             slot.set_strong_chunk(ptr::null_mut());
-            slot.set_prev_live(ptr::null_mut());
-            slot.set_next_live(ptr::null_mut());
-            slot.record_ = Option::None;
-            slot.meta_ = ptr::null();
         }
     }
 
@@ -633,126 +698,27 @@ where
         &mut self.slot_state_
     }
 
-    /// 类型擦除的清理登记；空闲槽位为 [`None`]。
-    #[inline]
-    pub(crate) fn record(&self) -> Option<&'static PreDropRecord> {
-        self.record_
-    }
-
-    /// `?Sized` 类型元数据（切片长度 / 虚表）；`Sized` 时为空指针。
-    #[inline]
-    pub(crate) fn meta(&self) -> *const () {
-        self.meta_
-    }
-
     /// 造一个栈上的空槽位，仅供单元测试使用。
     #[cfg(test)]
     pub(crate) fn stack_empty_() -> Self {
         WeakSlot {
             slot_state_: WeakSlotState::empty_(),
-            prev_live_: AtomicPtr::new(ptr::null_mut()),
-            next_live_: AtomicPtr::new(ptr::null_mut()),
             strong_chunk_: AtomicPtr::new(ptr::null_mut()),
-            record_: Option::None,
-            meta_: ptr::null(),
             _unused_t_: PhantomData,
         }
     }
 
-    /// 登记类型擦除的清理信息：调用方已经算好了有效登记与 `?Sized` 元数据。
-    ///
-    /// 类型相关的调用方（例如 `StrongChunk`）走这个入口：在那里有具体的 `T`，可以算出
-    /// 每类型一份的 [`PreDropRecord`] 与元数据。
-    pub(crate) fn set_record_erased_(
-        &mut self,
-        record_: Option<&'static PreDropRecord>,
-        meta_: *const (),
-    ) {
-        self.record_ = record_;
-        self.meta_ = meta_;
-    }
-
-    /// 按登记执行清理：先跑 `PreDrop` 钩子，再析构数据。
-    ///
-    /// # Safety
-    ///
-    /// 必须先由状态机认领销毁，且恰好调用一次。
-    pub(crate) unsafe fn drop_data(&self) {
-        let Option::Some(record) = self.record_ else {
-            return;
-        };
-        let base = self.strong_chunk_.load(Ordering::Acquire);
-        debug_assert!(!base.is_null(), "清理时强块指针必须已经绑定");
-        // SAFETY: 由调用方保证已认领且尚未析构；登记与元数据来自同一块数据
-        unsafe { record.run_(base.cast::<u8>(), self.meta_) };
-    }
-
-    // -- 数据访问（按 U 重建，支持 ?Sized）---------------------------------
-
-    /// 按 `U` 重建数据引用。调用方必须保证数据仍然活着。
-    ///
-    /// 数据区地址不再单独保存：由强块首址 + 单态化入口自己算出的偏移重建；`?Sized` 的元数据
-    /// 则来自槽位自己的 `meta_`。
-    ///
-    /// # Safety
-    ///
-    /// 数据必须尚未析构，且 `U` 必须与当初分配的 `T` 是同一个类型。
-    pub(crate) unsafe fn data_ref_as<U: ?Sized + ptr::Pointee>(&self) -> &U {
-        let base = self.strong_chunk_.load(Ordering::Acquire);
-        // SAFETY: 由调用方保证数据尚未析构；元数据来自同一次分配的登记
-        let data = unsafe { data_ptr_of_::<U>(base.cast::<u8>(), self.meta_) };
-        // SAFETY: 由调用方保证数据尚未析构
-        unsafe { &*data }
-    }
-
-    /// 按 `U` 重建数据可变引用。
-    ///
-    /// # Safety
-    ///
-    /// 同 [`WeakChunk::data_ref_as`]，且调用方必须保证独占访问。
-    pub(crate) unsafe fn data_ref_mut_as<U: ?Sized + ptr::Pointee>(&mut self) -> &mut U {
-        let base = self.strong_chunk_.load(Ordering::Acquire);
-        // SAFETY: 由调用方保证数据尚未析构且独占
-        let data = unsafe { data_ptr_of_::<U>(base.cast::<u8>(), self.meta_) };
-        // SAFETY: 由调用方保证数据尚未析构且独占
-        unsafe { &mut *data }
-    }
-
-    // -- 存活链 -------------------------------------------------------------
-
-    #[inline]
-    pub(crate) fn next_live(&self) -> *mut WeakSlot<()> {
-        self.next_live_.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub(crate) fn prev_live(&self) -> *mut WeakSlot<()> {
-        self.prev_live_.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub(crate) fn set_next_live(&self, next: *mut WeakSlot<()>) {
-        self.next_live_.store(next, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub(crate) fn set_prev_live(&self, prev: *mut WeakSlot<()>) {
-        self.prev_live_.store(prev, Ordering::Relaxed);
-    }
-
     // -- 池的维护 -----------------------------------------------------------
 
-    /// 把槽位串成空闲链的一环，并清掉上一轮使用留下的状态与清理登记。
+    /// 把槽位串成空闲链的一环，并清掉上一轮使用留下的状态与强块指针。
+    ///
+    /// `PreDrop` 登记与 `?Sized` 元数据属于强块，归还槽位时不需要在这里清。
     ///
     /// 仅供 `WeakPool` 在归还槽位时调用。
     pub(crate) fn link_as_freed(&mut self, next: PoolIndex) {
         self.slot_state_.set_next_freed(next);
         self.slot_state_.reset_all();
         self.set_strong_chunk(ptr::null_mut());
-        self.set_prev_live(ptr::null_mut());
-        self.set_next_live(ptr::null_mut());
-        self.record_ = Option::None;
-        self.meta_ = ptr::null();
     }
 }
 
@@ -764,14 +730,14 @@ where
 /// # 它与状态 CAS 的分工
 ///
 /// `weak_state_` 里的状态迁移 CAS 只保证**"状态迁移唯一"**；而升级/初始化路径要保护的
-/// 是一组彼此相关的写：弱引用计数、`strong_chunk_`、清理登记 `record_`、以及强块的强计数。
+/// 是一组彼此相关的写：弱引用计数、`strong_chunk_`、以及强块的强计数。
 /// 这些字段不在同一个字里，CAS 管不住它们的组合，于是需要本守卫把"读判据 + 一组写"
 /// 合成一个临界区：
 ///
-/// - `try_owning` / `try_sharing`：锁住之后才检查状态、绑定强块、写登记、抬计数；
+/// - `try_owning` / `try_sharing`：锁住之后才检查状态、绑定强块、抬计数；
 /// - 分配路径：锁住之后才把"已就位的数据"正式置为 `Created`，避免外界看到半成品。
 ///
-/// 本守卫 `Deref` 到 [`WeakChunk`]，因此可以在临界区内改动槽位字段。`Drop` 负责释放
+/// 本守卫 `Deref` 到 [`WeakSlot`]，因此可以在临界区内改动槽位字段。`Drop` 负责释放
 /// 锁位——即使临界区里 panic，锁也一定被归还。
 pub(crate) struct WeakSlotGuard<'a, T>
 where
@@ -800,20 +766,23 @@ where
     /// 唯一可能 panic 的步骤是抢锁本身，而它发生在"持有锁"之前。抢到锁之后再执行的只有
     /// 一次结构体字面量构造（指针运算 + `PhantomData`），既不分配也不调用用户代码，
     /// 因此不存在"锁已置位、却没人负责释放"的窗口。锁一旦置位，守卫就已经在返回路上。
-    fn try_acquire_(
+    fn try_acquire_<K>(
         owner: &'a WeakSlot<T>,
-        max_try: usize,
-    ) -> Option<Self> {
-        owner.slot_state_.acquire_::<T>(owner, max_try)
+        cancel: K,
+    ) -> Option<Self>
+    where
+        K: TrCancellationToken,
+    {
+        owner.slot_state_.acquire_::<T, K>(cancel)
     }
 
-    /// 忙等抢锁并交出守卫：`max_try == 0` 表示不限重试次数，因此必然成功。
+    /// 使用不可取消的令牌忙等抢锁，因此必然成功。
     ///
-    /// 与 [`WeakChunkStateGuard::try_acquire_`] 共用同一条抢锁路径，只是参数不同。
+    /// 与 [`WeakSlotGuard::try_acquire_`] 共用同一条抢锁路径，只是令牌不同。
     fn spin_acquire_(owner: &'a WeakSlot<T>) -> Self {
-        // 不限次数的抢锁不会失败，因此这里可以解包
-        Self::try_acquire_(owner, 0)
-            .expect("不限次数的抢锁必定成功")
+        // `NonCancellableToken` 永远不会取消，因此这里可以解包
+        Self::try_acquire_(owner, NonCancellableToken::new())
+            .expect("不可取消的抢锁必定成功")
     }
 
     /// 本守卫持有的槽位。
@@ -910,11 +879,6 @@ pub(crate) unsafe fn raw_to_meta_<T: ?Sized + ptr::Pointee>(raw: *const ()) -> T
     }
 }
 
-/// 读取弱槽位登记的 `?Sized` 类型元数据（`Sized` 时为空）。
-pub(crate) fn meta_of_(weak: &WeakSlot<()>) -> *const () {
-    weak.meta_
-}
-
 /// [`meta_of_`] 的逆操作：把裸元数据还原成 `T` 的元数据。
 ///
 /// # Safety
@@ -928,7 +892,8 @@ pub(crate) unsafe fn meta_from_raw_<T: ?Sized + ptr::Pointee>(raw: *const ()) ->
 /// 由"强块首址 + `?Sized` 元数据"还原数据区指针。
 ///
 /// `StrongChunk<T>` 的 `base_` 在偏移 0，因此强块首址与 `StrongChunk<T>` 首址相同；数据区
-/// 偏移交给编译器在这个单态化里算，所以清理登记里不必保存数据地址。
+/// 偏移交给编译器在这个单态化里算，所以强块头部只需保存 `?Sized` 元数据，不必保存
+/// 数据地址本身。
 ///
 /// # Safety
 ///

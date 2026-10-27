@@ -37,14 +37,16 @@ unsafe fn make_chunk_(
     }
 }
 
-/// 验证控制块布局：强块头部尽量小，弱槽位承载全部管理信息且尺寸与 `T` 无关。
-/// - 手段：断言 `StrongChunkBase` 的大小与对齐、`WeakChunk<T>` 在 `T = ()`、`u8`、
+/// 验证控制块布局：强块头部承载强计数、身份、清理登记与元数据，弱槽位只承载状态与
+/// 强块指针，且弱槽位尺寸与 `T` 无关。
+/// - 手段：断言 `StrongChunkBase` 的大小与对齐、`WeakSlot<T>` 在 `T = ()`、`u8`、
 ///   `[u8]` 下的尺寸一致，以及数据区偏移是 8 的倍数。
-/// - 判断：任一尺寸或对齐不符即失败。弱槽位尺寸与 `T` 无关是弱池按 `WeakChunk<()>`
-///   步长定位槽位的前提；强块头部小则是 arena 空间效率的直接体现。
+/// - 判断：任一尺寸或对齐不符即失败。弱槽位尺寸与 `T` 无关是弱池按 `WeakSlot<()>`
+///   步长定位槽位的前提。
 #[test]
 fn strong_chunk_layout_is_compact_and_aligned() {
-    assert_eq!(size_of::<StrongChunkBase>(), 16);
+    // 强块头部现在承载：强计数、身份指针、清理登记、`?Sized` 元数据。
+    assert_eq!(size_of::<StrongChunkBase>(), 32);
     assert_eq!(align_of::<StrongChunkBase>(), 8);
 
     let weak_size = size_of::<WeakSlot<()>>();
@@ -56,14 +58,14 @@ fn strong_chunk_layout_is_compact_and_aligned() {
     let probe = MaybeUninit::<StrongChunk<u64>>::uninit();
     let offset = probe.as_ptr() as usize;
     assert_eq!(offset % 8, 0);
-    assert_eq!(size_of::<StrongChunk<u64>>(), 16 + size_of::<u64>());
+    assert_eq!(size_of::<StrongChunk<u64>>(), 32 + size_of::<u64>());
 }
 
 /// 验证"强块只认身份、身份指向强块"的双向绑定，以及数据访问与析构登记。
 /// - 手段：造一块 `StrongChunk<u64>` 绑定栈上的身份槽位，随后双向检查。
 /// - 判断：弱槽位记录的强块指针必须等于强块自身地址（头部在偏移 0，因此两者同址）；
-///   强块记录的弱槽位必须等于身份地址；数据引用读出写入值；需要析构的类型必须已登记
-///   析构入口。这保证清盘流程只凭身份就能找回并析构数据。
+///   强块记录的弱槽位必须等于身份地址；数据引用读出写入值；`u64` 的清理登记必须为空。
+///   这保证清盘流程只凭身份就能找回强块，再由强块头部完成类型擦除析构。
 #[test]
 fn strong_chunk_binds_identity_both_ways() {
     let mut weak = make_identity_();
@@ -82,7 +84,7 @@ fn strong_chunk_binds_identity_both_ways() {
     assert!(chunk.is_data_alive(), "绑定后数据应当活着");
     assert_eq!(chunk.strong_count(), 0, "新建的强块强计数从 0 开始");
     assert!(
-        weak.record().is_none(),
+        chunk.predrop_rec_().is_none(),
         "u64 不需要析构，因此不该登记清理入口"
     );
 }
@@ -113,14 +115,18 @@ fn strong_chunk_drop_is_type_erased_but_effective() {
         this.init_with_(NonNull::from(&mut weak).cast(), Probe);
     }
 
-    // 登记的清理入口必须能就地析构数据，这正是清盘流程依赖的路径
+    // 登记的清理入口现在保存在强块头部，仍必须能就地析构数据。
     assert!(
-        weak.record().is_some_and(|record| !record.is_noop_()),
+        unsafe { &*slot.as_ptr() }
+            .predrop_rec_()
+            .is_some_and(|record| !record.is_noop_()),
         "带 Drop 的数据必须登记清理入口"
     );
     assert_eq!(DROPPED.load(Ordering::Acquire), 0);
-    // SAFETY: 数据刚构造好、尚未析构
-    unsafe { weak.drop_data() };
+    // SAFETY: 数据刚构造好、尚未析构；从身份槽位找到强块并执行登记
+    let base = weak.strong_chunk().expect("身份槽位必须绑定强块");
+    // SAFETY: 同上
+    unsafe { base.as_ref().drop_data_() };
     assert_eq!(DROPPED.load(Ordering::Acquire), 1, "类型擦除析构必须真的执行");
 }
 
@@ -156,9 +162,9 @@ fn strong_state_upgrade_paths() {
     assert!(weak2.try_owning().is_err(), "已共享的块不能再独占");
 }
 
-/// 验证 `?Sized` 数据的类型元数据确实被保存在弱槽位上，并且能从槽位完整复原。
+/// 验证 `?Sized` 数据的类型元数据可以经 `StrongChunkBase` 使用的裸元数据原语完整复原。
 /// - 手段：取一个 `&dyn Debug` 胖指针，经 `meta_to_raw_` / `meta_from_raw_` 走一遍
-///   "存进弱槽位再取出来"的往返，再用复原出的元数据重建引用。
+///   "存成裸指针再取出来"的往返，再用复原出的元数据重建引用。
 /// - 判断：复原出的 `DynMetadata` 必须与原元数据逐位相等，重建出的引用必须打印出原值。
 ///   这正是"清盘一侧对 `T` 一无所知也能析构/访问"的依据。
 #[test]
@@ -167,19 +173,18 @@ fn weak_chunk_rebuilds_unsized_data_from_metadata() {
     let repr: *const dyn core::fmt::Debug = &value;
     let (repr_data, repr_meta) = (repr as *const (), core::ptr::metadata(repr));
 
-    let mut weak = make_identity_();
-    weak.set_record_erased_(Option::None, crate::weak_::meta_to_raw_(repr_meta));
-
-    // 从槽位取回元数据：`?Sized` 的虚表指针必须被原样保存
+    // 元数据现在由 `StrongChunkBase` 保管；这里先验证裸元数据的搬运原语本身。
+    let raw = crate::weak_::meta_to_raw_(repr_meta);
+    // 从裸指针取回元数据：`?Sized` 的虚表指针必须被原样保存
     let roundtrip: core::ptr::DynMetadata<dyn core::fmt::Debug> =
-        unsafe { crate::weak_::meta_from_raw_::<dyn core::fmt::Debug>(weak.meta()) };
+        unsafe { crate::weak_::meta_from_raw_::<dyn core::fmt::Debug>(raw) };
     assert_eq!(roundtrip, repr_meta, "虚表元数据必须逐位保存");
 
     // 用取回的元数据重建胖指针，内容必须与原始引用一致
     // SAFETY: 元数据取自上面同一次登记，数据指针也来自同一个引用
     let rebuilt =
         unsafe { &*core::ptr::from_raw_parts::<dyn core::fmt::Debug>(repr_data, roundtrip) };
-    assert_eq!(alloc::format!("{rebuilt:?}"), "1234");
+    assert_eq!(std::format!("{rebuilt:?}"), "1234");
 }
 
 /// 验证 `WeakChunkState` 上"仅当 `Created` 才允许迁移"的升级原语。
@@ -230,7 +235,7 @@ fn weak_state_sharing_path_claims_destroy_exactly_once() {
 ///   空闲字节数在第二次分配后严格减少。最后把池内存还给分配器，避免测试泄漏。
 #[test]
 fn strong_pool_bump_allocation_is_aligned() {
-    use alloc::alloc::Global;
+    use std::alloc::Global;
     use core::alloc::{Allocator, Layout};
 
     static GLOBAL: Global = Global;

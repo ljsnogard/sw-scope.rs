@@ -255,16 +255,19 @@ fn claim_and_destroy_if_unreachable_(weak: &WeakSlot<()>) -> bool {
     if weak.chunk_state().try_claim_destroy().is_none() {
         return false;
     }
-    // SAFETY: 刚由本调用认领成功，且本路径恰好执行一次
-    unsafe { weak.drop_data() };
+    // SAFETY: 刚由本调用认领成功，且本路径恰好执行一次。清理登记与 `?Sized`
+    // 元数据现在保存在强块头部，因此先经身份槽位找到强块。
+    if let Option::Some(chunk) = weak.strong_chunk() {
+        // SAFETY: 同上
+        unsafe { chunk.as_ref().drop_data_() };
+    }
     weak.chunk_state().mark_destroyed();
     true
 }
 
 /// 把"类型擦除后的强块头部指针"还原成 `NonNull<StrongChunk<T>>`。
 ///
-/// 对 `?Sized` 的 `T` 需要重建胖指针，元数据取自弱槽位的析构登记（弱槽位是生命周期
-/// 最长的一环，见 `WeakChunk` 的文档）。
+/// 对 `?Sized` 的 `T` 需要重建胖指针，元数据取自强块头部保存的 `?Sized` 元数据。
 fn raw_to_strong_<T: ?Sized + ptr::Pointee>(
     raw: NonNull<crate::strong_::StrongChunkBase>,
 ) -> NonNull<StrongChunk<T>> {
@@ -278,14 +281,6 @@ fn raw_to_strong_<T: ?Sized + ptr::Pointee>(
 fn raw_meta_<T: ?Sized + ptr::Pointee>(
     raw: NonNull<crate::strong_::StrongChunkBase>,
 ) -> T::Metadata {
-    // SAFETY: 强块头部记录着身份槽位，槽位必然比强块活得久
-    let weak = unsafe { raw.as_ref().weak_chunk() };
-    // SAFETY: 同上
-    let weak = unsafe { weak.as_ref() };
-    #[cfg(test)]
-    {
-        let _ = weak;
-    }
-    // SAFETY: 登记信息是用同一个 T 写下的
-    unsafe { crate::weak_::meta_from_raw_::<T>(crate::weak_::meta_of_(weak)) }
+    // SAFETY: 登记信息是用同一个 T 写下的；元数据现在保存在强块头部
+    unsafe { crate::weak_::meta_from_raw_::<T>(raw.as_ref().meta_()) }
 }

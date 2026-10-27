@@ -1,3 +1,7 @@
+// 注意：本文件当前未参与编译（见 `scope_inner_/mod.rs`）。它仍引用 `WeakSlot` 的
+// 旧存活链 / 清理登记接口；迁移 `ScopeInner` 时应当改用 `WeakSlotState::
+// for_each_live_slot_` 与 `StrongChunkBase` 上的清理登记。
+
 //! 对象分配管线：强池 bump 分配、树共享弱池取槽、就地构造与挂链。
 //!
 //! 这里的方法紧密共享 `chain_head_` / `chain_tail_` / `live_head_` / `live_tail_` 与

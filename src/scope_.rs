@@ -58,7 +58,6 @@ pub struct Scope {
 impl Scope {
     /// 从默认的 RootScope 中创建一个子 scope。
     #[allow(clippy::new_without_default)]
-    #[cfg(feature = "core-alloc")]
     pub fn new() -> Self {
         // 旧实现：
         //

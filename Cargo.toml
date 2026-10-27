@@ -14,8 +14,6 @@ std = []
 # 默认（不开启）则忽略清盘标记、照常放入。
 strict-put-after-close = []
 
-default = ["core-alloc"]
-
 [dependencies]
 bplus_tree_cmp = { git = "https://gitee.com/lino_snsalias/bplus_tree_cmp.git" }
 atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }

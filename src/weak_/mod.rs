@@ -6,5 +6,5 @@ mod tests_;
 
 pub(crate) use pool_::WeakPool;
 pub(crate) use slot_::{
-    DataState, WeakSlot, data_ptr_of_, meta_from_raw_, meta_of_, meta_to_raw_,
+    DataState, WeakSlot, data_ptr_of_, meta_from_raw_, meta_to_raw_,
 };

@@ -1,3 +1,7 @@
+// 注意：本文件当前未参与编译（见 `scope_inner_/mod.rs`）。它仍引用 `WeakSlot` 的
+// 旧存活链 / 清理登记接口；迁移 `ScopeInner` 时应当改用 `WeakSlotState::
+// for_each_live_slot_` 与 `StrongChunkBase` 上的清理登记。
+
 //! 清盘方案 A：关闭子树、静默判定、待回收名单与整域回收。
 //!
 //! 这里的方法紧密共享存活链、强池链、待回收名单这组字段，因此放在同一个文件里。

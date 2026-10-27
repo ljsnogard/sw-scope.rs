@@ -4,7 +4,9 @@
 //! 无法从 `tests/` 目录下的集成测试访问，因此集中放在本模块内。
 //! `demo_.rs` 只作为使用示例，不承担测试职责。
 
-use alloc::{alloc::Global, vec, vec::Vec};
+use std::{alloc::Global, vec, vec::Vec};
+
+use abs_cancel::{CancelledToken, NonCancellableToken, TrCancellationToken};
 use core::{
     mem::MaybeUninit,
     ptr::NonNull,
@@ -12,8 +14,9 @@ use core::{
 };
 
 use crate::{
-    scope_inner_::{PoolIndex, RootScope},
-    weak_::{DataState, WeakSlot, WeakPool},
+    scope_inner_::{PoolIndex, ScopeInner},
+    weak_::{DataState, WeakPool, WeakSlot},
+    x_deps::abs_cancel,
 };
 
 /// 测试统一使用非泛型的弱池；池所属的 root 只按不透明指针保存，测试里用悬垂指针对照。
@@ -40,12 +43,13 @@ fn weak_chunk_size_is_type_agnostic() {
     assert_eq!(base_align, align_of::<WeakSlot<u128>>());
     assert_eq!(base_align, align_of::<WeakSlot<[u8]>>());
 
-    // 64 位平台上的目标布局（Batch B 之后）：
-    // 8(状态) + 8(prev_live) + 8(next_live) + 8(strong_chunk) + 8(record) + 8(meta) = 48
+    // 新设计的槽位只保留状态字与强块指针：
+    // 8(WeakSlotState) + 8(strong_chunk) = 16 字节。
+    // `PreDrop` 与 `?Sized` 元数据已经移到强块头部，存活链也不再逐槽位保存。
     #[cfg(target_pointer_width = "64")]
     assert_eq!(
-        base_size, 48,
-        "64 位平台上弱槽位应为 48 字节（原先每槽一份 24 字节的 DropVtable，现为一个记录指针 + 元数据）"
+        base_size, 16,
+        "64 位平台上弱槽位应为 16 字节（状态 + 强块指针）"
     );
 }
 
@@ -364,14 +368,14 @@ fn weak_chunk_pool_chain_survives_random_alloc_and_free() {
     // 对齐的占位地址；真正解引用域指针的代码尚未在测试路径上。
     // 新设计里弱池挂在 `RootScope` 上；这里只需要一个非空、对齐的占位地址来验证
     // “原样存取”的语义，不 dereference 它。
-    let root: NonNull<RootScope> = NonNull::dangling();
+    let scope: NonNull<ScopeInner> = NonNull::dangling();
     let mut owners: Vec<NonNull<TestPool>> = Vec::with_capacity(POOL_NUM);
     for _ in 0..POOL_NUM {
         owners.push(new_pool_());
     }
     for owner in owners.iter_mut() {
         // SAFETY: owner 指向独占分配的池
-        unsafe { owner.as_mut() }.set_root(root);
+        unsafe { owner.as_mut() }.set_scope(scope);
     }
     for i in 0..POOL_NUM - 1 {
         // SAFETY: 这些池由 new_pool_ 独占分配，测试结束前都存活
@@ -524,7 +528,7 @@ fn weak_chunk_pool_chain_survives_random_alloc_and_free() {
         // 每个池都应当仍然认得住自己的域
         assert_eq!(
             pool.root().map(|r| r.as_ptr()),
-            Option::Some(root.as_ptr()),
+            Option::Some(scope.as_ptr()),
             "池 {p} 的域在随机操作后丢失"
         );
     }
@@ -678,8 +682,9 @@ fn weak_chunk_pool_invariant_checker_detects_corruption() {
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 /// 验证状态锁的尝试语义与守卫的自动释放。
-/// - 手段：造一个槽位，先用带重试上限的 `try_lock` 取得守卫；在守卫存活期间再尝试一次
-///   （另一个借用），随后析构守卫，再尝试第三次。
+/// - 手段：造一个槽位，先用不可取消令牌 `try_lock` 取得守卫；在守卫存活期间用已取消
+///   令牌再尝试一次（只允许尝试一次，因此不会忙等），随后析构守卫，再用不可取消令牌
+///   尝试第三次。
 /// - 判断：第一次必须成功；守卫存活期间的第二次必须失败；守卫析构后的第三次必须成功，
 ///   且锁位确实被释放。这条测试同时说明守卫是"持有即独占、析构即归还"的。
 #[test]
@@ -693,15 +698,91 @@ fn weak_chunk_state_lock_is_exclusive_and_released_by_guard() {
     };
 
     {
-        let guard = chunk.try_lock(64).expect("空闲槽位应当能立刻上锁");
-        // 守卫存活期间，别的持有者拿不到锁
-        assert!(chunk.try_lock(4).is_none(), "已上锁的槽位不应再次成功上锁");
+        let guard = chunk
+            .try_lock(NonCancellableToken::new())
+            .expect("空闲槽位应当能立刻上锁");
+        // 守卫存活期间，别的持有者拿不到锁。已取消令牌让本次调用只尝试一次后放弃，
+        // 因此这里不会忙等。
+        assert!(
+            chunk.try_lock(CancelledToken::new()).is_none(),
+            "已上锁的槽位不应再次成功上锁"
+        );
         assert_eq!(guard.pool_order(), 0);
     }
     // 守卫析构后锁位应当被释放，且状态字没有残留垃圾位
-    assert!(chunk.try_lock(64).is_some(), "守卫析构后应当能重新上锁");
+    assert!(
+        chunk.try_lock(NonCancellableToken::new()).is_some(),
+        "守卫析构后应当能重新上锁"
+    );
     assert_eq!(chunk.data_state(), DataState::Reclaimed);
     assert_eq!(chunk.weak_count(), 0);
+}
+
+/// 验证 spin 取锁期间收到取消信号会放弃，而不是一直等到锁释放。
+/// Verify that a lock attempt gives up when the cancellation token fires during spinning.
+///
+/// - 手段 / Approach：先由当前线程用 `lock_busy` 持有锁；构造一个"第一次查询返回未取消、
+///   第二次查询返回已取消"的测试令牌，再调用 `try_lock`。这样第二次自旋时就会收到放弃
+///   信号，不需要额外线程与计时。
+/// - 判断 / Assertion：`try_lock` 必须返回 `None`（而不是继续忙等到当前线程释放锁），
+///   且令牌至少被查询两次。
+#[test]
+fn lock_gives_up_when_token_is_cancelled_during_spin() {
+    /// 前两次状态查询用于制造"自旋中途取消"的确定性场景。
+    struct CancelAfterCheck {
+        checks_: core::sync::atomic::AtomicUsize,
+    }
+
+    impl CancelAfterCheck {
+        const fn new() -> Self {
+            Self {
+                checks_: core::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TrCancellationToken for CancelAfterCheck {
+        type Cancellation = core::future::Pending<()>;
+        type ChildToken = Self;
+
+        fn is_cancelled(&self) -> bool {
+            // 第一次返回 false（继续自旋），之后返回 true（放弃）。
+            self.checks_.fetch_add(1, Ordering::AcqRel) >= 1
+        }
+
+        fn can_be_cancelled(&self) -> bool {
+            true
+        }
+
+        fn child_token(&self) -> Self {
+            Self::new()
+        }
+
+        fn cancellation(self) -> Self::Cancellation {
+            core::future::pending()
+        }
+    }
+
+    let mut slot = MaybeUninit::<WeakSlot<()>>::uninit();
+    // SAFETY: 初始化 1 个槽位后取可变引用
+    let chunk = unsafe {
+        let ptr = slot.as_mut_ptr();
+        WeakSlot::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+        &mut *ptr
+    };
+
+    // 当前线程持有锁，迫使 `try_lock` 进入自旋分支。
+    let guard = chunk.lock_busy();
+    let token = CancelAfterCheck::new();
+    assert!(
+        chunk.try_lock(token).is_none(),
+        "自旋中途收到取消信号时必须放弃抢锁"
+    );
+    assert!(
+        chunk.data_state() == DataState::Reclaimed,
+        "放弃抢锁不应改变槽位状态"
+    );
+    drop(guard);
 }
 
 /// 验证忙等版加锁（`lock_busy`）在无竞争时同样可用。
@@ -721,7 +802,10 @@ fn weak_chunk_lock_busy_acquires_and_releases() {
         let guard = chunk.lock_busy();
         assert_eq!(guard.pool_order(), 0);
     }
-    assert!(chunk.try_lock(64).is_some(), "忙等守卫析构后应当释放锁");
+    assert!(
+        chunk.try_lock(NonCancellableToken::new()).is_some(),
+        "忙等守卫析构后应当释放锁"
+    );
 }
 
 /// 验证锁在并发下确实互斥：多线程各自"取锁—进入临界区—放锁"，临界区不重叠。
@@ -732,7 +816,7 @@ fn weak_chunk_lock_busy_acquires_and_releases() {
 ///   若锁失效，两个线程会同时看到计数为 1，溢出计数大于 0。
 #[test]
 fn weak_chunk_state_lock_is_mutually_exclusive_across_threads() {
-    use alloc::sync::Arc;
+    use std::sync::Arc;
     use core::sync::atomic::AtomicUsize;
     use std::thread;
 
@@ -810,14 +894,16 @@ fn weak_chunk_lock_is_released_when_guard_drops_during_panic() {
     };
 
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = chunk.try_lock(64).expect("空闲槽位应当能上锁");
+        let _guard = chunk
+            .try_lock(NonCancellableToken::new())
+            .expect("空闲槽位应当能上锁");
         panic!("在临界区内 panic，检查锁是否会被守卫带走");
     }));
     assert!(caught.is_err(), "panic 应当被 catch_unwind 捕获");
 
     // 守卫随栈回退析构，锁必须已经释放
     assert!(
-        chunk.try_lock(64).is_some(),
+        chunk.try_lock(NonCancellableToken::new()).is_some(),
         "临界区 panic 后锁必须已被守卫释放"
     );
 }
@@ -897,4 +983,147 @@ fn weak_pool_of_slot_reverses_to_owning_pool() {
             );
         }
     }
+}
+
+/// 验证"仅凭 `WeakSlotState` 反推存活链"在多个满池、随机归还后的结果。
+/// Verify that the live chain can be reconstructed from `WeakSlotState` alone after
+/// several full pools have had random slots returned.
+///
+/// - 手段 / Approach：构造 3 个容量不同的弱池并串成双向链，按全局下标顺序把每个池
+///   分配满；用一个确定性的伪随机流在每个池里挑选若干位置归还，然后从任意一个槽位的
+///   `WeakSlotState` 调用 `for_each_live_slot_`，收集反推出来的存活链。
+/// - 判断 / Assertion：反推结果的长度必须等于"构造总数 - 归还数"，每个元素必须是构造
+///   时记录过的地址，整条链必须是"构造顺序去掉归还槽位"的**循环旋转**，并且旋转起点
+///   必须正好落在链尾池最后一个空闲槽位的下一个存活槽位（若该空闲槽位已是池尾，则
+///   回绕到链头）。这样同时验证了存活链的完整性与起点选择。
+#[test]
+fn live_chain_is_rebuilt_from_slot_states_after_random_free() {
+    const CAPS: [u16; 3] = [4, 5, 6];
+
+    // 1) 构造池链。每个池的容量不同，避免只在小池上碰巧成立。
+    let mut owners: Vec<NonNull<TestPool>> = Vec::with_capacity(CAPS.len());
+    for cap in CAPS {
+        owners.push(
+            TestPool::try_new_with_cell_count(cap, &Global).expect("测试用池应当构造成功"),
+        );
+    }
+    for i in 0..owners.len() - 1 {
+        // SAFETY: 两个池互不相同且都由本测试独占持有
+        unsafe {
+            owners[i].as_mut().link_siblings(&mut *owners[i + 1].as_ptr());
+        }
+    }
+
+    // 2) 按全局下标顺序分配满，并记录构造顺序（池顺序 + 池内下标顺序）。
+    let mut constructed: Vec<NonNull<WeakSlot<()>>> = Vec::new();
+    for (p, owner) in owners.iter_mut().enumerate() {
+        // SAFETY: owner 指向本测试独占的池
+        let pool = unsafe { owner.as_mut() };
+        for _ in 0..CAPS[p] {
+            assert!(pool.allocate().is_some(), "池 {p} 应当能分配满");
+        }
+        // SAFETY: 池仍然存活，槽位数组在整个测试期间有效
+        let slots = unsafe { pool.slots().as_mut() };
+        for slot in slots.iter_mut() {
+            // 真实分配管线在数据就位后会把状态置为 `Created`；测试里没有数据，
+            // 但必须模拟这一步，否则槽位仍会被当作空闲。
+            slot.chunk_state().init_created();
+            constructed.push(NonNull::from(slot));
+        }
+    }
+
+    // 3) 每个池随机归还若干槽位。用小型 LCG 产生确定性"随机"，便于失败复现。
+    let mut seed = 0xA5A5_1234_5678_9ABCu64;
+    let mut freed: Vec<NonNull<WeakSlot<()>>> = Vec::new();
+    for (p, owner) in owners.iter_mut().enumerate() {
+        // SAFETY: owner 指向本测试独占的池
+        let pool = unsafe { owner.as_mut() };
+        let cap = CAPS[p] as usize;
+        // 每个池归还 1..=cap/2 个不同位置，保证池里总还有存活槽位。
+        let mut chosen: Vec<usize> = Vec::new();
+        let want = 1 + (p % (cap / 2).max(1));
+        while chosen.len() < want {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let index = (seed >> 33) as usize % cap;
+            if chosen.contains(&index) {
+                continue;
+            }
+            chosen.push(index);
+            assert!(pool.deallocate(index as PoolIndex), "归还池 {p} 的槽位 {index} 应当成功");
+        }
+        for index in chosen {
+            freed.push(constructed[constructed_offset_(p, &CAPS) + index]);
+        }
+    }
+
+    // 预期：构造顺序去掉已归还的槽位。
+    let expected: Vec<NonNull<WeakSlot<()>>> = constructed
+        .iter()
+        .copied()
+        .filter(|slot| !freed.contains(slot))
+        .collect();
+    assert!(!expected.is_empty());
+
+    // 4) 从任意一个槽位的 `WeakSlotState` 反推整条存活链。
+    let mut rebuilt: Vec<NonNull<WeakSlot<()>>> = Vec::new();
+    // SAFETY: owners[0] 存活；槽位数组有效
+    let slots = unsafe { owners[0].as_mut().slots().as_mut() };
+    slots[0]
+        .chunk_state()
+        .for_each_live_slot_(|slot| rebuilt.push(slot));
+
+    // 5) 完整性 + 循环旋转比较。
+    assert_eq!(
+        rebuilt.len(),
+        expected.len(),
+        "反推存活链的长度必须等于构造数减去归还数"
+    );
+    assert_eq!(
+        rebuilt.len(),
+        constructed.len() - freed.len(),
+        "归还数量与账本不符"
+    );
+    let offset = expected
+        .iter()
+        .position(|slot| *slot == rebuilt[0])
+        .expect("反推链的首个槽位必须来自构造顺序");
+
+    // 5.1) 起点必须是链尾池最后一个空闲槽位的下一个存活槽位；若该空洞已是池尾，
+    //      则按算法回绕到链头池的第一个存活槽位。
+    let last_base = constructed_offset_(CAPS.len() - 1, &CAPS);
+    let last_cap = *CAPS.last().expect("至少有一个池") as usize;
+    let last_free = (0..last_cap)
+        .filter(|index| freed.contains(&constructed[last_base + index]))
+        .max()
+        .expect("链尾池必须至少归还一个槽位");
+    let expected_start = if last_free + 1 < last_cap {
+        last_base + last_free + 1
+    } else {
+        (0..constructed.len())
+            .find(|index| !freed.contains(&constructed[*index]))
+            .expect("至少应当有一个存活槽位")
+    };
+    let expected_offset = expected
+        .iter()
+        .position(|slot| *slot == constructed[expected_start])
+        .expect("起点槽位必须仍在存活链中");
+    assert_eq!(
+        offset, expected_offset,
+        "反推链的起点不是链尾池最后一个空闲槽位之后的位置"
+    );
+
+    // 5.2) 从对齐后的起点开始逐项比较。
+    for (k, slot) in rebuilt.iter().enumerate() {
+        assert_eq!(
+            *slot,
+            expected[(offset + k) % expected.len()],
+            "反推链在第 {k} 项偏离了相对构造顺序（循环旋转）"
+        );
+    }
+}
+
+/// 计算第 `p` 个池在 `CAPS` 拼接成的构造顺序中的起始下标。
+/// Compute the start offset of pool `p` in the concatenated construction order.
+fn constructed_offset_(p: usize, caps: &[u16]) -> usize {
+    caps[..p].iter().map(|cap| *cap as usize).sum()
 }

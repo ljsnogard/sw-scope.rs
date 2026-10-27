@@ -6,7 +6,7 @@ use core::{
 
 use crate::{
     strong_::PreDropRecord,
-    weak_::WeakSlot,
+    weak_::{data_ptr_of_, WeakSlot},
 };
 
 /// Arena 中承载用户数据的一个块。
@@ -14,11 +14,14 @@ use crate::{
 /// # 它为什么这么小
 ///
 /// 决策「不复用内存空洞」之后，强块不再需要在池内维护任何出入记录：位置一旦分配就
-/// 终身不变，整块池子最后一次性回收。于是状态、存活链链接、析构登记这些管理信息全部
-/// 移到了 [`WeakChunk`]（对象的身份所在，也是生命周期最长的一环），强块自己只剩两样：
+/// 终身不变，整块池子最后一次性回收。
 ///
-/// - 数据本身（`data_`）；
-/// - 自己那份**强**引用计数与指回身份的指针（[`StrongChunkBase`]）。
+/// 强块头部承担两件事：
+///
+/// - 自己那份**强**引用计数与指回身份的指针；
+/// - 类型擦除的 `PreDrop` 登记与 `?Sized` 元数据（弱槽位不再保存它们）。
+///
+/// 存活链不逐槽位保存，而是由弱池链与槽位状态在需要时反推。
 ///
 /// 强引用计数与弱槽位里的弱引用计数是**两个不同的东西**：前者数 "多少个 `Sharing` 共享
 /// 这份数据"，后者数 "多少个 `Retain` 句柄指向这个对象"，因此各自保管、互不干扰。
@@ -33,26 +36,27 @@ where
 
 /// 强块与类型无关的公共头部。
 ///
-/// 弱槽位通过 [`StrongChunkBase::weak_chunk`] 单向指回身份，因此从强块出发可以找到
-/// 存活链与析构登记所在的槽位；反向则不需要链接。
+/// 强块通过 [`StrongChunkBase::weak_chunk`] 单向指回身份槽位；清理登记与元数据就在
+/// 强块头部，因此清盘一侧只需要强块指针就能完成类型擦除析构。
 #[repr(C)]
 pub(crate) struct StrongChunkBase {
     /// 强引用计数（仅 `Sharing<T>` 有效）。
     refc_: AtomicU32,
 
-    // 以下三个字段是旧的"池内链表 + 每块自带 PreDrop 登记"设计留下的；新的身份/登记
-    // 信息保存在 `WeakSlot` 上，因此暂时注释掉，待确认强块头部布局后再决定是否恢复。
-    //
-    // /// 本 chunk 距离池首的偏移量（以 Cell 计）
-    // pool_order_: PoolIndex,
-
-    // /// 上一个 StrongChunkBase 的偏移量（以 Cell 计）
-    // next_chunk_: PoolIndex,
-
     /// 指回本块的身份弱槽位。
     weak_chunk_: NonNull<WeakSlot<()>>,
 
-    // predrop_rec_: PreDropRecord,
+    /// 类型擦除的清理登记；`None` 表示既不需要 `Drop` 也没有 `PreDrop` 钩子。
+    ///
+    /// 新设计把 `PreDrop` 与 `?Sized` 元数据从弱槽位移到这里：弱槽位只承担身份、
+    /// 状态与空闲链，强块头部才是"这块数据怎么析构"的权威。
+    predrop_rec_: Option<&'static PreDropRecord>,
+
+    /// 数据区的 `?Sized` 元数据（切片长度 / 虚表）；`Sized` 时为空指针。
+    ///
+    /// 它必须和 `predrop_rec_` 一起保存：清理入口按 `T` 单态化后需要它才能重建
+    /// `*mut T`。
+    meta_: *const (),
 }
 
 
@@ -62,6 +66,8 @@ impl StrongChunkBase {
         StrongChunkBase {
             refc_: AtomicU32::new(0),
             weak_chunk_: weak_chunk,
+            predrop_rec_: Option::None,
+            meta_: ptr::null(),
         }
     }
 
@@ -69,6 +75,66 @@ impl StrongChunkBase {
     #[inline]
     pub(crate) const fn weak_chunk(&self) -> NonNull<WeakSlot<()>> {
         self.weak_chunk_
+    }
+
+    /// 数据区的 `?Sized` 元数据。
+    #[inline]
+    pub(crate) const fn meta_(&self) -> *const () {
+        self.meta_
+    }
+
+    /// 类型擦除的清理登记。
+    #[inline]
+    pub(crate) const fn predrop_rec_(&self) -> Option<&'static PreDropRecord> {
+        self.predrop_rec_
+    }
+
+    /// 绑定清理登记与 `?Sized` 元数据。只在数据刚构造完成时调用。
+    #[inline]
+    pub(crate) fn set_record_meta_(
+        &mut self,
+        record: Option<&'static PreDropRecord>,
+        meta: *const (),
+    ) {
+        self.predrop_rec_ = record;
+        self.meta_ = meta;
+    }
+
+    /// 按登记执行清理：先跑 `PreDrop` 钩子，再析构数据。
+    ///
+    /// # Safety
+    ///
+    /// 必须先由状态机认领销毁，且恰好调用一次。
+    pub(crate) unsafe fn drop_data_(&self) {
+        let Option::Some(record) = self.predrop_rec_ else {
+            return;
+        };
+        // SAFETY: 由调用方保证已认领且尚未析构；登记与元数据来自同一块数据
+        unsafe { record.run_(self as *const Self as *mut u8, self.meta_) };
+    }
+
+    /// 按 `U` 重建数据引用；调用方必须保证数据仍然活着。
+    ///
+    /// # Safety
+    ///
+    /// 数据必须尚未析构，且 `U` 必须与当初分配的 `T` 是同一个类型。
+    pub(crate) unsafe fn data_ref_as<U: ?Sized + ptr::Pointee>(&self) -> &U {
+        // SAFETY: 强块首址与 StrongChunk<U> 首址相同；元数据来自同一次分配
+        let data = unsafe { data_ptr_of_::<U>(self as *const Self as *mut u8, self.meta_) };
+        // SAFETY: 由调用方保证数据尚未析构
+        unsafe { &*data }
+    }
+
+    /// 按 `U` 重建数据可变引用；调用方必须保证数据仍然活着且独占。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`StrongChunkBase::data_ref_as`]，且调用方必须保证独占访问。
+    pub(crate) unsafe fn data_ref_mut_as<U: ?Sized + ptr::Pointee>(&mut self) -> &mut U {
+        // SAFETY: 同 data_ref_as
+        let data = unsafe { data_ptr_of_::<U>(self as *mut Self as *mut u8, self.meta_) };
+        // SAFETY: 由调用方保证数据尚未析构且独占
+        unsafe { &mut *data }
     }
 
     /// 数据区的起始偏移（以 `StrongChunkBase` 计）。
@@ -156,10 +222,8 @@ where
         if !self.is_data_alive() {
             return Option::None;
         }
-        // SAFETY: 状态表明数据尚未析构；身份槽位比强块活得久
-        let weak = unsafe { self.base_.weak_chunk().as_ref() };
-        // SAFETY: 状态表明数据尚未析构
-        Option::Some(unsafe { weak.data_ref_as::<T>() })
+        // SAFETY: 状态表明数据尚未析构；登记与元数据就在强块头部
+        Option::Some(unsafe { self.base_.data_ref_as::<T>() })
     }
 
     /// 数据仍然活着时返回其可变引用。
@@ -167,10 +231,8 @@ where
         if !self.is_data_alive() {
             return Option::None;
         }
-        // SAFETY: 状态表明数据尚未析构；身份槽位比强块活得久，且 &mut self 保证独占访问
-        let weak = unsafe { self.base_.weak_chunk().as_mut() };
-        // SAFETY: 状态表明数据尚未析构
-        Option::Some(unsafe { weak.data_ref_mut_as::<T>() })
+        // SAFETY: 状态表明数据尚未析构，且 &mut self 保证独占访问
+        Option::Some(unsafe { self.base_.data_ref_mut_as::<T>() })
     }
 
     /// 数据是否仍然活着。状态权威在弱槽位，这里顺着身份指针去读。
@@ -187,7 +249,13 @@ where
         self.base_.weak_chunk()
     }
 
-    /// 供分配路径调用：绑定身份、清零强计数，并把数据登记进弱槽位的清理登记。
+    /// 本块的清理登记（保存在强块头部）。
+    #[inline]
+    pub(crate) fn predrop_rec_(&self) -> Option<&'static PreDropRecord> {
+        self.base_.predrop_rec_()
+    }
+
+    /// 供分配路径调用：绑定身份、清零强计数，并把清理登记与元数据写进强块头部。
     ///
     /// `record` 是调用方按"对象级 > 类型级 > 默认"选好的有效登记，交给类型无关的弱槽位保管。
     ///
@@ -233,7 +301,7 @@ where
         } else {
             Option::Some(record)
         };
-        weak.set_record_erased_(record_, meta_);
+        self.base_.set_record_meta_(record_, meta_);
     }
 }
 
