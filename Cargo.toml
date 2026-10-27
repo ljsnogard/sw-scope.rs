@@ -22,3 +22,7 @@ gen_mcf2 = { git = "https://gitee.com/lino_snsalias/cancel_rs.git" }
 # 类型键：`typeid::of::<T>()` 对非 `'static`、`?Sized` 的 `T` 也能给出稳定的
 # `core::any::TypeId`，用来取代原先不可靠的 `core::any::type_name`。
 typeid = { version = "1", optional = true }
+
+
+[dev-dependencies]
+compio = { version = "0.19.*", features = ["fs", "macros", "time", "net", "runtime"] }

@@ -15,18 +15,19 @@
 use core::{
     alloc::{Allocator, Layout},
     mem::MaybeUninit,
-    ptr,
+    ptr::{self, NonNull},
     sync::atomic::AtomicPtr,
 };
 
-#[cfg(feature = "core-alloc")]
-extern crate alloc;
+use abs_cancel::TrCancellationToken;
+use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
-    abs_::{TrEmplace, TrScope},
+    abs_::{TrEmplace, TrPredrop, TrScope},
     index_::Retain,
-    scope_inner_::{RootScope, ScopeKey},
+    scope_inner_::{ScopeInner, ScopeKey},
     scope_str_::ScopeStr,
+    x_deps::abs_cancel,
 };
 
 #[derive(Debug)]
@@ -48,11 +49,7 @@ pub enum ScopeError {
 /// 新设计里它只是 root B+ 树中一个条目的句柄：`root_` 指出树，`key_` 指出条目。
 /// 旧实现直接持有 `&'static ScopeInner`，并靠父子链维持代际关系；见文件末尾注释。
 pub struct Scope {
-    /// 本句柄所属的 root；root 终身存活。
-    root_: &'static RootScope,
-
-    /// 本域在 root B+ 树中的键。
-    key_: ScopeKey,
+    inner_: NonNull<ScopeInner>,
 }
 
 impl Scope {
@@ -71,6 +68,10 @@ impl Scope {
         // // 以 root 域为父创建子 Scope；root 自身没有父域，临时句柄析构时会被跳过
         // let root_scope = Self::make_scope_(root);
         // Self::new_from_parent(&root_scope)
+        todo!()
+    }
+
+    pub async fn put_async<T>(&self, data: T) -> Result<Retain<T>, ScopeError> {
         todo!()
     }
 }
@@ -332,80 +333,26 @@ impl Scope {
     }
 }
 
-impl TrScope for &mut Scope {
+impl TrScope for Scope {
     type Err = ScopeError;
 
-    #[inline]
-    fn try_put<F, T>(self, factory: F) -> Result<Retain<T>, Self::Err>
+    type EmplaceWithPredropAsync<'f, M, P> = ScopeEmplaceWithPredropAsync<'f, 'f, M, P>
     where
-        F: FnOnce() -> T,
-    {
-        Scope::try_put(self, factory)
-    }
+        M: 'f + TrEmplace,
+        P: 'f + TrPredrop<M::Target>,
+        Self: 'f;
 
-    #[inline]
-    fn try_put_str(self, str: &str) -> Result<Retain<ScopeStr>, Self::Err> {
-        Scope::try_put_str(self, str)
-    }
-
-    #[inline]
-    fn try_clone<T>(self, src: &[T]) -> Result<Retain<[T]>, Self::Err>
-    where
-        T: Clone,
-    {
-        Scope::try_clone(self, src)
-    }
-
-    #[inline]
-    unsafe fn try_emplace<TyEmp>(
-        self,
+    unsafe fn emplace_with_predrop_async<'f, M, P>(
+        &'f self,
         layout: Layout,
-        emplace: TyEmp,
-    ) -> Result<Retain<TyEmp::Target>, Self::Err>
+        emplace: M,
+        predrop: P,
+    ) -> Self::EmplaceWithPredropAsync<'f, M, P>
     where
-        TyEmp: TrEmplace,
+        M: 'f + TrEmplace,
+        P: 'f + TrPredrop<M::Target>,
     {
-        unsafe { Scope::try_emplace(self, layout, emplace) }
-    }
-
-    #[inline]
-    unsafe fn try_emplace_with<TyEmp, Fin>(
-        self,
-        layout: Layout,
-        emplace: TyEmp,
-        pre_drop: Fin,
-    ) -> Result<Retain<TyEmp::Target>, Self::Err>
-    where
-        TyEmp: TrEmplace,
-        Fin: FnOnce(&mut TyEmp::Target) + 'static,
-    {
-        unsafe { Scope::try_emplace_with(self, layout, emplace, pre_drop) }
-    }
-
-    #[inline]
-    fn try_alloc_slice_uninit<T>(
-        self,
-        length: usize,
-    ) -> Result<Retain<[MaybeUninit<T>]>, Self::Err> {
-        Scope::try_alloc_slice_uninit(self, length)
-    }
-
-    #[inline]
-    fn set_pre_drop<T, Fin>(self, pre_drop: Fin) -> Result<(), Self::Err>
-    where
-        T: ?Sized,
-        Fin: FnOnce(&mut T) + 'static,
-    {
-        Scope::set_pre_drop::<T, Fin>(self, pre_drop)
-    }
-
-    #[inline]
-    fn try_put_with<F, T, Fin>(self, factory: F, pre_drop: Fin) -> Result<Retain<T>, Self::Err>
-    where
-        F: FnOnce() -> T,
-        Fin: FnOnce(&mut T) + 'static,
-    {
-        Scope::try_put_with(self, factory, pre_drop)
+        ScopeEmplaceWithPredropAsync::new(self, layout, emplace, predrop)
     }
 }
 
@@ -439,6 +386,22 @@ impl Drop for Scope {
         // inner.reclaim_pending_();
         todo!()
     }
+}
+
+#[gen_may_cancel_future(ScopeEmplaceWithPredrop)]
+async fn scope_emplace_with_predrop_async<'f, M, P, K>(
+    scope: &'f Scope,
+    layout: Layout,
+    emplace: M,
+    predrop: P,
+    cancel: K,
+) -> Result<Retain<M::Target>, ScopeError>
+where
+    M: 'f + TrEmplace,
+    P: 'f + TrPredrop<M::Target>,
+    K: TrCancellationToken,
+{
+    Result::Err(ScopeError::ClosedScope)
 }
 
 // ============================================================================

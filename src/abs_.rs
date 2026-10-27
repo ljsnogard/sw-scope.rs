@@ -1,6 +1,12 @@
 use core::{alloc::Layout, marker::PhantomData, mem::MaybeUninit};
 
-use crate::{index_::Retain, scope_str_::ScopeStr};
+use abs_cancel::TrMayCancel;
+
+use crate::{
+    index_::Retain,
+    scope_str_::ScopeStr,
+    x_deps::abs_cancel,
+};
 
 pub trait TrPredrop<T>
 where
@@ -69,15 +75,12 @@ pub trait TrEmplace {
 pub trait TrScope {
     type Err;
 
-    fn try_put<F, T>(self, factory: F) -> Result<Retain<T>, Self::Err>
+    type EmplaceWithPredropAsync<'f, M, P>: TrMayCancel<'f, MayCancelOutput =
+        Result<Retain<M::Target>, Self::Err>>
     where
-        F: FnOnce() -> T;
-
-    fn try_put_str(self, str: &str) -> Result<Retain<ScopeStr>, Self::Err>;
-
-    fn try_clone<T>(self, src: &[T]) -> Result<Retain<[T]>, Self::Err>
-    where
-        T: Clone;
+        M: 'f + TrEmplace,
+        P: 'f + TrPredrop<M::Target>,
+        Self: 'f;
 
     /// Like placement new in C++, to construct big object directly in place
     /// instead of create on stack then move. This is also helpful when `T` has
@@ -87,76 +90,92 @@ pub trait TrScope {
     /// - Caller must guarantee the emplaced value is safe for drop semantics;
     /// - Caller must guarantee the process of emplacement will not exceed the
     ///   memory border;
-    unsafe fn try_emplace<TyEmp>(
-        self,
+    unsafe fn emplace_with_predrop_async<'f, M, P>(
+        &'f self,
         layout: Layout,
-        emplace: TyEmp,
-    ) -> Result<Retain<TyEmp::Target>, Self::Err>
+        emplace: M,
+        predrop: P,
+    ) -> Self::EmplaceWithPredropAsync<'f, M, P>
     where
-        TyEmp: TrEmplace;
+        M: 'f + TrEmplace,
+        P: 'f + TrPredrop<M::Target>;
 
-    /// 同 [`TrScope::try_emplace`]，但额外传一个对象级 `PreDrop` 钩子；它覆盖类型级钩子。
-    ///
-    /// # Safety
-    ///
-    /// 同 [`TrScope::try_emplace`]。
-    unsafe fn try_emplace_with<TyEmp, Fin>(
-        self,
+    /// A convenient method calling `try_emplace_with` without `pre_drop`;
+    unsafe fn emplace_async<'f, M>(
+        &'f self,
         layout: Layout,
-        emplace: TyEmp,
-        pre_drop: Fin,
-    ) -> Result<Retain<TyEmp::Target>, Self::Err>
+        emplace: M,
+    ) -> Self::EmplaceWithPredropAsync<'f, M, ()>
     where
-        TyEmp: TrEmplace,
-        Fin: FnOnce(&mut TyEmp::Target) + 'static;
+        M: TrEmplace,
+    {
+        unsafe { Self::emplace_with_predrop_async(self, layout, emplace, ()) }
+    }
 
-    fn try_alloc_slice_uninit<T>(
-        self,
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    type PutWithFactoryPredropAsync<'f, Ft, Fp, P, T>: TrMayCancel<'f, MayCancelOutput =
+        Result<Retain<T>, Self::Err>>
+    where
+        Ft: FnOnce() -> T,
+        Fp: FnOnce() -> P,
+        P: TrPredrop<T>,
+        T: 'f,
+        Self: 'f;
+
+    fn put_with_factory_predrop_async<'f, Ft, Fp, P, T>(
+        &'f self,
+        val_factory: Ft,
+        predrop_factory: Fp,
+    ) -> Self::PutWithFactoryPredropAsync<'f, Ft, Fp, P, T>
+    where
+        Ft: FnOnce() -> T,
+        Fp: FnOnce() -> P,
+        P: TrPredrop<T>;
+
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    type PutStrAsync<'f, P>: TrMayCancel<'f, MayCancelOutput =
+        Result<Retain<ScopeStr>, Self::Err>>
+    where
+        P: TrPredrop<ScopeStr>,
+        Self: 'f;
+
+    fn put_str_with_predrop_async<'f, P>(
+        &'f self,
+        str: &'f str,
+        predrop: P,
+    ) -> Self::PutStrAsync<'f, P>
+    where
+        P: TrPredrop<ScopeStr>;
+
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+    // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+    type AllocUninitSliceAsync<'f, P, T>: TrMayCancel<'f, MayCancelOutput =
+        Result<Retain<[MaybeUninit<T>]>, Self::Err>>
+    where
+        P: TrPredrop<[MaybeUninit<T>]>,
+        T: 'f,
+        Self: 'f;
+
+    fn alloc_uninit_slice_async<'f, P, T>(
+        &'f self,
         length: usize,
-    ) -> Result<Retain<[MaybeUninit<T>]>, Self::Err>;
-
-    /// 为类型 `T` 注册一个类型级 `PreDrop` 钩子，作用于该类型的所有实例。
-    fn set_pre_drop<T, Fin>(self, pre_drop: Fin) -> Result<(), Self::Err>
+        predrop: P,
+    ) -> Self::AllocUninitSliceAsync<'f, P, T>
     where
-        T: ?Sized,
-        Fin: FnOnce(&mut T) + 'static;
+        P: TrPredrop<[MaybeUninit<T>]>;
+}
 
-    /// 同 [`TrScope::try_put`]，但额外传一个对象级 `PreDrop` 钩子；它覆盖类型级钩子。
-    fn try_put_with<F, T, Fin>(self, factory: F, pre_drop: Fin) -> Result<Retain<T>, Self::Err>
-    where
-        F: FnOnce() -> T,
-        Fin: FnOnce(&mut T) + 'static;
-
-    fn put<T>(self, data: T) -> Retain<T>
-    where
-        Self: Sized,
-    {
-        let Result::Ok(w) = self.try_put(|| data) else {
-            panic!()
-        };
-        w
-    }
-
-    fn put_with<F, T, Fin>(self, factory: F, pre_drop: Fin) -> Retain<T>
-    where
-        Self: Sized,
-        F: FnOnce() -> T,
-        Fin: FnOnce(&mut T) + 'static,
-    {
-        let Result::Ok(w) = self.try_put_with(factory, pre_drop) else {
-            panic!()
-        };
-        w
-    }
-
-    fn put_str(self, str: &str) -> Retain<ScopeStr>
-    where
-        Self: Sized,
-    {
-        let Result::Ok(w) = self.try_put_str(str) else {
-            panic!()
-        };
-        w
+pub trait TrScopeExt
+where
+    Self: TrScope,
+{
+    async fn put_async<T>(&self, data: T) -> Result<Retain<T>, Self::Err> {
+        todo!()
     }
 }
 

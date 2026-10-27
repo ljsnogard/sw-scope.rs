@@ -1,5 +1,4 @@
-// 旧实现需要 `Allocator` 的 `allocate`/`deallocate` 扩展；迁移后暂未使用。
-// #![feature(allocator_ext)]
+#![feature(impl_trait_in_assoc_type)]
 #![feature(ptr_metadata)]
 #![feature(try_trait_v2)]
 
@@ -7,6 +6,7 @@
 // 本次重构先把新树结构编译通过：大量旧实现与辅助类型被停用但按约定保留在源码中，
 // 因此暂时允许不可达代码。等 B+ 树操作与分配管线迁移完成、旧实现真正删除后，应移除
 // 这个 allow。
+
 #![allow(dead_code)]
 
 mod abs_;
