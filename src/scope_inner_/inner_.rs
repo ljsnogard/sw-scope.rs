@@ -99,8 +99,6 @@ pub(crate) struct ScopeHeader {
     /// 本实体所在的强块与身份槽位，供未来把 chunk / slot 还给 root 池。
     chunk_: NonNull<StrongChunkBase>,
     weak_: NonNull<WeakSlot<()>>,
-    /// 单态化的析构入口：root 不需要知道 `A`，经此指针即可析构异质实体。
-    drop_: unsafe fn(NonNull<ScopeHeader>),
 }
 
 /// 一个域的完整实体：固定头部 + 每域一份的用户指定分配器。
@@ -177,7 +175,6 @@ impl ScopeHeader {
                     root_: root,
                     chunk_: NonNull::new_unchecked(base as *mut StrongChunkBase),
                     weak_: weak,
-                    drop_: drop_scope_entity_::<A>,
                 },
             );
             ptr::write(ptr::addr_of_mut!((*entity).alloc_), alloc);
@@ -216,18 +213,4 @@ impl ScopeHeader {
     pub(crate) fn root_(&self) -> &'static RootScope {
         self.root_
     }
-}
-
-/// 单态化析构入口：root 只需要 `ScopeHeader` 里的一个函数指针，就能析构异质的
-/// `ScopeEntity<A>`。chunk / 弱槽位的归还留给 root 的回收路径（当前实验尚未接入）。
-///
-/// # Safety
-///
-/// `header` 必须指向一个仍然存活、且尚未析构的 `ScopeEntity<A>`。
-unsafe fn drop_scope_entity_<A>(header: NonNull<ScopeHeader>)
-where
-    A: Allocator + Send + Sync + 'static,
-{
-    // SAFETY: ScopeHeader 是 ScopeEntity<A> 的首字段
-    unsafe { ptr::drop_in_place(header.as_ptr() as *mut ScopeEntity<A>) };
 }

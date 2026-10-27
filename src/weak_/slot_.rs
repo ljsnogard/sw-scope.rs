@@ -59,17 +59,9 @@ where
     /// 本槽位对应的强块。数据的析构、类型擦除信息与 `PreDrop` 都在强块头部，
     /// 弱槽位只负责指出它。
     strong_chunk_: AtomicPtr<StrongChunkBase>,
-    /// 类型擦除的析构入口：由 `StrongChunk::init_*` 写入，`Retain` 收尾时调用。
-    drop_: Option<ChunkDropFn>,
     /// `T` 只在类型上区分，不参与布局。
     _unused_t_: PhantomData<NonNull<StrongChunk<T>>>,
 }
-
-/// 在强块首址上执行原始 `T` / `P` 的析构。
-///
-/// 它由 [`StrongChunk`] 在初始化时写入 [`WeakSlot`]；这样 `Retain` / `Owning` / `Sharing`
-/// 的收尾路径只拿到身份槽位，也能析构 `?Sized` 数据与捕获了环境的 `PreDrop` 对象。
-pub(crate) type ChunkDropFn = unsafe fn(NonNull<StrongChunkBase>);
 
 // `WeakSlotState` 是 `WeakSlot` 的首字段：`#[repr(C)]` 保证其偏移为 0。
 // 这条不变量是 `WeakSlotState::acquire_` 只凭自身地址反推 `WeakSlot` 的前提。
@@ -600,18 +592,6 @@ where
         self.strong_chunk_.store(chunk, Ordering::Release);
     }
 
-    /// 读取类型擦除的析构入口。
-    #[inline]
-    pub(crate) fn drop_fn_(&self) -> Option<ChunkDropFn> {
-        self.drop_
-    }
-
-    /// 记录类型擦除的析构入口。
-    #[inline]
-    pub(crate) fn set_drop_fn_(&mut self, drop: Option<ChunkDropFn>) {
-        self.drop_ = drop;
-    }
-
     // -- 升级路径 -----------------------------------------------------------
 
     /// 尝试把 `Retain` 的持有关系升级为 `Owning`。
@@ -698,7 +678,6 @@ where
             slot.slot_state_.set_next_freed(next);
             slot.slot_state_.init_unallocated();
             slot.set_strong_chunk(ptr::null_mut());
-            slot.drop_ = Option::None;
         }
     }
 
@@ -720,7 +699,6 @@ where
         WeakSlot {
             slot_state_: WeakSlotState::empty_(),
             strong_chunk_: AtomicPtr::new(ptr::null_mut()),
-            drop_: Option::None,
             _unused_t_: PhantomData,
         }
     }
@@ -736,7 +714,6 @@ where
         self.slot_state_.set_next_freed(next);
         self.slot_state_.reset_all();
         self.set_strong_chunk(ptr::null_mut());
-        self.drop_ = Option::None;
     }
 }
 

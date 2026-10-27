@@ -43,13 +43,13 @@ fn weak_chunk_size_is_type_agnostic() {
     assert_eq!(base_align, align_of::<WeakSlot<u128>>());
     assert_eq!(base_align, align_of::<WeakSlot<[u8]>>());
 
-    // 槽位保留状态字、强块指针与类型擦除析构入口：
-    // 8(WeakSlotState) + 8(strong_chunk) + 8(drop fn) = 24 字节。
-    // `PreDrop` 与 `?Sized` 元数据在强块头部，存活链不逐槽位保存。
+    // 新设计的槽位只保留状态字与强块指针：
+    // 8(WeakSlotState) + 8(strong_chunk) = 16 字节。
+    // `PreDrop`、`?Sized` 元数据与擦除 drop 都在强块头部，存活链也不再逐槽位保存。
     #[cfg(target_pointer_width = "64")]
     assert_eq!(
-        base_size, 24,
-        "64 位平台上弱槽位应为 24 字节（状态 + 强块指针 + 析构入口）"
+        base_size, 16,
+        "64 位平台上弱槽位应为 16 字节（状态 + 强块指针）"
     );
 }
 

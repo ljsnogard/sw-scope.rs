@@ -129,20 +129,24 @@ StrongChunkBase | ScopeEntity<A> {
 **仍未接入**：`C::LockAlloc` 尚未用于锁内核；固定锁类型使用 root 的分配器。
 这一点已在 `TrScopeInnerConfig` 的文档中标注 TODO。
 
-## 类型擦除析构（补充）
+## 类型擦除析构（补充，方向已修正）
 
-demo 里 `Retain` / `Owning` / `Sharing` 的最后一步终于不再 `todo!()`：
+最初一版把析构入口放进了 `WeakSlot`，这是错的：`WeakSlot` 只应保存身份与状态，对象信息
+（`?Sized` 元数据、内联 `PreDrop`、擦除 drop）都属于 `StrongChunk`。修正后：
 
-- `WeakSlot` 增加 `drop_: Option<ChunkDropFn>`；`ChunkDropFn` 是
-  `unsafe fn(NonNull<StrongChunkBase>)`。
-- `StrongChunk::init_with`（所有 `init_sized` / `init_unsized` / `init_auto` 都会走到它）
-  在绑定强块时写入 `drop_chunk_::<T, P>`。
-- `StrongChunkBase::drop_data_` 不再查 root 元信息，而是从身份槽位取出这个入口并调用；
-  入口内部把强块首址还原成 `StrongChunk<T, P>`，因此 `?Sized` 元数据与直接存储的
-  `PreDrop` 对象都能按原始 `T` / `P` 析构。
-- 强块里的实体 `ScopeEntity<A>` 也走同一个入口；未来 root 拆除时可以直接对实体调用
-  `drop_data_`。
-- `WeakSlot` 尺寸从 16 字节变为 24 字节（状态 + 强块指针 + 析构入口），对应的尺寸断言已更新。
+- `StrongChunkBase` 增加 `drop_: Option<ChunkDropFn>`；`ChunkDropFn` 是
+  `unsafe fn(NonNull<StrongChunkBase>)`。头部从 16 字节变成 24 字节（三个指针宽度）。
+- `StrongChunk::init_with`（`init_sized` / `init_unsized` / `init_auto` 都经过它）在写头部时
+  同时写入 `drop_chunk_::<T, P>`。
+- `StrongChunkBase::drop_data_` 直接调用头部里的入口；入口把强块首址还原成
+  `StrongChunk<T, P>`，因此 `?Sized` 元数据与直接存储的 `PreDrop` 对象都按原始
+  `T` / `P` 析构，不需要查 root 元信息。
+- `WeakSlot` 恢复为 16 字节（状态字 + 强块指针），不再携带任何析构信息。
+- 强块里的实体 `ScopeEntity<A>` 也由同一个入口析构；`ScopeHeader` 里临时的
+  `drop_` 字段已删除。
+
+代价是强块布局偏移整体后移一个指针；`strong_` 布局测试已同步更新（Sized 数据偏移
+3、带 Predrop 4、`?Sized` 带 meta 4、meta + predrop 6）。
 
 新增测试：
 

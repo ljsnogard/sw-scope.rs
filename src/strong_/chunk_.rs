@@ -56,13 +56,19 @@ const PTR_SIZE: usize = mem::size_of::<usize>();
 /// 强块只保存这个地址，不保存元信息内容；元信息由 RootScope 的 B+ 树统一保管。
 pub(crate) type MetaAddr = *const ();
 
+/// 在强块首址上执行原始 `T` / `P` 的析构。
+///
+/// 它由 [`StrongChunk::init_with`] 写入强块头部；`?Sized` 元数据、内联 `PreDrop` 与这个
+/// 入口一起构成强块自己的对象信息，弱槽位只保存身份与状态。
+pub(crate) type ChunkDropFn = unsafe fn(NonNull<StrongChunkBase>);
+
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- 强块头部
 
 /// 强块与类型无关的公共头部。
 ///
 /// 布局固定为：`refc_`（4 字节） + `pool_order_`（2 字节） + `dat_offset_`（2 字节）
-/// + `weak_chunk_`（一个指针）。在 64 位平台上恰好是两个指针宽度。
+/// + `weak_chunk_`（一个指针） + `drop_`（一个指针）。在 64 位平台上恰好是三个指针宽度。
 #[repr(C)]
 pub(crate) struct StrongChunkBase {
     /// 强引用计数 + 两个结构标志位。
@@ -80,6 +86,9 @@ pub(crate) struct StrongChunkBase {
 
     /// 指回本块的身份弱槽位。
     weak_chunk_: NonNull<WeakSlot<()>>,
+
+    /// 类型擦除的析构入口；由 typed 工厂在初始化时写入。
+    drop_: Option<ChunkDropFn>,
 }
 
 impl StrongChunkBase {
@@ -102,6 +111,7 @@ impl StrongChunkBase {
             pool_order_: 0,
             dat_offset_: 0,
             weak_chunk_: weak_chunk,
+            drop_: Option::None,
         }
     }
 
@@ -199,9 +209,7 @@ impl StrongChunkBase {
     ///
     /// 调用方必须已经认领销毁，且恰好调用一次。
     pub(crate) unsafe fn drop_data_(&self) {
-        // SAFETY: 强块活着时身份槽位必然活着
-        let weak = unsafe { self.weak_chunk().as_ref() };
-        let Option::Some(drop) = weak.drop_fn_() else {
+        let Option::Some(drop) = self.drop_ else {
             return;
         };
         // SAFETY: 由调用方保证认领销毁且恰好一次
@@ -451,6 +459,7 @@ where
                 pool_order_: pool_order,
                 dat_offset_: dat_offset,
                 weak_chunk_: weak_chunk,
+                drop_: Option::Some(drop_chunk_::<T, P>),
             });
             let slot = base_bytes.add(StrongChunkBase::THIS_SIZE);
             if has_meta {
@@ -464,7 +473,6 @@ where
         // SAFETY: weak_chunk 是本块的身份槽位，且此刻独占使用
         let weak = unsafe { &mut *(weak_chunk.as_ptr() as *mut WeakSlot<T>) };
         weak.set_strong_chunk(base as *mut StrongChunkBase);
-        weak.set_drop_fn_(Option::Some(drop_chunk_::<T, P>));
     }
 
     /// `?Sized` 数据的工厂：必须带 RootScope 元信息指针。

@@ -69,7 +69,7 @@ static PRE_DROPPED: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn strong_chunk_layout_is_compact_and_aligned() {
-    assert_eq!(size_of::<StrongChunkBase>(), 16);
+    assert_eq!(size_of::<StrongChunkBase>(), 24);
     assert_eq!(align_of::<StrongChunkBase>(), 8);
     // 视图本身只有头部 + 零尺寸类型标记，不包含数据。
     assert_eq!(size_of::<StrongChunk<u64>>(), size_of::<StrongChunkBase>());
@@ -81,7 +81,7 @@ fn strong_chunk_layout_is_compact_and_aligned() {
 
     let (_, dat_offset) =
         StrongChunk::<u64>::layout_sized(Layout::new::<u64>()).expect("布局不应溢出");
-    assert_eq!(dat_offset, 2, "Sized、无 Predrop 的数据偏移应为两个指针");
+    assert_eq!(dat_offset, 3, "Sized、无 Predrop 的数据偏移应为三个指针");
 }
 
 /// 验证身份双向绑定与默认数据访问。
@@ -119,10 +119,10 @@ fn strong_chunk_binds_identity_both_ways() {
 #[test]
 fn strong_chunk_sized_layout_with_optional_predrop() {
     let (_, off) = StrongChunk::<u64, ()>::layout_sized(Layout::new::<u64>()).unwrap();
-    assert_eq!(off, 2);
+    assert_eq!(off, 3);
 
     let (_, off) = StrongChunk::<u64, Hook>::layout_sized(Layout::new::<u64>()).unwrap();
-    assert_eq!(off, 3);
+    assert_eq!(off, 4);
 
     let mut weak = make_identity_();
     let mut buf = ChunkBuf::<8>::new();
@@ -148,7 +148,7 @@ fn strong_chunk_sized_layout_with_optional_predrop() {
     assert_eq!(chunk.base_().pool_order_(), 9);
     assert_eq!(chunk.predrop_().expect("Predrop 槽").value, 0xCAFE);
     assert_eq!(
-        &buf.0[2] as *const usize,
+        &buf.0[3] as *const usize,
         &chunk.predrop_().unwrap().value as *const u64 as *const usize
     );
     assert_eq!(*chunk.try_get_data().unwrap(), 0xDEAD_BEEF);
@@ -164,7 +164,7 @@ fn strong_chunk_unsized_layout_has_meta_pointer() {
 
     let (_, off) =
         StrongChunk::<[u64], ()>::layout_unsized(Layout::for_value(&values[..])).unwrap();
-    assert_eq!(off, 3, "base + meta 指针 = 3 个指针");
+    assert_eq!(off, 4, "base（3 指针） + meta 指针 = 4 个指针");
 
     let mut weak = make_identity_();
     let mut buf = ChunkBuf::<8>::new();
@@ -201,7 +201,10 @@ fn strong_chunk_meta_and_predrop_are_laid_out_before_data() {
     let meta_addr = &meta_word as *const *const () as MetaAddr;
     let (_, off) = StrongChunk::<[u128], Hook>::layout_unsized(Layout::for_value(&[value][..]))
         .expect("布局不应溢出");
-    assert_eq!(off, 4, "base + meta + predrop = 4 个指针");
+    assert_eq!(
+        off, 6,
+        "base（3 指针） + meta + predrop，再按 u128 对齐 = 6 个指针"
+    );
 
     let mut weak = make_identity_();
     let mut buf = ChunkBuf::<8>::new();
@@ -221,9 +224,9 @@ fn strong_chunk_meta_and_predrop_are_laid_out_before_data() {
     // SAFETY: 数据区已对齐、尚未初始化
     unsafe { ptr::write(chunk.data_ptr() as *mut u128, value) };
 
-    assert_eq!(buf.0[2], meta_addr as usize);
+    assert_eq!(buf.0[3], meta_addr as usize);
     assert_eq!(
-        &buf.0[3] as *const usize,
+        &buf.0[4] as *const usize,
         &chunk.predrop_().unwrap().value as *const u64 as *const usize
     );
     assert_eq!(chunk.predrop_().unwrap().value, 0xBEEF);
