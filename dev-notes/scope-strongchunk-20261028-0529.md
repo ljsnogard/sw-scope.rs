@@ -108,3 +108,23 @@ StrongChunkBase | ScopeEntity<A> {
 如果 `Clone` + 引用计数意味着域会频繁创建 / 销毁，建议在这个分支上把实体池换成
 **可回收的变长 slab**（或保留 B+ 树的 data arena 作为实体池），而不是继续用 bump-only
 的 StrongPool；否则回收语义无法落地。
+
+## new_with_cfg 创建路径（补充）
+
+本轮把 `Scope::new_with_cfg<C>` 接到“实体存放在 root 强池”的路径上：
+
+- `TrScopeInnerConfig` 增加 `type PoolAlloc: Allocator + Default + Send + Sync + 'static`；
+  `DefaultConfig<A>` 的 `PoolAlloc = A`，因此配置类型真正决定每域分配器类型。
+- `Scope::new_with_cfg<C>()` = `new_with_alloc::<C::PoolAlloc, C>()`：
+  - `C::PageSize` 决定该域开新弱池 / 强池的页大小；
+  - `C::PoolAlloc::default()` 作为每域分配器的值，内联在 `ScopeEntity<A>` 尾部；
+  - 实体本身仍由 root 的 `entity_pool_` 以 `StrongChunk` 分配。
+- `Scope::try_init_root<TyCfg>()` 现在用 `TyCfg::PageSize` 和 `TyCfg::PoolAlloc::default()`
+  初始化默认 root 的实体池（已发布 root 不会被替换）。
+- `Scope::new_with_alloc` / `new_with_alloc_value` 保留，作为显式指定分配器类型 / 值的入口。
+
+新增测试 `new_with_cfg_creates_scopes_across_root_entity_pools`：连续创建 300 个域，
+验证 root 的实体强池会按需开新池、句柄地址互不相同。
+
+**仍未接入**：`C::LockAlloc` 尚未用于锁内核；固定锁类型使用 root 的分配器。
+这一点已在 `TrScopeInnerConfig` 的文档中标注 TODO。

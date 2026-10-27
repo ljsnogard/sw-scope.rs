@@ -56,30 +56,33 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// 尝试以某种配置来初始化根域。
+    /// 用给定配置的页大小初始化默认 root。
     ///
-    /// 当前实验分支只保证默认 root 初始化；`TyCfg` 的接入留给后续。
-    pub fn try_init_root<TyCfg>() -> bool {
-        let _ = core::marker::PhantomData::<TyCfg>;
-        let _ = Self::default_root_();
+    /// 后到的并发调用会拿到先到者发布的 root；返回 `true` 表示 root 已可用。
+    pub fn try_init_root<TyCfg>() -> bool
+    where
+        TyCfg: TrScopeInnerConfig,
+    {
+        let page_size = <TyCfg::PageSize as crate::page_size::TrPageSizeSelect>::PAGE_SIZE;
+        // root 自己的实体池使用配置的分配器类型；已发布的 root 不会被替换。
+        let root_alloc = <TyCfg::PoolAlloc as Default>::default();
+        let _ = RootScope::try_init_default_root_scope_(&DEFAULT_ROOT_SCOPE, page_size, root_alloc);
         true
     }
 
     /// 从默认的 RootScope 中创建一个子 scope。
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self::new_with_alloc::<
-            alloc::alloc::Global,
-            scope_inner_::DefaultConfig<alloc::alloc::Global>,
-        >()
+        Self::new_with_cfg::<scope_inner_::DefaultConfig<alloc::alloc::Global>>()
     }
 
-    /// 用默认的 `Global` 分配器，按给定配置创建域句柄。
+    /// 按给定配置创建域句柄：`C::PoolAlloc` 决定每域分配器类型，
+    /// `C::PageSize` 决定开新池的页大小。
     pub fn new_with_cfg<C>() -> Self
     where
         C: TrScopeInnerConfig,
     {
-        Self::new_with_alloc::<alloc::alloc::Global, C>()
+        Self::new_with_alloc::<C::PoolAlloc, C>()
     }
 
     /// 按给定配置创建域句柄，池分配器使用 `A::default()`。
@@ -1010,12 +1013,14 @@ mod tests_ {
     use crate::{Scope, scope_inner_};
 
     static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static TAG_ALLOCS: AtomicUsize = AtomicUsize::new(0);
     static GLOBAL: Global = Global;
 
     /// 转发给 `Global` 并统计分配次数，用来证明 per-Scope 分配器确实被使用。
     struct CountingAlloc;
 
     /// 带状态的分配器，用来制造与 `CountingAlloc` / `Global` 不同尺寸的 `ScopeEntity`。
+    #[derive(Default)]
     struct TaggedAlloc {
         _tag: usize,
     }
@@ -1023,6 +1028,7 @@ mod tests_ {
     // SAFETY: 只把分配 / 释放原样转交给 `Global`
     unsafe impl Allocator for TaggedAlloc {
         fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            TAG_ALLOCS.fetch_add(1, Ordering::SeqCst);
             GLOBAL.allocate(layout)
         }
 
@@ -1136,7 +1142,28 @@ mod tests_ {
         let second = plain.put_async(2u32).await.expect("Global 域放入应当成功");
         assert_eq!(*first.try_owning().expect("第一个值应当可独占"), 1);
         assert_eq!(*second.try_owning().expect("第二个值应当可独占"), 2);
+        assert!(
+            TAG_ALLOCS.load(Ordering::SeqCst) > 0,
+            "new_with_cfg 应当使用 C::PoolAlloc"
+        );
         mem::forget(first);
         mem::forget(second);
+    }
+
+    /// 测试 `new_with_cfg` 连续创建大量域时，root 的实体强池会按需开新池。
+    /// Test that repeated `new_with_cfg` calls grow the root's entity strong pools.
+    ///
+    /// - 手段：用默认配置连续创建 300 个域句柄。
+    ///   / How: create 300 scope handles with the default config.
+    /// - 判断：所有句柄都创建成功且互不相同，说明实体 chunk 能跨多个 root 强池分配。
+    ///   / What: all handles are created and distinct, showing entity chunks span multiple
+    ///   root strong pools.
+    #[test]
+    fn new_with_cfg_creates_scopes_across_root_entity_pools() {
+        let scopes: std::vec::Vec<Scope> = (0..300)
+            .map(|_| Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>())
+            .collect();
+        assert_eq!(scopes.len(), 300);
+        assert!(scopes[0] != scopes[299], "实体地址必须互不相同");
     }
 }
