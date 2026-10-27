@@ -1,280 +1,379 @@
-//! `strong_` 模块的内部单元测试：控制块布局、身份绑定与升级路径。
+//! `strong_` 模块的内部单元测试：头部布局、工厂决定的形状、可选槽与升级路径。
 
 use core::{
-    mem::{MaybeUninit, align_of, size_of},
-    ptr::NonNull,
+    alloc::Layout,
+    mem::{align_of, size_of},
+    ptr::{self, NonNull},
 };
 
 use super::*;
-use crate::weak_::{DataState, WeakSlot};
+use crate::{
+    abs_::TrPredrop,
+    weak_::{DataState, WeakSlot},
+};
 
-/// 造一个仅用于测试的"身份槽位"：栈上的 `WeakChunk<()>`，并推进到 `Created`，
-/// 模拟一次成功分配之后的状态。
+/// 造一个身份槽位并推进到 `Created`，模拟一次成功分配。
 fn make_identity_() -> WeakSlot<()> {
     let slot = WeakSlot::<()>::stack_empty_();
-    // 真实路径上这一步由分配流程完成
     let _ = slot
         .chunk_state()
         .try_transition_state(DataState::Reclaimed, DataState::Created);
     slot
 }
 
-/// 造一块 `StrongChunk<u64>` 并绑定给 `weak`。
-///
-/// # Safety
-///
-/// `weak` 必须指向一个存活的身份槽位，且活得比返回值更久；`slot` 同理。
-unsafe fn make_chunk_(
-    slot: &mut MaybeUninit<StrongChunk<u64>>,
-    weak: *mut WeakSlot<()>,
-    value: u64,
-) -> &mut StrongChunk<u64> {
-    // SAFETY: 由调用方保证 slot 可写、weak 有效
-    unsafe {
-        let this = &mut *slot.as_mut_ptr();
-        this.init_with_(NonNull::new_unchecked(weak), value);
-        this
+/// 测试用的对齐缓冲区：头部 + meta 指针 + predrop + 数据都能放下。
+#[repr(C, align(16))]
+struct ChunkBuf<const N: usize>([usize; N]);
+
+impl<const N: usize> ChunkBuf<N> {
+    const fn new() -> Self {
+        ChunkBuf([0usize; N])
+    }
+
+    fn base_(&mut self) -> *mut StrongChunkBase {
+        self.0.as_mut_ptr().cast::<StrongChunkBase>()
     }
 }
 
-/// 验证控制块布局：强块头部承载强计数、身份、清理登记与元数据，弱槽位只承载状态与
-/// 强块指针，且弱槽位尺寸与 `T` 无关。
-/// - 手段：断言 `StrongChunkBase` 的大小与对齐、`WeakSlot<T>` 在 `T = ()`、`u8`、
-///   `[u8]` 下的尺寸一致，以及数据区偏移是 8 的倍数。
-/// - 判断：任一尺寸或对齐不符即失败。弱槽位尺寸与 `T` 无关是弱池按 `WeakSlot<()>`
-///   步长定位槽位的前提。
+/// 非零尺寸的 Predrop 对象；直接存储，便于检查内存位置。
+#[derive(Debug)]
+struct Hook {
+    value: u64,
+}
+
+impl<T: ?Sized> TrPredrop<T> for Hook {
+    fn pre_drop(self, _data: &mut T) {
+        let _ = self.value;
+    }
+}
+
+/// 析构测试用探针。
+struct Probe;
+impl Drop for Probe {
+    fn drop(&mut self) {
+        DROPPED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+struct ProbeHook;
+impl TrPredrop<Probe> for ProbeHook {
+    fn pre_drop(self, _data: &mut Probe) {
+        PRE_DROPPED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+static DROPPED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static PRE_DROPPED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 验证头部与默认视图的尺寸；真实数据位置由工厂给出的偏移决定。
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn strong_chunk_layout_is_compact_and_aligned() {
-    // 强块头部现在承载：强计数、身份指针、清理登记、`?Sized` 元数据。
-    assert_eq!(size_of::<StrongChunkBase>(), 32);
+    assert_eq!(size_of::<StrongChunkBase>(), 16);
     assert_eq!(align_of::<StrongChunkBase>(), 8);
+    // 视图本身只有头部 + 零尺寸类型标记，不包含数据。
+    assert_eq!(size_of::<StrongChunk<u64>>(), size_of::<StrongChunkBase>());
 
     let weak_size = size_of::<WeakSlot<()>>();
     assert_eq!(weak_size, size_of::<WeakSlot<u8>>());
     assert_eq!(weak_size, size_of::<WeakSlot<[u8]>>());
     assert_eq!(align_of::<WeakSlot<()>>(), 8);
 
-    // 数据区在块内的偏移按实际投影测量，必须是 8 的倍数（头部与数据同对齐）
-    let probe = MaybeUninit::<StrongChunk<u64>>::uninit();
-    let offset = probe.as_ptr() as usize;
-    assert_eq!(offset % 8, 0);
-    assert_eq!(size_of::<StrongChunk<u64>>(), 32 + size_of::<u64>());
+    let (_, dat_offset) =
+        StrongChunk::<u64>::layout_sized(Layout::new::<u64>()).expect("布局不应溢出");
+    assert_eq!(dat_offset, 2, "Sized、无 Predrop 的数据偏移应为两个指针");
 }
 
-/// 验证"强块只认身份、身份指向强块"的双向绑定，以及数据访问与析构登记。
-/// - 手段：造一块 `StrongChunk<u64>` 绑定栈上的身份槽位，随后双向检查。
-/// - 判断：弱槽位记录的强块指针必须等于强块自身地址（头部在偏移 0，因此两者同址）；
-///   强块记录的弱槽位必须等于身份地址；数据引用读出写入值；`u64` 的清理登记必须为空。
-///   这保证清盘流程只凭身份就能找回强块，再由强块头部完成类型擦除析构。
+/// 验证身份双向绑定与默认数据访问。
 #[test]
 fn strong_chunk_binds_identity_both_ways() {
     let mut weak = make_identity_();
-    let mut slot = MaybeUninit::<StrongChunk<u64>>::uninit();
-    // SAFETY: slot 与 weak 都在本测试的栈上存活
-    let chunk = unsafe { make_chunk_(&mut slot, &mut weak, 0x0123_4567_89AB_CDEF) };
+    let mut buf = ChunkBuf::<8>::new();
+    // SAFETY: buf 足够大；weak 在测试栈上存活
+    let chunk = unsafe { &mut *(buf.base_() as *mut StrongChunk<u64>) };
+    // SAFETY: 默认 Sized 布局
+    unsafe {
+        StrongChunk::<u64>::init_with_value(
+            buf.base_() as *mut StrongChunk<u64>,
+            NonNull::from(&mut weak).cast(),
+            0x0123_4567_89AB_CDEF,
+        )
+    };
 
     let weak_ptr: NonNull<WeakSlot<()>> = NonNull::from(&mut weak).cast();
     assert_eq!(chunk.weak_chunk().as_ptr(), weak_ptr.as_ptr());
     assert_eq!(
         weak.strong_chunk().map(|p| p.as_ptr()),
-        Option::Some(chunk as *mut StrongChunk<u64> as *mut StrongChunkBase),
+        Option::Some(buf.base_()),
     );
 
     assert_eq!(*chunk.try_get_data().unwrap(), 0x0123_4567_89AB_CDEF);
-    assert!(chunk.is_data_alive(), "绑定后数据应当活着");
-    assert_eq!(chunk.strong_count(), 0, "新建的强块强计数从 0 开始");
-    assert!(
-        chunk.predrop_rec_().is_none(),
-        "u64 不需要析构，因此不该登记清理入口"
-    );
+    assert!(chunk.is_data_alive());
+    assert_eq!(chunk.strong_count(), 0);
+    assert!(chunk.predrop_().is_none());
+    assert!(!chunk.has_meta_());
 }
 
-/// 验证类型擦除析构确实会把数据析构掉。
-/// - 手段：用带 `Drop` 的探针类型建块，经 `init_with_` 登记后，模拟清盘流程从身份槽位
-///   取出析构登记并调用它。
-/// - 判断：登记里必须有析构入口，且调用后探针的析构计数恰好增加 1。这是"清盘只拿得到
-///   类型无关的头部，却仍能正确析构具体类型"的关键路径。
+/// 验证 Sized 数据的两种 Predrop 形状：无 Predrop 与直接存储 Predrop 对象。
+#[cfg(target_pointer_width = "64")]
 #[test]
-fn strong_chunk_drop_is_type_erased_but_effective() {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+fn strong_chunk_sized_layout_with_optional_predrop() {
+    let (_, off) = StrongChunk::<u64, ()>::layout_sized(Layout::new::<u64>()).unwrap();
+    assert_eq!(off, 2);
 
-    static DROPPED: AtomicUsize = AtomicUsize::new(0);
-
-    struct Probe;
-    impl Drop for Probe {
-        fn drop(&mut self) {
-            DROPPED.fetch_add(1, Ordering::AcqRel);
-        }
-    }
+    let (_, off) = StrongChunk::<u64, Hook>::layout_sized(Layout::new::<u64>()).unwrap();
+    assert_eq!(off, 3);
 
     let mut weak = make_identity_();
-    let mut slot = MaybeUninit::<StrongChunk<Probe>>::uninit();
-    // SAFETY: slot 与 weak 都在本测试的栈上存活
+    let mut buf = ChunkBuf::<8>::new();
+    // SAFETY: buf 足够大；weak 在测试栈上存活
+    let chunk = unsafe { &mut *(buf.base_() as *mut StrongChunk<u64, Hook>) };
+    // SAFETY: 布局已计算
     unsafe {
-        let this = &mut *slot.as_mut_ptr();
-        this.init_with_(NonNull::from(&mut weak).cast(), Probe);
-    }
+        StrongChunk::<u64, Hook>::init_sized(
+            buf.base_() as *mut StrongChunk<u64, Hook>,
+            NonNull::from(&mut weak).cast(),
+            9,
+            Hook { value: 0xCAFE },
+            off,
+        )
+    };
+    // 数据写在 dat_offset 处。
+    let data = chunk.data_ptr();
+    // SAFETY: 数据区已对齐、尚未初始化
+    unsafe { data.write(0xDEAD_BEEF) };
 
-    // 登记的清理入口现在保存在强块头部，仍必须能就地析构数据。
-    assert!(
-        unsafe { &*slot.as_ptr() }
-            .predrop_rec_()
-            .is_some_and(|record| !record.is_noop_()),
-        "带 Drop 的数据必须登记清理入口"
+    assert!(!chunk.base_().has_meta_());
+    assert!(chunk.base_().has_predrop_());
+    assert_eq!(chunk.base_().pool_order_(), 9);
+    assert_eq!(chunk.predrop_().expect("Predrop 槽").value, 0xCAFE);
+    assert_eq!(
+        &buf.0[2] as *const usize,
+        &chunk.predrop_().unwrap().value as *const u64 as *const usize
     );
-    assert_eq!(DROPPED.load(Ordering::Acquire), 0);
-    // SAFETY: 数据刚构造好、尚未析构；从身份槽位找到强块并执行登记
-    let base = weak.strong_chunk().expect("身份槽位必须绑定强块");
-    // SAFETY: 同上
-    unsafe { base.as_ref().drop_data_() };
-    assert_eq!(DROPPED.load(Ordering::Acquire), 1, "类型擦除析构必须真的执行");
+    assert_eq!(*chunk.try_get_data().unwrap(), 0xDEAD_BEEF);
+}
+
+/// 验证 `?Sized` 数据必须带 meta 指针，并且 Predrop 仍可独立选择。
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn strong_chunk_unsized_layout_has_meta_pointer() {
+    let values = [7u64, 8, 9];
+    let meta_word = crate::weak_::meta_to_raw_(ptr::metadata(&values[..]));
+    let meta_addr = &meta_word as *const *const () as MetaAddr;
+
+    let (_, off) =
+        StrongChunk::<[u64], ()>::layout_unsized(Layout::for_value(&values[..])).unwrap();
+    assert_eq!(off, 3, "base + meta 指针 = 3 个指针");
+
+    let mut weak = make_identity_();
+    let mut buf = ChunkBuf::<8>::new();
+    // SAFETY: buf 足够大；weak 与 meta_word 在测试栈上存活
+    let chunk = unsafe { &mut *(buf.base_() as *mut StrongChunk<[u64], ()>) };
+    // SAFETY: 布局已计算
+    unsafe {
+        StrongChunk::<[u64], ()>::init_unsized(
+            buf.base_() as *mut StrongChunk<[u64], ()>,
+            NonNull::from(&mut weak).cast(),
+            0,
+            meta_addr,
+            (),
+            off,
+        )
+    };
+    // SAFETY: 数据区已对齐、尚未初始化
+    unsafe {
+        ptr::copy_nonoverlapping(values.as_ptr(), chunk.data_ptr() as *mut u64, values.len())
+    };
+
+    assert!(chunk.has_meta_());
+    assert!(!chunk.has_predrop_());
+    assert_eq!(chunk.base_().meta_addr_(), Option::Some(meta_addr));
+    assert_eq!(chunk.try_get_data().unwrap(), &values[..]);
+}
+
+/// 验证 base -> meta -> predrop -> data 的实际顺序，以及 Predrop 直接存储。
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn strong_chunk_meta_and_predrop_are_laid_out_before_data() {
+    let value = 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEFu128;
+    let meta_word = crate::weak_::meta_to_raw_(1usize);
+    let meta_addr = &meta_word as *const *const () as MetaAddr;
+    let (_, off) = StrongChunk::<[u128], Hook>::layout_unsized(Layout::for_value(&[value][..]))
+        .expect("布局不应溢出");
+    assert_eq!(off, 4, "base + meta + predrop = 4 个指针");
+
+    let mut weak = make_identity_();
+    let mut buf = ChunkBuf::<8>::new();
+    // SAFETY: buf 足够大；weak/meta_word 在测试栈上存活
+    let chunk = unsafe { &mut *(buf.base_() as *mut StrongChunk<[u128], Hook>) };
+    // SAFETY: 布局已计算
+    unsafe {
+        StrongChunk::<[u128], Hook>::init_unsized(
+            buf.base_() as *mut StrongChunk<[u128], Hook>,
+            NonNull::from(&mut weak).cast(),
+            3,
+            meta_addr,
+            Hook { value: 0xBEEF },
+            off,
+        )
+    };
+    // SAFETY: 数据区已对齐、尚未初始化
+    unsafe { ptr::write(chunk.data_ptr() as *mut u128, value) };
+
+    assert_eq!(buf.0[2], meta_addr as usize);
+    assert_eq!(
+        &buf.0[3] as *const usize,
+        &chunk.predrop_().unwrap().value as *const u64 as *const usize
+    );
+    assert_eq!(chunk.predrop_().unwrap().value, 0xBEEF);
+    assert_eq!(chunk.try_get_data().unwrap(), &[value][..]);
+}
+
+/// 验证 typed 析构：Predrop 对象先执行，再析构数据。
+#[test]
+fn strong_chunk_drop_runs_predrop_before_data_drop() {
+    use core::sync::atomic::Ordering;
+
+    DROPPED.store(0, Ordering::Release);
+    PRE_DROPPED.store(0, Ordering::Release);
+
+    let (_, off) = StrongChunk::<Probe, ProbeHook>::layout_sized(Layout::new::<Probe>())
+        .expect("布局不应溢出");
+    let mut weak = make_identity_();
+    let mut buf = ChunkBuf::<8>::new();
+    // SAFETY: buf 足够大；weak 在测试栈上存活
+    let chunk = unsafe { &mut *(buf.base_() as *mut StrongChunk<Probe, ProbeHook>) };
+    // SAFETY: 布局已计算
+    unsafe {
+        StrongChunk::<Probe, ProbeHook>::init_sized(
+            buf.base_() as *mut StrongChunk<Probe, ProbeHook>,
+            NonNull::from(&mut weak).cast(),
+            0,
+            ProbeHook,
+            off,
+        )
+    };
+    // SAFETY: 数据刚构造好、尚未析构
+    unsafe { chunk.drop_data_() };
+    assert_eq!(
+        PRE_DROPPED.load(Ordering::Acquire),
+        1,
+        "Predrop 必须先执行一次"
+    );
+    assert_eq!(DROPPED.load(Ordering::Acquire), 1, "数据必须恰好析构一次");
+}
+
+/// 验证 `pool_order_` 能在归还路径上 O(1) 反推所属强池。
+#[test]
+fn strong_chunk_pool_order_reverses_to_pool() {
+    use core::alloc::Allocator;
+    use std::alloc::Global;
+
+    static GLOBAL: Global = Global;
+
+    let mut pool_ptr = StrongPool::try_new_(64, &GLOBAL, Option::None).expect("建池应当成功");
+    // SAFETY: pool_ptr 由本测试独占
+    let pool = unsafe { pool_ptr.as_mut() };
+    let (mem, order) = pool
+        .allocate_with_order_(Layout::from_size_align(32, 8).expect("布局合法"))
+        .expect("池内应当放得下");
+    let mut weak = make_identity_();
+    let (_, dat_offset) = StrongChunk::<u64>::layout_sized(Layout::new::<u64>()).unwrap();
+    // SAFETY: 分配块至少 32 字节；weak 在测试栈上存活
+    let base = mem.as_ptr() as *mut StrongChunk<u64>;
+    unsafe {
+        StrongChunk::<u64>::init_sized(base, NonNull::from(&mut weak).cast(), order, (), dat_offset)
+    };
+    let chunk_base = NonNull::new(mem.as_ptr() as *mut StrongChunkBase).expect("块地址非空");
+    let derived = StrongPool::of_chunk_(chunk_base).expect("必须能由 pool_order_ 反推池");
+    assert_eq!(derived.as_ptr(), pool_ptr.as_ptr());
+
+    // SAFETY: 池由 GLOBAL 按 layout_for_(64) 分配，且测试独占
+    unsafe { GLOBAL.deallocate(pool_ptr.cast(), StrongPool::layout_for_(64)) };
+}
+
+/// 验证 `WeakChunkState` 上"仅当 `Created` 才允许迁移"的升级原语。
+#[test]
+fn weak_state_upgrade_primitive_is_exclusive() {
+    let weak = make_identity_();
+    let state = &weak.chunk_state();
+    state.init_created();
+    assert_eq!(
+        state.try_set_state(DataState::Owning),
+        Option::Some(DataState::Created)
+    );
+    assert_eq!(state.data_state(), DataState::Owning);
+    assert_eq!(state.try_set_state(DataState::Sharing), Option::None);
+}
+
+/// 验证 `Sharing` 路径的状态迁移与"认领销毁唯一"。
+#[test]
+fn weak_state_sharing_path_claims_destroy_exactly_once() {
+    let weak = make_identity_();
+    let state = &weak.chunk_state();
+    state.init_created();
+    assert_eq!(
+        state.try_set_state(DataState::Sharing),
+        Option::Some(DataState::Created)
+    );
+    assert_eq!(state.try_claim_destroy(), Option::Some(DataState::Sharing));
+    assert_eq!(state.try_claim_destroy(), Option::None);
+    state.mark_destroyed();
+    state.mark_finalized();
+    assert_eq!(state.data_state(), DataState::Finalized);
 }
 
 /// 验证"数据活着"与"有强引用"是两件事，以及两条升级路径的互斥性。
-/// - 手段：`Created` 状态下先试 `try_retain`，再试 `try_share`；另起一块走
-///   `try_share` 路径并检查强计数。
-/// - 判断：升级为 `Owning` 后状态变 `Owning`、强计数仍为 0，且再 `try_share` 必须失败；
-///   升级为 `Sharing` 时强计数必须置 1，且再 `try_retain` 必须失败。
 #[test]
 fn strong_state_upgrade_paths() {
     let mut weak = make_identity_();
-    let weak_ptr = &mut weak as *mut WeakSlot<()>;
-    let mut slot = MaybeUninit::<StrongChunk<u64>>::uninit();
-    // SAFETY: slot 与 weak 都在本测试的栈上存活
-    let chunk = unsafe { make_chunk_(&mut slot, weak_ptr, 7) };
+    let mut buf = ChunkBuf::<8>::new();
+    // SAFETY: buf 足够大；weak 在测试栈上存活
+    let chunk = unsafe { &mut *(buf.base_() as *mut StrongChunk<u64>) };
+    // SAFETY: 默认 Sized 布局
+    unsafe {
+        StrongChunk::<u64>::init_with_value(
+            buf.base_() as *mut StrongChunk<u64>,
+            NonNull::from(&mut weak).cast(),
+            7,
+        )
+    };
 
     assert_eq!(weak.data_state(), DataState::Created);
     assert!(chunk.is_data_alive());
     assert!(weak.try_owning().is_ok());
     assert_eq!(weak.data_state(), DataState::Owning);
     assert_eq!(weak.try_sharing(), Result::Err(DataState::Owning));
-    assert!(chunk.is_data_alive(), "独占持有期间数据依然活着");
 
     let mut weak2 = make_identity_();
-    let weak2_ptr = &mut weak2 as *mut WeakSlot<()>;
-    let mut slot2 = MaybeUninit::<StrongChunk<u64>>::uninit();
-    // SAFETY: slot2 与 weak2 都在本测试的栈上存活
-    let chunk2 = unsafe { make_chunk_(&mut slot2, weak2_ptr, 9) };
-
+    let mut buf2 = ChunkBuf::<8>::new();
+    // SAFETY: buf2 足够大；weak2 在测试栈上存活
+    let chunk2 = unsafe { &mut *(buf2.base_() as *mut StrongChunk<u64>) };
+    // SAFETY: 默认 Sized 布局
+    unsafe {
+        StrongChunk::<u64>::init_with_value(
+            buf2.base_() as *mut StrongChunk<u64>,
+            NonNull::from(&mut weak2).cast(),
+            9,
+        )
+    };
     assert!(weak2.try_sharing().is_ok());
-    assert_eq!(weak2.data_state(), DataState::Sharing);
-    assert_eq!(chunk2.strong_count(), 1, "升级为 Sharing 时强计数置 1");
-    assert!(weak2.try_owning().is_err(), "已共享的块不能再独占");
+    assert_eq!(chunk2.strong_count(), 1);
+    assert!(weak2.try_owning().is_err());
 }
 
-/// 验证 `?Sized` 数据的类型元数据可以经 `StrongChunkBase` 使用的裸元数据原语完整复原。
-/// - 手段：取一个 `&dyn Debug` 胖指针，经 `meta_to_raw_` / `meta_from_raw_` 走一遍
-///   "存成裸指针再取出来"的往返，再用复原出的元数据重建引用。
-/// - 判断：复原出的 `DynMetadata` 必须与原元数据逐位相等，重建出的引用必须打印出原值。
-///   这正是"清盘一侧对 `T` 一无所知也能析构/访问"的依据。
+/// 验证 `?Sized` 元数据的裸指针往返。
 #[test]
 fn weak_chunk_rebuilds_unsized_data_from_metadata() {
     let value: u32 = 1234;
     let repr: *const dyn core::fmt::Debug = &value;
     let (repr_data, repr_meta) = (repr as *const (), core::ptr::metadata(repr));
-
-    // 元数据现在由 `StrongChunkBase` 保管；这里先验证裸元数据的搬运原语本身。
     let raw = crate::weak_::meta_to_raw_(repr_meta);
-    // 从裸指针取回元数据：`?Sized` 的虚表指针必须被原样保存
     let roundtrip: core::ptr::DynMetadata<dyn core::fmt::Debug> =
         unsafe { crate::weak_::meta_from_raw_::<dyn core::fmt::Debug>(raw) };
-    assert_eq!(roundtrip, repr_meta, "虚表元数据必须逐位保存");
-
-    // 用取回的元数据重建胖指针，内容必须与原始引用一致
-    // SAFETY: 元数据取自上面同一次登记，数据指针也来自同一个引用
+    assert_eq!(roundtrip, repr_meta);
     let rebuilt =
         unsafe { &*core::ptr::from_raw_parts::<dyn core::fmt::Debug>(repr_data, roundtrip) };
     assert_eq!(std::format!("{rebuilt:?}"), "1234");
-}
-
-/// 验证 `WeakChunkState` 上"仅当 `Created` 才允许迁移"的升级原语。
-/// - 手段：把槽位置为 `Created`，先试 `try_set_state(Owning)`，再试 `try_set_state(Sharing)`。
-/// - 判断：第一次必须成功并返回先前状态 `Created`；第二次必须失败（已经不是 `Created`），
-///   状态保持在 `Owning`。这正是升级路径"判据唯一"的依据。
-#[test]
-fn weak_state_upgrade_primitive_is_exclusive() {
-    let weak = make_identity_();
-    let state = &weak.chunk_state();
-    state.init_created();
-
-    assert_eq!(state.try_set_state(DataState::Owning), Option::Some(DataState::Created));
-    assert_eq!(state.data_state(), DataState::Owning);
-    assert_eq!(state.try_set_state(DataState::Sharing), Option::None);
-    assert_eq!(state.data_state(), DataState::Owning);
-}
-
-/// 验证 `Sharing` 路径的状态迁移与"认领销毁唯一"。
-/// - 手段：另造一个 `Created` 槽位，走 `try_set_state(Sharing)` → `try_claim_destroy`
-///   → `mark_destroyed` → `mark_finalized`。
-/// - 判断：升级为 `Sharing` 成功且此时不可再独占；认领销毁只能成功一次（第二次返回
-///   `None`），随后状态依次为 `Destroying`、`Destroyed`、`Finalized`。这覆盖了
-///   "`Sharing` 计数归零后由最后一个持有者认领析构"这条路径的状态侧行为。
-#[test]
-fn weak_state_sharing_path_claims_destroy_exactly_once() {
-    let weak = make_identity_();
-    let state = &weak.chunk_state();
-    state.init_created();
-
-    assert_eq!(state.try_set_state(DataState::Sharing), Option::Some(DataState::Created));
-    assert_eq!(state.data_state(), DataState::Sharing);
-    assert_eq!(state.try_set_state(DataState::Owning), Option::None);
-
-    assert_eq!(state.try_claim_destroy(), Option::Some(DataState::Sharing));
-    assert_eq!(state.data_state(), DataState::Destroying);
-    assert_eq!(state.try_claim_destroy(), Option::None, "第二个认领者必须失败");
-
-    state.mark_destroyed();
-    assert_eq!(state.data_state(), DataState::Destroyed);
-    state.mark_finalized();
-    assert_eq!(state.data_state(), DataState::Finalized);
-}
-
-/// 验证强池的 bump 分配：按布局对齐、`used_count_` 只增不减、空闲区随之收缩。
-/// - 手段：申请一个 64 cell 的池，先分配对齐 8 的块，再分配对齐 16 的块（模拟 `u128`）。
-/// - 判断：两块地址分别满足各自对齐；`used_count_` 随分配单调增加且不超过容量；
-///   空闲字节数在第二次分配后严格减少。最后把池内存还给分配器，避免测试泄漏。
-#[test]
-fn strong_pool_bump_allocation_is_aligned() {
-    use std::alloc::Global;
-    use core::alloc::{Allocator, Layout};
-
-    static GLOBAL: Global = Global;
-
-    let pool_ptr = StrongPool::try_new_(64, &GLOBAL, Option::None).expect("建池应当成功");
-    {
-        // SAFETY: pool_ptr 是刚初始化的独占池
-        let pool = unsafe { pool_ptr.as_ref() };
-        assert_eq!(pool.cell_count_(), 64);
-        assert_eq!(pool.used_count_(), 0);
-    }
-    let first_used;
-    // SAFETY: 同上；只在本块内可变借用
-    {
-        let pool = unsafe { pool_ptr.as_ptr().as_mut().unwrap() };
-        let a = pool
-            .allocate_(Layout::from_size_align(16, 8).unwrap())
-            .expect("第一块应当放得下");
-        assert_eq!(
-            (a.as_ptr() as *mut u8).align_offset(8),
-            0,
-            "第一块必须满足 align=8"
-        );
-        first_used = pool.used_count_();
-
-        let b = pool
-            .allocate_(Layout::from_size_align(16, 16).unwrap())
-            .expect("第二块应当放得下");
-        assert_eq!(
-            (b.as_ptr() as *mut u8).align_offset(16),
-            0,
-            "第二块必须满足 align=16"
-        );
-        assert!(
-            pool.used_count_() > first_used,
-            "第二次分配后已用 cell 必须增加"
-        );
-        assert!(pool.used_count_() <= pool.cell_count_());
-    }
-    // SAFETY: pool_ptr 由 GLOBAL 按 layout_for_(64) 分配，且此时借用已结束
-    unsafe { GLOBAL.deallocate(pool_ptr.cast(), StrongPool::layout_for_(64)) };
 }

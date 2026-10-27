@@ -17,6 +17,7 @@
 //! ```text
 //! RootScope {
 //!     scopes_:         BPlusTree<ScopeKey, NonNull<ScopeInner>>, // 管理所有域
+//!     metas_:          BPlusTree<usize, *const ()>,             // 强块元信息字（按地址）
 //!     next_scope_key_: ScopeKey,
 //!     weak_pools_:     Option<NonNull<WeakPool>>,                // 树共享弱池链
 //!     pre_drop_registry_: PreDropRegistry,
@@ -37,9 +38,7 @@ use core::{
 
 use bplustree_cmp::{BPlusTree, OrdComparer};
 
-#[cfg(feature = "core-alloc")]
-use crate::strong_::PreDropRegistry;
-use crate::weak_::WeakPool;
+use crate::strong_::MetaAddr;
 
 use super::{PoolIndex, ScopeInner, ScopeKey};
 
@@ -48,8 +47,8 @@ const TREE_M: usize = 16;
 
 /// 一整棵 Scope 树的根。
 ///
-/// 它真正持有 B+ 树、弱槽位池链与类型级 `PreDrop` 注册表；所有 `ScopeInner` 都通过
-/// `ScopeKey` 登记在这棵树里。
+/// 它真正持有两棵 B+ 树、弱槽位池链与类型级 `PreDrop` 注册表：所有 `ScopeInner` 通过
+/// `ScopeKey` 登记在 `scopes_` 里，强块元信息字通过地址登记在 `metas_` 里。
 pub struct RootScope {
     /// 所有域：键是 `ScopeKey`，值是指向域内部的指针。
     ///
@@ -61,16 +60,15 @@ pub struct RootScope {
     // 同时确认树自身的分配器应当来自 `allocator_`，而不是默认的 `Global`。
     scopes_: BPlusTree<TREE_M, OrdComparer<ScopeKey>, ScopeKey, NonNull<ScopeInner>>,
 
+    /// 强块元信息字：键是元信息地址，值是一个指针宽度的元数据字。
+    ///
+    /// 强块只保存地址；元信息内容由本树统一持有。B+ 树的数据槽在条目存续期间地址稳定，
+    /// 因此 `insert_meta_` 可以把该地址交给强块。
+    metas_: BPlusTree<TREE_M, OrdComparer<usize>, usize, *const ()>,
+
     /// 下一个可分配的 `ScopeKey`。
     // TODO(新设计): 是否复用已回收域的键由 B+ 树的删除策略决定。
     next_scope_key_: ScopeKey,
-
-    /// 整棵树共享的弱槽位池链头。
-    weak_pools_: Option<NonNull<WeakPool>>,
-
-    /// 整棵树共享的类型级 `PreDrop` 注册表。
-    #[cfg(feature = "core-alloc")]
-    pre_drop_registry_: PreDropRegistry,
 
     /// 类型擦除后的分配器；所有域都借用它。
     allocator_: &'static dyn Allocator,
@@ -125,6 +123,55 @@ impl RootScope {
         &mut self.scopes_
     }
 
+    /// 登记一条强块元信息，返回元信息在树中的稳定地址。
+    ///
+    /// 地址已存在时返回 [`None`]，调用方应改用 [`RootScope::get_meta_`]。
+    #[inline]
+    pub(crate) fn insert_meta_(
+        &mut self,
+        addr: usize,
+        meta: *const (),
+    ) -> Option<NonNull<*const ()>> {
+        match self.metas_.try_insert(addr, meta) {
+            Result::Ok((_, value)) => Option::Some(NonNull::from(value)),
+            Result::Err(_) => Option::None,
+        }
+    }
+
+    /// 按地址查找强块元信息字。
+    #[inline]
+    pub(crate) fn get_meta_(&self, addr: usize) -> Option<&*const ()> {
+        self.metas_.get(addr).map(|(_, meta)| meta)
+    }
+
+    /// 查找已有元信息字的稳定地址。
+    #[inline]
+    pub(crate) fn get_meta_addr_(&self, addr: usize) -> Option<MetaAddr> {
+        self.metas_
+            .get(addr)
+            .map(|(_, meta)| NonNull::from(meta).as_ptr() as MetaAddr)
+    }
+
+    /// 尝试注册一个元信息字；已存在时直接返回它原来的地址。
+    ///
+    /// 这是 `?Sized` 工厂的配套入口：第一个使用该元信息的块负责插入，后续块复用同一个
+    /// RootScope B+ 树数据槽，因此强块里的 meta 指针可以稳定共享。
+    pub(crate) fn ensure_meta_(&mut self, meta: *const ()) -> MetaAddr {
+        let key = meta as usize;
+        if let Option::Some(addr) = self.get_meta_addr_(key) {
+            return addr;
+        }
+        self.insert_meta_(key, meta)
+            .expect("刚确认该元信息不存在")
+            .as_ptr() as MetaAddr
+    }
+
+    /// 按地址摘除强块元信息字。
+    #[inline]
+    pub(crate) fn remove_meta_(&mut self, addr: usize) -> Option<*const ()> {
+        self.metas_.remove(addr)
+    }
+
     /// 把一个域登记进 root 的 B+ 树；返回被覆盖的旧值（正常情况下为 `None`）。
     ///
     /// 这是新设计取代父子 / 兄弟链的核心入口：域之间的归属关系不再由域内指针表达，
@@ -156,19 +203,6 @@ impl RootScope {
         let key = self.next_scope_key_;
         self.next_scope_key_ = self.next_scope_key_.wrapping_add(1);
         key
-    }
-
-    /// 整棵树共享的弱槽位池链头。
-    #[inline]
-    pub(crate) fn weak_pools_(&self) -> Option<NonNull<WeakPool>> {
-        self.weak_pools_
-    }
-
-    /// 整棵树共享的类型级 `PreDrop` 注册表。
-    #[cfg(feature = "core-alloc")]
-    #[inline]
-    pub(crate) fn pre_drop_registry_(&self) -> &PreDropRegistry {
-        &self.pre_drop_registry_
     }
 
     /// 类型擦除后的分配器。

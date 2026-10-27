@@ -1,10 +1,7 @@
-use core::{
-    marker::PhantomData,
-    ptr::{self, NonNull},
-};
+use core::{marker::PhantomData, ptr::NonNull};
 
 use crate::{
-    strong_::StrongChunk,
+    strong_::{StrongChunk, StrongChunkBase},
     weak_::{DataState, WeakSlot},
 };
 
@@ -13,7 +10,7 @@ pub struct Owning<'a, T>
 where
     T: 'a + ?Sized,
 {
-    strong_chunk_: NonNull<StrongChunk<T>>,
+    strong_chunk_: NonNull<StrongChunkBase>,
     _lifetime_a_: PhantomData<&'a T>,
 }
 
@@ -22,7 +19,7 @@ pub struct Sharing<'a, T>
 where
     T: 'a + ?Sized,
 {
-    strong_chunk_: NonNull<StrongChunk<T>>,
+    strong_chunk_: NonNull<StrongChunkBase>,
     _lifetime_a_: PhantomData<&'a T>,
 }
 
@@ -43,7 +40,7 @@ impl<'a, T> Owning<'a, T>
 where
     T: 'a + ?Sized,
 {
-    pub(crate) const fn new(chunk: NonNull<StrongChunk<T>>) -> Self {
+    pub(crate) const fn new(chunk: NonNull<StrongChunkBase>) -> Self {
         Owning {
             strong_chunk_: chunk,
             _lifetime_a_: PhantomData,
@@ -58,9 +55,12 @@ where
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let chunk = unsafe { self.strong_chunk_.as_ref() };
+        // SAFETY: 强块指针来自同一个 T 的分配；头部视图地址与块首址相同
+        let chunk = unsafe { &*(self.strong_chunk_.as_ptr() as *const StrongChunk<T>) };
         debug_assert!(chunk.is_data_alive());
-        chunk.try_get_data().expect("[Owning::deref] should always work.")
+        chunk
+            .try_get_data()
+            .expect("[Owning::deref] should always work.")
     }
 }
 
@@ -69,19 +69,14 @@ where
     T: 'a + ?Sized,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let chunk = unsafe { self.strong_chunk_.as_mut() };
+        // SAFETY: 同上；&mut self 保证独占
+        let chunk = unsafe { &mut *(self.strong_chunk_.as_ptr() as *mut StrongChunk<T>) };
         debug_assert!(chunk.is_data_alive());
         chunk
             .try_get_data_mut()
             .expect("[Owning::deref_mut] should always work.")
     }
 }
-
-impl<'a, T, U> core::ops::CoerceUnsized<Owning<'a, U>> for Owning<'a, T>
-where
-    T: ?Sized + core::marker::Unsize<U>,
-    U: ?Sized,
-{}
 
 impl<'a, T> Drop for Owning<'a, T>
 where
@@ -94,7 +89,8 @@ where
     /// （保证来源 (b)），见 `dev-notes/weak-20260922-1135.md` §2。
     fn drop(&mut self) {
         // SAFETY: Owning 持有强块指针，强块活着时身份槽位也活着
-        let chunk = unsafe { self.strong_chunk_.as_ref() };
+        // SAFETY: 强块指针有效；头部视图地址与块首址相同
+        let chunk = unsafe { &*(self.strong_chunk_.as_ptr() as *const StrongChunk<T>) };
         // SAFETY: 同上
         let weak = unsafe { chunk.weak_chunk().as_ref() };
         debug_assert!(
@@ -116,7 +112,7 @@ impl<'a, T> Sharing<'a, T>
 where
     T: 'a + ?Sized,
 {
-    pub(crate) const fn new(chunk: NonNull<StrongChunk<T>>) -> Self {
+    pub(crate) const fn new(chunk: NonNull<StrongChunkBase>) -> Self {
         Sharing {
             strong_chunk_: chunk,
             _lifetime_a_: PhantomData,
@@ -131,17 +127,14 @@ where
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let chunk = unsafe { self.strong_chunk_.as_ref() };
+        // SAFETY: 强块指针来自同一个 T 的分配；头部视图地址与块首址相同
+        let chunk = unsafe { &*(self.strong_chunk_.as_ptr() as *const StrongChunk<T>) };
         debug_assert!(chunk.is_data_alive());
-        chunk.try_get_data().expect("[Owning::deref] should always work.")
+        chunk
+            .try_get_data()
+            .expect("[Owning::deref] should always work.")
     }
 }
-
-impl<'a, T, U> core::ops::CoerceUnsized<Sharing<'a, U>> for Sharing<'a, T>
-where
-    T: ?Sized + core::marker::Unsize<U>,
-    U: ?Sized,
-{}
 
 impl<'a, T> Clone for Sharing<'a, T>
 where
@@ -150,7 +143,8 @@ where
     /// 复制一个共享句柄：只把强计数加 1。
     fn clone(&self) -> Self {
         // SAFETY: Sharing 持有强块指针，强块活着时它有效
-        let chunk = unsafe { self.strong_chunk_.as_ref() };
+        // SAFETY: 头部指针有效
+        let chunk = unsafe { &*(self.strong_chunk_.as_ptr() as *const StrongChunk<T>) };
         chunk.incr_strong_count();
         Sharing {
             strong_chunk_: self.strong_chunk_,
@@ -169,7 +163,8 @@ where
     /// 只有"强计数归零且弱计数也为 0"这种组合才顺带走确定性析构。
     fn drop(&mut self) {
         // SAFETY: 同上
-        let chunk = unsafe { self.strong_chunk_.as_ref() };
+        // SAFETY: 头部指针有效
+        let chunk = unsafe { &*(self.strong_chunk_.as_ptr() as *const StrongChunk<T>) };
         if chunk.decr_strong_count() != 0 {
             return;
         }
@@ -189,7 +184,6 @@ impl<T> Retain<T>
 where
     T: ?Sized,
 {
-
     /// 尝试从 `Weak<T>` 提升为 `Retain<T>`。
     /// 当且仅当 `DataState::Allocated` 时会成功
     pub fn try_owning(&self) -> Option<Owning<'_, T>> {
@@ -265,22 +259,10 @@ fn claim_and_destroy_if_unreachable_(weak: &WeakSlot<()>) -> bool {
     true
 }
 
-/// 把"类型擦除后的强块头部指针"还原成 `NonNull<StrongChunk<T>>`。
-///
-/// 对 `?Sized` 的 `T` 需要重建胖指针，元数据取自强块头部保存的 `?Sized` 元数据。
-fn raw_to_strong_<T: ?Sized + ptr::Pointee>(
+/// 强块头部指针本身就是 typed view 的首址；这里只做类型投影。
+fn raw_to_strong_<T: ?Sized>(
     raw: NonNull<crate::strong_::StrongChunkBase>,
-) -> NonNull<StrongChunk<T>> {
-    let void = raw.as_ptr().cast::<()>();
-    let meta = raw_meta_::<T>(raw);
-    // SAFETY: 由调用方保证该强块当初就是按 T 分配的；头部在偏移 0，因此同址
-    unsafe { NonNull::new_unchecked(ptr::from_raw_parts_mut::<StrongChunk<T>>(void, meta)) }
-}
-
-/// 从强块头部取出它当初分配时的类型元数据。
-fn raw_meta_<T: ?Sized + ptr::Pointee>(
-    raw: NonNull<crate::strong_::StrongChunkBase>,
-) -> T::Metadata {
-    // SAFETY: 登记信息是用同一个 T 写下的；元数据现在保存在强块头部
-    unsafe { crate::weak_::meta_from_raw_::<T>(raw.as_ref().meta_()) }
+) -> NonNull<StrongChunkBase> {
+    let _ = core::marker::PhantomData::<T>;
+    raw
 }

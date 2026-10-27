@@ -11,7 +11,7 @@ use core::{
 };
 use std::string::String;
 
-use super::{PreDropRecord};
+use super::PreDropRecord;
 use crate::{strong_::StrongChunk, weak_::WeakSlot};
 
 /// 按值收下一个零尺寸钩子，只用它的类型取登记；用于在测试里推断 `Fin`。
@@ -25,10 +25,7 @@ fn record_with_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(_hook: Fin) -> &'stati
 #[test]
 fn pre_drop_record_is_shared_per_type() {
     assert!(
-        ptr::eq(
-            PreDropRecord::of::<String>(),
-            PreDropRecord::of::<String>()
-        ),
+        ptr::eq(PreDropRecord::of::<String>(), PreDropRecord::of::<String>()),
         "同一类型必须共用同一份登记"
     );
     assert!(
@@ -171,7 +168,7 @@ unsafe fn make_probe_chunk_(slot: &mut MaybeUninit<StrongChunk<Probe>>) -> *mut 
     let chunk = slot.as_mut_ptr();
     // SAFETY: chunk 可写；weak 是本测试栈上的有效身份槽位
     unsafe {
-        (*chunk).init_with_(core::ptr::NonNull::from(weak), Probe("hello"));
+        StrongChunk::<Probe>::init_with_value(chunk, core::ptr::NonNull::from(weak), Probe("hello"));
     }
     chunk.cast::<u8>()
 }
@@ -192,7 +189,11 @@ fn pre_drop_runs_before_drop_exactly_once() {
     // SAFETY: base 来自上面刚构造好的 StrongChunk<Probe>；Probe 是 Sized，元数据为空
     unsafe { record.run_(base, ptr::null()) };
 
-    assert_eq!(PRE_DROPPED.load(Ordering::Acquire), 1, "PreDrop 应恰好运行一次");
+    assert_eq!(
+        PRE_DROPPED.load(Ordering::Acquire),
+        1,
+        "PreDrop 应恰好运行一次"
+    );
     assert_eq!(DROPPED.load(Ordering::Acquire), 1, "Drop 应恰好运行一次");
 }
 

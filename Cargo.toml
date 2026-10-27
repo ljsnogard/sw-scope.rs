@@ -15,8 +15,9 @@ std = []
 strict-put-after-close = []
 
 [dependencies]
-bplus_tree_cmp = { git = "https://gitee.com/lino_snsalias/bplus_tree_cmp.git" }
 atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }
+bplus_tree_cmp = { git = "https://gitee.com/lino_snsalias/bplus_tree_cmp.git" }
+gen_mcf2 = { git = "https://gitee.com/lino_snsalias/cancel_rs.git" }
 
 # 类型键：`typeid::of::<T>()` 对非 `'static`、`?Sized` 的 `T` 也能给出稳定的
 # `core::any::TypeId`，用来取代原先不可靠的 `core::any::type_name`。

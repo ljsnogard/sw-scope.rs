@@ -1,9 +1,7 @@
 // 旧实现需要 `Allocator` 的 `allocate`/`deallocate` 扩展；迁移后暂未使用。
 // #![feature(allocator_ext)]
-#![feature(coerce_unsized)]
 #![feature(ptr_metadata)]
 #![feature(try_trait_v2)]
-#![feature(unsize)]
 
 #![no_std]
 // 本次重构先把新树结构编译通过：大量旧实现与辅助类型被停用但按约定保留在源码中，
@@ -38,7 +36,7 @@ pub use scope_str_::ScopeStr;
 
 pub mod x_deps {
     pub use atomic_sync;
-    pub use bplustree_cmp;
-
     pub use atomic_sync::x_deps::{abs_cancel, abs_sync, funty};
+    pub use bplustree_cmp;
+    pub use gen_mcf2;
 }

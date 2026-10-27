@@ -1,13 +1,41 @@
-use core::{
-    alloc::Layout,
-    marker::PhantomData,
-    mem::MaybeUninit,
-};
+use core::{alloc::Layout, marker::PhantomData, mem::MaybeUninit};
 
-use crate::{
-    index_::Retain,
-    scope_str_::ScopeStr,
-};
+use crate::{index_::Retain, scope_str_::ScopeStr};
+
+pub trait TrPredrop<T>
+where
+    T: ?Sized,
+{
+    /// 是否是"没有 predrop 钩子"的占位值 `()`。
+    ///
+    /// 强块用这个常量决定是否在 `StrongChunkBase` 的 `refc_` 里置 predrop 标志位。
+    /// 真实钩子（函数项、闭包、函数指针）使用默认值 `false`；`()` 覆盖为 `true`。
+    const IS_ABSENT: bool = false;
+
+    fn pre_drop(self, data: &mut T);
+}
+
+impl<F, T> TrPredrop<T> for F
+where
+    F: FnOnce(&mut T),
+    T: ?Sized,
+{
+    fn pre_drop(self, data: &mut T) {
+        let f = self;
+        f(data)
+    }
+}
+
+impl<T> TrPredrop<T> for ()
+where
+    T: ?Sized,
+{
+    const IS_ABSENT: bool = true;
+
+    fn pre_drop(self, data: &mut T) {
+        let _ = data;
+    }
+}
 
 pub trait TrEmplace {
     type Target: ?Sized;
@@ -35,11 +63,7 @@ pub trait TrEmplace {
     /// - Must gurantee the initialization will not exceed the memory border
     ///   specified by the layout;
     /// - The initialized result must safe for drop semantics;
-    unsafe fn emplace(
-        self,
-        layout: Layout,
-        place: *mut Self::Target,
-    );
+    unsafe fn emplace(self, layout: Layout, place: *mut Self::Target);
 }
 
 pub trait TrScope {
@@ -103,7 +127,10 @@ pub trait TrScope {
         F: FnOnce() -> T,
         Fin: FnOnce(&mut T) + 'static;
 
-    fn put<T>(self, data: T) -> Retain<T> where Self: Sized {
+    fn put<T>(self, data: T) -> Retain<T>
+    where
+        Self: Sized,
+    {
         let Result::Ok(w) = self.try_put(|| data) else {
             panic!()
         };
@@ -122,7 +149,10 @@ pub trait TrScope {
         w
     }
 
-    fn put_str(self, str: &str) -> Retain<ScopeStr> where Self: Sized {
+    fn put_str(self, str: &str) -> Retain<ScopeStr>
+    where
+        Self: Sized,
+    {
         let Result::Ok(w) = self.try_put_str(str) else {
             panic!()
         };
@@ -166,7 +196,8 @@ where
 {
     type Target = T;
     type Meta = <T as core::ptr::Pointee>::Metadata;
-    type Result<'f> = Result<&'f mut T, !>
+    type Result<'f>
+        = Result<&'f mut T, !>
     where
         Self: 'f;
 
@@ -174,12 +205,12 @@ where
         self.meta_
     }
 
-    unsafe fn emplace(
-        self,
-        layout: Layout,
-        place: *mut Self::Target,
-    ) {
-        let IntoEmplace { factory_: f, meta_: _, _use_t_: _ } = self;
+    unsafe fn emplace(self, layout: Layout, place: *mut Self::Target) {
+        let IntoEmplace {
+            factory_: f,
+            meta_: _,
+            _use_t_: _,
+        } = self;
         f(layout, place)
     }
 }

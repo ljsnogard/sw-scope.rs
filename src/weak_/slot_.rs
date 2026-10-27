@@ -416,11 +416,7 @@ impl WeakSlotState {
     ///
     /// 只有**真正由本次调用完成迁移**才返回 `Some`，"状态本来就已经是 `to`" 不算成功
     /// ——升级路径要靠这个返回值判断自己是不是赢家。
-    pub(crate) fn try_transition_state(
-        &self,
-        from: DataState,
-        to: DataState,
-    ) -> Option<DataState> {
+    pub(crate) fn try_transition_state(&self, from: DataState, to: DataState) -> Option<DataState> {
         self.transition_(|current| (current == from).then_some(to))
     }
 
@@ -431,14 +427,13 @@ impl WeakSlotState {
     /// 裁决点：`Owning::drop`、`Sharing::drop` 的最后一次减计数、以及清盘兜底，都只能
     /// 通过这里竞争。
     pub(crate) fn try_claim_destroy(&self) -> Option<DataState> {
-        self.transition_(|from| {
-            from.is_claimable().then_some(DataState::Destroying)
-        })
+        self.transition_(|from| from.is_claimable().then_some(DataState::Destroying))
     }
 
     /// 标记数据已析构完成。只有成功认领过销毁的线程应当调用。
     pub(crate) fn mark_destroyed(&self) {
-        let _ = self.transition_(|from| (from == DataState::Destroying).then_some(DataState::Destroyed));
+        let _ = self
+            .transition_(|from| (from == DataState::Destroying).then_some(DataState::Destroyed));
     }
 
     /// 标记已退出存活链、可随池回收。只有弱引用计数归零后才应调用。
@@ -766,10 +761,7 @@ where
     /// 唯一可能 panic 的步骤是抢锁本身，而它发生在"持有锁"之前。抢到锁之后再执行的只有
     /// 一次结构体字面量构造（指针运算 + `PhantomData`），既不分配也不调用用户代码，
     /// 因此不存在"锁已置位、却没人负责释放"的窗口。锁一旦置位，守卫就已经在返回路上。
-    fn try_acquire_<K>(
-        owner: &'a WeakSlot<T>,
-        cancel: K,
-    ) -> Option<Self>
+    fn try_acquire_<K>(owner: &'a WeakSlot<T>, cancel: K) -> Option<Self>
     where
         K: TrCancellationToken,
     {
@@ -781,8 +773,7 @@ where
     /// 与 [`WeakSlotGuard::try_acquire_`] 共用同一条抢锁路径，只是令牌不同。
     fn spin_acquire_(owner: &'a WeakSlot<T>) -> Self {
         // `NonCancellableToken` 永远不会取消，因此这里可以解包
-        Self::try_acquire_(owner, NonCancellableToken::new())
-            .expect("不可取消的抢锁必定成功")
+        Self::try_acquire_(owner, NonCancellableToken::new()).expect("不可取消的抢锁必定成功")
     }
 
     /// 本守卫持有的槽位。
@@ -898,10 +889,9 @@ pub(crate) unsafe fn meta_from_raw_<T: ?Sized + ptr::Pointee>(raw: *const ()) ->
 /// # Safety
 ///
 /// `base` 必须是 `StrongChunk<T>` 的首地址，`meta` 必须来自同一次分配登记。
-pub(crate) unsafe fn data_ptr_of_<T: ?Sized>(base: *mut u8, meta: *const ()) -> *mut T {
-    let meta = unsafe { raw_to_meta_::<T>(meta) };
-    // SAFETY: base 是 StrongChunk<T> 的首地址，meta 与之一致
-    let chunk = ptr::from_raw_parts_mut::<StrongChunk<T>>(base.cast::<()>(), meta);
-    // SAFETY: 同上
+pub(crate) unsafe fn data_ptr_of_<T: ?Sized>(base: *mut u8, _meta: *const ()) -> *mut T {
+    // `StrongChunk<T>` 现在只是头部视图，地址与强块首址相同；真实数据偏移在头部。
+    let chunk = base.cast::<StrongChunk<T>>();
+    // SAFETY: base 是 StrongChunk<T> 的首地址
     unsafe { (*chunk).data_ptr() }
 }

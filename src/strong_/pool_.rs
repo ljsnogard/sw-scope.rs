@@ -4,6 +4,7 @@ use core::{
     ptr::{self, NonNull},
 };
 
+use super::chunk_::StrongChunkBase;
 use crate::scope_inner_::{DEFAULT_CELL_SIZE, PoolIndex};
 
 /// 强池的 cell 步长；旧实现由 `ScopeInner<const CELL_SIZE>` 提供。
@@ -100,6 +101,24 @@ impl StrongPool {
         self.used_count_
     }
 
+    /// 由强块首址与 `pool_order_` 反推所属池。
+    ///
+    /// `pool_order_` 必须是该块在池内的**起始 cell 序号**。线程安全的池在归还块时需要
+    /// 先通过这个反推拿到池地址并取得池锁，因此 `StrongChunkBase::pool_order_` 必须保留。
+    /// 返回 `None` 表示地址不可能由本池的布局产生（越界或未按池对齐）。
+    pub(crate) fn of_chunk_(chunk: NonNull<StrongChunkBase>) -> Option<NonNull<Self>> {
+        // SAFETY: 调用方保证 chunk 指向一个有效强块头部
+        let order = unsafe { chunk.as_ref() }.pool_order_() as usize;
+        let offset = Self::THIS_SIZE.checked_add(order.checked_mul(CELL_SIZE)?)?;
+        let addr = chunk.as_ptr() as usize;
+        let base = addr.checked_sub(offset)?;
+        if !base.is_multiple_of(mem::align_of::<Self>()) {
+            return Option::None;
+        }
+        // SAFETY: base 由非空块地址减去固定偏移得到，必定非空
+        Option::Some(unsafe { NonNull::new_unchecked(base as *mut Self) })
+    }
+
     /// 整块池子承载的全部 cell 空间。
     pub(crate) const fn memory_(&self) -> NonNull<[u8]> {
         let p = self as *const Self as *const u8;
@@ -132,6 +151,20 @@ impl StrongPool {
     ///
     /// 剩余空间放不下时返回当前可用的连续字节数，供上层决定是否开新池。
     pub(crate) fn allocate_(&mut self, layout: Layout) -> Result<NonNull<[u8]>, usize> {
+        self.allocate_with_order_(layout).map(|(mem, _)| mem)
+    }
+
+    /// 同 [`StrongPool::allocate_`]，但额外返回该块在池内的起始 cell 序号。
+    ///
+    /// 这个序号要写进强块头部的 `pool_order_`，归还时才能 O(1) 反推池地址。
+    ///
+    /// # Errors
+    ///
+    /// 剩余空间放不下时返回当前可用的连续字节数。
+    pub(crate) fn allocate_with_order_(
+        &mut self,
+        layout: Layout,
+    ) -> Result<(NonNull<[u8]>, PoolIndex), usize> {
         let data_addr = self as *mut Self as usize;
         let cell_addr = data_addr + Self::THIS_SIZE;
         let used_bytes = (self.used_count_ as usize) * CELL_SIZE;
@@ -144,14 +177,21 @@ impl StrongPool {
         if end > pool_end {
             return Result::Err(pool_end - free_start);
         }
+        let start_offset = start - cell_addr;
+        debug_assert!(
+            start_offset.is_multiple_of(CELL_SIZE),
+            "块起点必须落在 cell 边界上，否则 pool_order_ 无法反推池地址"
+        );
+        let order = (start_offset / CELL_SIZE) as PoolIndex;
         // 推进 used_count_，把对齐跳过的字节也算成已用
         self.used_count_ = ((end - cell_addr).div_ceil(CELL_SIZE)) as PoolIndex;
         // SAFETY: start..end 落在本池 cell 区内，且 start 已按 layout 对齐
-        unsafe {
-            Result::Ok(NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
+        let mem = unsafe {
+            NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
                 start as *mut u8,
                 layout.size(),
-            )))
-        }
+            ))
+        };
+        Result::Ok((mem, order))
     }
 }
