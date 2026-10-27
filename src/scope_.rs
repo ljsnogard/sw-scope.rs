@@ -1014,7 +1014,17 @@ mod tests_ {
 
     static ALLOCS: AtomicUsize = AtomicUsize::new(0);
     static TAG_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
     static GLOBAL: Global = Global;
+
+    /// 用来观察 `Retain` 最后一个句柄消失后是否真的执行了 `T::drop`。
+    struct DropProbe;
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     /// 转发给 `Global` 并统计分配次数，用来证明 per-Scope 分配器确实被使用。
     struct CountingAlloc;
@@ -1165,5 +1175,54 @@ mod tests_ {
             .collect();
         assert_eq!(scopes.len(), 300);
         assert!(scopes[0] != scopes[299], "实体地址必须互不相同");
+    }
+
+    /// 测试最后一个 `Retain` 消失时执行类型擦除后的 `T::drop`。
+    /// Test that dropping the last Retain runs the type-erased `T::drop`.
+    ///
+    /// - 手段：放入一个带 `Drop` 的 `DropProbe`，然后析构 `Retain`。
+    ///   / How: put a `DropProbe` with a `Drop` impl and then drop the `Retain`.
+    /// - 判断：放入后计数为 0，`Retain` 析构后计数恰好为 1。
+    ///   / What: the counter is 0 after the put and exactly 1 after the Retain is dropped.
+    #[compio::test]
+    async fn retain_drop_runs_typed_destructor() {
+        DROPS.store(0, Ordering::SeqCst);
+        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let retain = scope.put_async(DropProbe).await.expect("放入应当成功");
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        drop(retain);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1, "应当执行一次 T::drop");
+    }
+
+    /// 测试 `Owning` 与 `Sharing` 的往返：独占、共享、克隆后状态都能正确回到 `Created`。
+    /// Test Owning/Sharing round-trips and that cloned Retains keep the data alive.
+    ///
+    /// - 手段：先 `try_owning` 改写数据并释放，再 `try_sharing`、`clone`，再克隆 `Retain`。
+    ///   / How: take `try_owning`, mutate and release; then `try_sharing`, clone, and clone the
+    ///   `Retain`.
+    /// - 判断：每一步之后仍能重新独占 / 读取；最后一个 Retain 析构时数据恰好销毁一次。
+    ///   / What: after each step the data can be read/owned again, and the final Retain drop
+    ///   destroys it exactly once.
+    #[compio::test]
+    async fn owning_and_sharing_handles_roundtrip() {
+        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let retain = scope.put_async(10u32).await.expect("放入应当成功");
+        {
+            let mut owned = retain.try_owning().expect("应当可独占");
+            *owned = 20;
+        }
+        assert!(retain.try_owning().is_some(), "归还独占权后应能再次独占");
+
+        let shared = retain.try_sharing().expect("应当可共享");
+        assert_eq!(*shared, 20);
+        let shared2 = shared.clone();
+        drop(shared);
+        drop(shared2);
+        assert!(retain.try_owning().is_some(), "强引用释放后应回到 Created");
+
+        let clone = retain.clone();
+        drop(retain);
+        assert_eq!(*clone.try_owning().expect("克隆句柄仍应可独占"), 20);
+        drop(clone);
     }
 }

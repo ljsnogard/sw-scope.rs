@@ -192,15 +192,20 @@ impl StrongChunkBase {
 
     /// 类型擦除路径上的析构。
     ///
-    /// Predrop 现在是直接存储的泛型对象，类型擦除侧拿不到 `P`/`T`，必须经 RootScope
-    /// 元信息取得对应的单态化入口；该入口尚未接入。
+    /// 单态化的析构入口在 [`StrongChunk::init_with`] 时写入了身份槽位，因此这里只需要
+    /// 通过 `WeakSlot` 取回入口并调用；`T` / `P` 的差异完全由那个入口承担。
     ///
     /// # Safety
     ///
     /// 调用方必须已经认领销毁，且恰好调用一次。
     pub(crate) unsafe fn drop_data_(&self) {
-        // TODO(新设计): 经 RootScope 元信息取得 P/T 的擦除入口后执行 Predrop 与析构。
-        todo!()
+        // SAFETY: 强块活着时身份槽位必然活着
+        let weak = unsafe { self.weak_chunk().as_ref() };
+        let Option::Some(drop) = weak.drop_fn_() else {
+            return;
+        };
+        // SAFETY: 由调用方保证认领销毁且恰好一次
+        unsafe { drop(NonNull::from(self)) };
     }
 
     /// 当前强引用计数（不含两个标志位）。
@@ -459,6 +464,7 @@ where
         // SAFETY: weak_chunk 是本块的身份槽位，且此刻独占使用
         let weak = unsafe { &mut *(weak_chunk.as_ptr() as *mut WeakSlot<T>) };
         weak.set_strong_chunk(base as *mut StrongChunkBase);
+        weak.set_drop_fn_(Option::Some(drop_chunk_::<T, P>));
     }
 
     /// `?Sized` 数据的工厂：必须带 RootScope 元信息指针。
@@ -593,4 +599,18 @@ where
         // SAFETY: 数据区已分配、对齐且尚未初始化；由调用方保证独占
         unsafe { data.write(value) };
     }
+}
+
+/// 在强块首址上执行原始 `T` / `P` 的 typed 析构。
+///
+/// 它被 [`StrongChunk::init_with`] 写进 `WeakSlot`，让只拿到身份槽位的收尾路径也能
+/// 析构 `?Sized` 数据与直接存储的 `PreDrop` 对象。
+///
+/// # Safety
+///
+/// `base` 必须是由同一个 `T` / `P` 的 `StrongChunk` 分配出来的首址。
+unsafe fn drop_chunk_<T: ?Sized, P: TrPredrop<T>>(base: NonNull<StrongChunkBase>) {
+    let chunk = base.as_ptr() as *mut StrongChunk<T, P>;
+    // SAFETY: base 是同一个 T/P 的强块首址，调用方已认领销毁
+    unsafe { (*chunk).drop_data_() };
 }

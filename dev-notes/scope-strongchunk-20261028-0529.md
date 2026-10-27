@@ -128,3 +128,28 @@ StrongChunkBase | ScopeEntity<A> {
 
 **仍未接入**：`C::LockAlloc` 尚未用于锁内核；固定锁类型使用 root 的分配器。
 这一点已在 `TrScopeInnerConfig` 的文档中标注 TODO。
+
+## 类型擦除析构（补充）
+
+demo 里 `Retain` / `Owning` / `Sharing` 的最后一步终于不再 `todo!()`：
+
+- `WeakSlot` 增加 `drop_: Option<ChunkDropFn>`；`ChunkDropFn` 是
+  `unsafe fn(NonNull<StrongChunkBase>)`。
+- `StrongChunk::init_with`（所有 `init_sized` / `init_unsized` / `init_auto` 都会走到它）
+  在绑定强块时写入 `drop_chunk_::<T, P>`。
+- `StrongChunkBase::drop_data_` 不再查 root 元信息，而是从身份槽位取出这个入口并调用；
+  入口内部把强块首址还原成 `StrongChunk<T, P>`，因此 `?Sized` 元数据与直接存储的
+  `PreDrop` 对象都能按原始 `T` / `P` 析构。
+- 强块里的实体 `ScopeEntity<A>` 也走同一个入口；未来 root 拆除时可以直接对实体调用
+  `drop_data_`。
+- `WeakSlot` 尺寸从 16 字节变为 24 字节（状态 + 强块指针 + 析构入口），对应的尺寸断言已更新。
+
+新增测试：
+
+- `retain_drop_runs_typed_destructor`：最后一个 `Retain` 析构时 `T::drop` 恰好执行一次；
+- `owning_and_sharing_handles_roundtrip`：`Owning` 改写 / 释放、`Sharing` 与 `clone`、
+  `Retain::clone` 之后仍能重新独占并读回数据。
+
+验证：`cargo test --lib` **41 passed**；四种 feature 组合通过；实验代码无新增告警。
+
+仍未做：把析构后的弱槽位 / 强块归还给池，从而触发“整池回收 / 复用”的 StrongPool 算法。
