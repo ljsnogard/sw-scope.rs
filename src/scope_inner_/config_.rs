@@ -9,8 +9,6 @@ use core::{
 use crate::page_size::{self, TrPageSizeSelect};
 
 pub trait TrScopeInnerConfig {
-    /// The allocator used for WeakPool and StrongPool
-    type PoolAlloc: Allocator;
     type LockAlloc: AllocatorClone;
     type PageSize: TrPageSizeSelect;
 }
@@ -24,7 +22,6 @@ impl<A> TrScopeInnerConfig for DefaultConfig<A>
 where
     A: Allocator + Default,
 {
-    type PoolAlloc = Global;
     type LockAlloc = Global;
     type PageSize = page_size::PageSize2KB;
 }

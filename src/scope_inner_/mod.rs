@@ -3,9 +3,9 @@
 //! # 新设计（重构中）
 //!
 //! 旧的"代际树"结构（父域 / 子域 / 兄弟链）正在被移除：现在一个 [`RootScope`] 通过一棵
-//! [`bplustree_cmp::BPlusTree`] 管理整棵树里的所有 [`ScopeInner`]，键是 [`ScopeKey`]。因此
+//! [`bplustree_cmp::BPlusTree`] 管理整棵树里的所有 [`ScopeInner`]，树的键就是域地址。因此
 //!
-//! - [`Scope`](crate::Scope) 只保留"所属 root + 在树中的键"；
+//! - [`Scope`](crate::Scope) 只保存指向自己 `ScopeInner` 的指针；
 //! - [`ScopeInner`] 不再带 `const CELL_SIZE` / 配置类型等泛型参数；
 //! - 分配器统一擦除为 `&'static dyn Allocator`，不再靠固定偏移反推 root。
 //!
@@ -14,24 +14,20 @@
 //!
 //! # 子模块
 //!
-//! - 本文件：常量、[`PoolIndex`] / [`ScopeKey`]、[`ScopeInner`] 字段定义与逐项导出；
-//! - [`alloc_`](alloc_)：强池 bump 分配、树共享弱池取槽与对象构造管线（旧实现，待迁移）；
+//! - 本文件：常量、[`PoolIndex`]、[`ScopeInner`] 字段定义与逐项导出；
+//! - [`alloc_`](alloc_)：每域弱池取槽、每域强池 bump 分配与对象构造管线；
 //! - [`root_`](root_)：新 [`RootScope`] 与由 B+ 树管理域的入口；
 //! - `life_` / `teardown_`：旧代际树的生命周期与清盘逻辑，依赖已移除的父子链字段，
 //!   暂时停用但保留源码。
 
-use core::{
-    ptr,
-    sync::atomic::AtomicPtr,
-};
+use core::{ptr, sync::atomic::AtomicPtr};
 
-// 旧的 `config_` / `alloc_` / `life_` / `teardown_` 都建立在父子 / 兄弟链与 const-generic
-// 池之上；新设计改由 root 的 B+ 树管理所有域，因此这些模块暂时不参与编译。原文件保留，
-// 等树操作补齐后再决定迁移方式。
-//
+// 旧的 `config_` / `life_` / `teardown_` 都建立在父子 / 兄弟链之上；新设计改由 root 的
+// B+ 树管理所有域，这些模块暂时不参与编译。原文件保留，等树操作补齐后再决定迁移方式。
+// `alloc_` 已按新设计（每域自持弱池 / 强池、新强块布局）重写并重新启用。
+mod alloc_;
 mod config_;
 mod inner_;
-// mod alloc_;
 // mod life_;
 // mod teardown_;
 mod root_;
@@ -43,7 +39,10 @@ mod root_;
 // mod tests_;
 
 pub use config_::{DefaultConfig, TrScopeInnerConfig};
-pub(crate) use inner_::{ScopeInner, ScopeInnerWithCfg};
+pub(crate) use inner_::ScopeInner;
+// `ScopeInnerWithCfg` 是 Scope 层创建新域时的入口，等 `Scope::new_with_cfg` 接通后即被使用。
+#[allow(unused_imports)]
+pub(crate) use inner_::ScopeInnerWithCfg;
 pub(crate) use root_::RootScope;
 
 // 旧导出（仅供对照）：

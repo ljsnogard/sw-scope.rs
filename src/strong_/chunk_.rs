@@ -281,6 +281,24 @@ where
         Option::Some((layout, (rounded / PTR_SIZE) as PoolIndex))
     }
 
+    /// `T` 是否需要 meta 指针：`Sized` 的元数据宽度为 0，`?Sized` 则非 0。
+    ///
+    /// 分配层拿不到 `T` 的具体形状，只能靠这个判断在 [`StrongChunk::layout_auto`] /
+    /// [`StrongChunk::init_auto`] 里自动选对工厂。
+    pub(crate) fn needs_meta_() -> bool {
+        mem::size_of::<<T as ptr::Pointee>::Metadata>() != 0
+    }
+
+    /// 依 `T` 是否 `?Sized` 自动选择布局，避免分配层分别调用 `layout_sized` /
+    /// `layout_unsized`。
+    ///
+    /// # Errors
+    ///
+    /// 布局溢出或对齐非法时返回 [`None`]。
+    pub(crate) fn layout_auto(data_layout: Layout) -> Option<(Layout, PoolIndex)> {
+        Self::layout_with(Self::needs_meta_(), data_layout)
+    }
+
     /// Predrop 对象在块内的字节偏移；`P = ()` 时无意义。
     fn predrop_offset_(has_meta: bool) -> usize {
         let start = StrongChunkBase::THIS_SIZE + if has_meta { PTR_SIZE } else { 0 };
@@ -461,6 +479,35 @@ where
         unsafe {
             Self::init_with(
                 base, weak_chunk, pool_order, true, meta, predrop, dat_offset,
+            )
+        };
+    }
+
+    /// 依 `T` 是否 `?Sized` 自动选择初始化形状。
+    ///
+    /// `meta` 只在 [`StrongChunk::needs_meta_`] 为 `true` 时写入；`Sized` 时传空指针即可。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`StrongChunk::init_with`]；`meta` 必须与 `T` 匹配且稳定。
+    pub(crate) unsafe fn init_auto(
+        base: *mut Self,
+        weak_chunk: NonNull<WeakSlot<()>>,
+        pool_order: PoolIndex,
+        meta: MetaAddr,
+        predrop: P,
+        dat_offset: PoolIndex,
+    ) {
+        // SAFETY: 由调用方保证
+        unsafe {
+            Self::init_with(
+                base,
+                weak_chunk,
+                pool_order,
+                Self::needs_meta_(),
+                meta,
+                predrop,
+                dat_offset,
             )
         };
     }

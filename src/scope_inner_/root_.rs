@@ -16,16 +16,15 @@
 //!
 //! ```text
 //! RootScope {
-//!     scopes_:         BPlusTree<ScopeKey, NonNull<ScopeInner>>, // 管理所有域
-//!     metas_:          BPlusTree<usize, *const ()>,             // 强块元信息字（按地址）
-//!     next_scope_key_: ScopeKey,
-//!     weak_pools_:     Option<NonNull<WeakPool>>,                // 树共享弱池链
-//!     pre_drop_registry_: PreDropRegistry,
-//!     allocator_:      &'static dyn Allocator,                   // 类型已擦除
+//!     scopes_: BPlusTree<…, NonNull<ScopeInner>, ()>,          // 所有域（按地址）
+//!     metas_:  BPlusTree<…, usize, *const ()>,                 // 强块元信息字（按地址）
+//!     inner_:  ScopeInner,                                    // 分配 ScopeInnerWithCfg 的域
+//!     alloc_:  &'static dyn Allocator,                        // 类型已擦除
 //! }
 //! ```
 //!
-//! 因而 [`super::ScopeInner`] 与 [`Scope`](crate::Scope) 都可以去掉泛型参数。
+//! 因而 [`super::ScopeInner`] 与 [`Scope`](crate::Scope) 都可以去掉泛型参数。弱池与强池
+//! 都由每个 [`super::ScopeInner`] 自己持有，root 不再保存树级共享弱池。
 //!
 //! 旧实现的初始化、共享扩展与反推 root 的代码保留在文件末尾注释中，等 B+ 树操作补齐后
 //! 再决定哪些部分需要恢复。
@@ -55,8 +54,8 @@ pub type MetasBpTree = BPlusTree<TREE_M, OrdComparer<usize>, usize, *const ()>;
 
 /// 一整棵 Scope 树的根。
 ///
-/// 它真正持有两棵 B+ 树、弱槽位池链与类型级 `PreDrop` 注册表：所有 `ScopeInner` 通过
-/// `ScopeKey` 登记在 `scopes_` 里，强块元信息字通过地址登记在 `metas_` 里。
+/// 它真正持有两棵 B+ 树与类型擦除后的分配器：所有 `ScopeInner` 按地址登记在 `scopes_` 里，
+/// 强块元信息字按地址登记在 `metas_` 里。弱池 / 强池都由各域自己持有。
 #[repr(C)]
 pub(crate) struct RootScope {
     scopes_: ScopesBpTree,

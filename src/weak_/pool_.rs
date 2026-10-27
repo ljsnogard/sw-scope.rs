@@ -24,7 +24,8 @@ use crate::{
 /// 槽位。又由于索引一律是 [`PoolIndex`]（u16），池的槽位数天然被限制在
 /// `PoolIndex::MAX` 以内。
 ///
-/// 本池所属的 root 由 [`RootScope`] 保存；池只负责把它存下来再原样交还。
+/// 本池所属的 [`ScopeInner`] 由池自己记录（[`WeakPool::set_scope`]）；池只负责把它存下来
+/// 再原样交还。弱池随域持有，不再由 root 共享。
 ///
 /// # 空闲槽位链表
 ///
@@ -75,7 +76,7 @@ pub(crate) struct WeakPool {
     // 同一条内存链上的兄弟池，供池容量不足时串联扩展使用
     prev_: Option<NonNull<WeakPool>>,
     next_: Option<NonNull<WeakPool>>,
-    // 本池所属的 root（整棵树共享弱池，root 才是池的持有者）
+    // 本池所属的 ScopeInner：弱池随域持有，不再由 root 共享
     scope_: Option<NonNull<ScopeInner>>,
 }
 
@@ -196,7 +197,7 @@ impl WeakPool {
         self.scope_
     }
 
-    /// 绑定本池所属的 root。
+    /// 绑定本池所属的 [`ScopeInner`]。
     pub fn set_scope(&mut self, scope: NonNull<ScopeInner>) {
         self.scope_ = Option::Some(scope);
     }
