@@ -1,14 +1,14 @@
-pub(crate) trait TrPageSizeSelect {
+pub trait TrPageSizeSelect {
     const PAGE_SIZE: usize;
 }
 
-pub(crate) struct PageSize1KB;
-pub(crate) struct PageSize2KB;
-pub(crate) struct PageSize4KB;
-pub(crate) struct PageSize8KB;
-pub(crate) struct PageSize16KB;
-pub(crate) struct PageSize32KB;
-pub(crate) struct PageSize64KB;
+pub struct PageSize1KB;
+pub struct PageSize2KB;
+pub struct PageSize4KB;
+pub struct PageSize8KB;
+pub struct PageSize16KB;
+pub struct PageSize32KB;
+pub struct PageSize64KB;
 
 impl TrPageSizeSelect for PageSize1KB {
     const PAGE_SIZE: usize = 1024;

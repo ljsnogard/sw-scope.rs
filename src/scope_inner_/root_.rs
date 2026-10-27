@@ -31,47 +31,46 @@
 //! 再决定哪些部分需要恢复。
 
 use core::{
-    alloc::Allocator,
-    ptr::NonNull,
+    alloc::{AllocError, Allocator, Layout},
+    cmp::Ordering,
+    ptr::{self, NonNull},
     sync::atomic::AtomicPtr,
 };
 
-use bplustree_cmp::{BPlusTree, OrdComparer};
+use atomex::{AtomexPtr, CmpxchResult};
+use bplustree_cmp::{BPlusTree, OrdComparer, TrComparer};
 
-use crate::strong_::MetaAddr;
+use crate::{
+    strong_::MetaAddr,
+    x_deps::atomex,
+};
 
-use super::{PoolIndex, ScopeInner, ScopeKey};
+use super::{PoolIndex, inner_::ScopeInner};
 
 /// B+ 树的节点容量。
 const TREE_M: usize = 16;
+
+pub type ScopesBpTree = BPlusTree<TREE_M, ScopePtrComparer, NonNull<ScopeInner>, ()>;
+pub type MetasBpTree = BPlusTree<TREE_M, OrdComparer<usize>, usize, *const ()>;
 
 /// 一整棵 Scope 树的根。
 ///
 /// 它真正持有两棵 B+ 树、弱槽位池链与类型级 `PreDrop` 注册表：所有 `ScopeInner` 通过
 /// `ScopeKey` 登记在 `scopes_` 里，强块元信息字通过地址登记在 `metas_` 里。
-pub struct RootScope {
-    /// 所有域：键是 `ScopeKey`，值是指向域内部的指针。
-    ///
-    /// 旧实现用 root 内联的 `ScopeInner` + `RootExtension`，域之间再用父子 / 兄弟链相连；
-    /// 新实现把"谁属于谁"也交给这棵树统一记录。
-    ///
-    // TODO(新设计): `Scope` 句柄共享 `&'static RootScope`，登记 / 摘除域需要内部可变性；
-    // 这里后续应包一层自旋锁（或等 B+ 树提供拆分锁），而不是要求 `&mut RootScope`。
-    // 同时确认树自身的分配器应当来自 `allocator_`，而不是默认的 `Global`。
-    scopes_: BPlusTree<TREE_M, OrdComparer<ScopeKey>, ScopeKey, NonNull<ScopeInner>>,
+#[repr(C)]
+pub(crate) struct RootScope {
+    scopes_: ScopesBpTree,
 
     /// 强块元信息字：键是元信息地址，值是一个指针宽度的元数据字。
     ///
     /// 强块只保存地址；元信息内容由本树统一持有。B+ 树的数据槽在条目存续期间地址稳定，
     /// 因此 `insert_meta_` 可以把该地址交给强块。
-    metas_: BPlusTree<TREE_M, OrdComparer<usize>, usize, *const ()>,
+    metas_: MetasBpTree,
 
-    /// 下一个可分配的 `ScopeKey`。
-    // TODO(新设计): 是否复用已回收域的键由 B+ 树的删除策略决定。
-    next_scope_key_: ScopeKey,
+    /// 专用于分配任意 ScopeInnerWithAlloc 的 Scope。
+    inner_: ScopeInner,
 
-    /// 类型擦除后的分配器；所有域都借用它。
-    allocator_: &'static dyn Allocator,
+    alloc_: &'static dyn Allocator,
 }
 
 impl RootScope {
@@ -83,43 +82,83 @@ impl RootScope {
     /// 当 `atomic_ptr` 已经被其他线程发布、或第一次分配 root 失败时返回 `Err`。
     // TODO(新设计): 基于 B+ 树与 `&'static dyn Allocator` 重写初始化流程。
     pub(crate) fn try_init_default_root_scope_<A>(
-        _atomic_ptr: &'static AtomicPtr<RootScope>,
+        atomic_ptr: &'static AtomicPtr<RootScope>,
         _page_size: usize,
-        _allocator: A,
+        allocator: A,
     ) -> Result<&'static RootScope, &'static RootScope>
     where
         A: Allocator + 'static,
     {
-        // 旧实现（root 内联 ScopeInner + RootExtension + 具体分配器，靠固定偏移反推）：
-        //
-        // assert!(
-        //     mem::offset_of!(Self, allocator_)
-        //         == mem::size_of::<ScopeInner<CELL_SIZE>>()
-        //             + mem::size_of::<RootExtension<CELL_SIZE>>(),
-        //     "分配器字段与 RootExtension 之间存在对齐填充，无法用固定偏移反推 root",
-        // );
-        // let init_cell_count =
-        //     WeakPool::<CELL_SIZE, RootExtension<CELL_SIZE>>::max_count_within_max_size(page_size);
-        // ...
-        // let acquired = atomic_ptr as *const AtomicPtr<ScopeInner<CELL_SIZE>>
-        //     as *mut ScopeInner<CELL_SIZE>;
-        // ...
-        todo!()
+        fn alloc_root_scope_<TyAlloc>(
+            alloc: TyAlloc,
+        ) -> Result<NonNull<RootScope>, AllocError>
+        where
+            TyAlloc: 'static + Allocator,
+        {
+            #[repr(C)]
+            struct RootScopeRepr<TyAlloc> {
+                scope: RootScope,
+                alloc: TyAlloc,
+            }
+
+            let layout = Layout::new::<RootScopeRepr<TyAlloc>>();
+            let mut addr = alloc.allocate(layout)?;
+            let root = unsafe {
+                let p = addr.as_mut();
+                let p = &mut p[0] as *mut u8 as *mut RootScopeRepr<TyAlloc>;
+                &mut *p
+            };
+            root.scope.scopes_ = ScopesBpTree::with_comparer(ScopePtrComparer).unwrap();
+            root.scope.metas_ = MetasBpTree::new().unwrap();
+            root.scope.inner_ = ScopeInner::root_();
+            root.alloc = alloc;
+            root.scope.alloc_ = &root.alloc;
+            Result::Ok(NonNull::from_mut(&mut root.scope))
+        }
+
+        // this is the guarded value telling other racers that, the root scope is
+        // being initialized and they should just wait for the final result.
+        let impossible_value = atomic_ptr
+            as *const _
+            as *const u8
+            as *const RootScope
+            as *mut RootScope;
+        let atom_cell: AtomexPtr<RootScope, &mut AtomicPtr<RootScope>,> = AtomexPtr::new(unsafe {
+            &mut *(atomic_ptr as *const _ as *mut _)
+        });
+        let expect = |v: *mut RootScope| v.is_null();
+        let desire = |_| impossible_value;
+        let root_ptr: NonNull<RootScope>;
+        loop {
+            let res = atom_cell.try_spin_compare_exchange_weak(expect, desire);
+            match res {
+                CmpxchResult::Fail(_) => continue,
+                CmpxchResult::Unexpected(p) => {
+                    if ptr::eq(p, impossible_value) {
+                        continue;
+                    } else {
+                        return Result::Ok(unsafe { &*p });
+                    }
+                }
+                CmpxchResult::Succ(_) => {
+                    root_ptr = alloc_root_scope_(allocator).unwrap();
+                    break;
+                }
+            }
+        };
+        atom_cell.store(root_ptr.as_ptr());
+        Result::Ok(unsafe { root_ptr.as_ref() })
     }
 
     /// 根 B+ 树的只读视图。
     #[inline]
-    pub(crate) fn scopes_(
-        &self,
-    ) -> &BPlusTree<TREE_M, OrdComparer<ScopeKey>, ScopeKey, NonNull<ScopeInner>> {
+    pub(crate) const fn scopes_(&self) -> &ScopesBpTree {
         &self.scopes_
     }
 
     /// 根 B+ 树的可变视图；登记 / 移除域时使用。
     #[inline]
-    pub(crate) fn scopes_mut_(
-        &mut self,
-    ) -> &mut BPlusTree<TREE_M, OrdComparer<ScopeKey>, ScopeKey, NonNull<ScopeInner>> {
+    pub(crate) fn scopes_mut_(&mut self) -> &mut ScopesBpTree {
         &mut self.scopes_
     }
 
@@ -172,43 +211,36 @@ impl RootScope {
         self.metas_.remove(addr)
     }
 
-    /// 把一个域登记进 root 的 B+ 树；返回被覆盖的旧值（正常情况下为 `None`）。
-    ///
-    /// 这是新设计取代父子 / 兄弟链的核心入口：域之间的归属关系不再由域内指针表达，
-    /// 而是由 root 的树统一记录。
-    #[inline]
-    pub(crate) fn insert_scope_(
-        &mut self,
-        key: ScopeKey,
-        inner: NonNull<ScopeInner>,
-    ) -> Option<NonNull<ScopeInner>> {
-        self.scopes_.insert(key, inner)
-    }
+    // /// 把一个域登记进 root 的 B+ 树；返回被覆盖的旧值（正常情况下为 `None`）。
+    // ///
+    // /// 这是新设计取代父子 / 兄弟链的核心入口：域之间的归属关系不再由域内指针表达，
+    // /// 而是由 root 的树统一记录。
+    // #[inline]
+    // pub(crate) fn insert_scope_(
+    //     &mut self,
+    //     key: ScopeKey,
+    //     inner: NonNull<ScopeInner>,
+    // ) -> Option<NonNull<ScopeInner>> {
+    //     self.scopes_.insert(key, inner)
+    // }
 
-    /// 按 [`ScopeKey`] 查找域。
-    #[inline]
-    pub(crate) fn get_scope_(&self, key: ScopeKey) -> Option<NonNull<ScopeInner>> {
-        self.scopes_.get(key).map(|(_, inner)| *inner)
-    }
+    // /// 按 [`ScopeKey`] 查找域。
+    // #[inline]
+    // pub(crate) fn get_scope_(&self, key: ScopeKey) -> Option<NonNull<ScopeInner>> {
+    //     self.scopes_.get(key).map(|(_, inner)| *inner)
+    // }
 
-    /// 从 root 的 B+ 树中摘除一个域。
-    #[inline]
-    pub(crate) fn remove_scope_(&mut self, key: ScopeKey) -> Option<NonNull<ScopeInner>> {
-        self.scopes_.remove(key)
-    }
+    // /// 从 root 的 B+ 树中摘除一个域。
+    // #[inline]
+    // pub(crate) fn remove_scope_(&mut self, key: ScopeKey) -> Option<NonNull<ScopeInner>> {
+    //     self.scopes_.remove(key)
+    // }
 
-    /// 分配下一个域键。
-    #[inline]
-    pub(crate) fn next_key_(&mut self) -> ScopeKey {
-        let key = self.next_scope_key_;
-        self.next_scope_key_ = self.next_scope_key_.wrapping_add(1);
-        key
-    }
 
     /// 类型擦除后的分配器。
     #[inline]
     pub(crate) fn allocator_(&self) -> &'static dyn Allocator {
-        self.allocator_
+        self.alloc_
     }
 
     /// 池索引类型（仅为旧代码迁移期间保留的引用）。
@@ -216,6 +248,27 @@ impl RootScope {
     #[inline]
     pub(crate) const fn pool_index_() -> PoolIndex {
         0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScopePtrComparer;
+
+impl TrComparer<NonNull<ScopeInner>> for ScopePtrComparer {
+    fn compare(
+        &self,
+        a: &NonNull<ScopeInner>,
+        b: &NonNull<ScopeInner>,
+    ) -> Ordering {
+        let a = a.as_ptr() as usize;
+        let b = b.as_ptr() as usize;
+        <usize as Ord>::cmp(&a, &b)
+    }
+}
+
+impl ScopeInner {
+    fn root_() -> Self {
+        todo!()
     }
 }
 

@@ -121,6 +121,9 @@ pub trait TrScope {
         Ft: FnOnce() -> T,
         Fp: FnOnce() -> P,
         P: TrPredrop<T>,
+        Ft: 'f,
+        Fp: 'f,
+        P: 'f,
         T: 'f,
         Self: 'f;
 
@@ -141,6 +144,7 @@ pub trait TrScope {
         Result<Retain<ScopeStr>, Self::Err>>
     where
         P: TrPredrop<ScopeStr>,
+        P: 'f,
         Self: 'f;
 
     fn put_str_with_predrop_async<'f, P>(
@@ -158,6 +162,7 @@ pub trait TrScope {
         Result<Retain<[MaybeUninit<T>]>, Self::Err>>
     where
         P: TrPredrop<[MaybeUninit<T>]>,
+        P: 'f,
         T: 'f,
         Self: 'f;
 

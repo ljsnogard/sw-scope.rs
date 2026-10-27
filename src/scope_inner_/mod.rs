@@ -21,21 +21,16 @@
 //!   暂时停用但保留源码。
 
 use core::{
-    alloc::Allocator,
-    ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, AtomicUsize},
-};
-
-use crate::{
-    strong_::StrongPool,
-    weak_::{WeakPool, WeakSlot},
+    ptr,
+    sync::atomic::AtomicPtr,
 };
 
 // 旧的 `config_` / `alloc_` / `life_` / `teardown_` 都建立在父子 / 兄弟链与 const-generic
 // 池之上；新设计改由 root 的 B+ 树管理所有域，因此这些模块暂时不参与编译。原文件保留，
 // 等树操作补齐后再决定迁移方式。
 //
-// mod config_;
+mod config_;
+mod inner_;
 // mod alloc_;
 // mod life_;
 // mod teardown_;
@@ -46,7 +41,10 @@ mod root_;
 //
 // #[cfg(test)]
 // mod tests_;
-pub use root_::RootScope;
+
+pub use config_::{DefaultConfig, TrScopeInnerConfig};
+pub(crate) use inner_::{ScopeInner, ScopeInnerWithCfg};
+pub(crate) use root_::RootScope;
 
 // 旧导出（仅供对照）：
 // pub(crate) use root_::{RootScope, RootScopeRef};
@@ -58,56 +56,9 @@ pub const DEFAULT_CELL_SIZE: usize = core::mem::size_of::<usize>();
 
 pub(crate) type PoolIndex = u16;
 
-/// 域在 root 的 B+ 树中的键。
-///
-/// 旧设计用父子 / 兄弟链表达域之间的关系；新设计用它作为
-/// [`bplustree_cmp::BPlusTree`] 的键，root 通过
-/// `ScopeKey -> NonNull<ScopeInner>` 管理所有域。
-// TODO(新设计): 确认键的生成策略（单调递增 / 复用回收域留下的空洞）。
-pub(crate) type ScopeKey = usize;
-
 /// 默认 root 的发布点（指向 [`RootScope`]）；空指针表示尚未初始化。
 pub(crate) static DEFAULT_ROOT_SCOPE: AtomicPtr<RootScope> = AtomicPtr::new(ptr::null_mut());
 
-/// 一个域的内部表示。
-///
-/// 新设计里它由 root 的 [`bplustree_cmp::BPlusTree`] 统一持有并索引，因此不再保存
-/// 父域 / 子域 / 兄弟链；这些字段的旧版本见文件末尾注释以及 `life_` / `teardown_` 的源码。
-///
-/// 域持有若干 [`StrongPool`] 组成的链，池内的对象位置终身不变（见 `StrongPool` 的文档）；
-/// 域静默时整条链一次性回收。
-///
-/// 数据对象的"存活链"挂在弱槽位上（`WeakSlot::prev_live_` / `next_live_`），这里只保存
-/// 链头与链尾。
-#[repr(C)]
-pub struct ScopeInner {
-    /// 域标志位：`CLOSED` / `HANDLE_DROPPED`。
-    flags_: AtomicUsize,
-
-    /// 本域在 root 的 B+ 树中的键；创建时由 root 分配。
-    scope_key_: ScopeKey,
-
-    /// 指向本树共享的弱槽位池链头（旧字段，迁移期间保留）。
-    weak_pool_: Option<NonNull<WeakPool>>,
-
-    /// 指向 Scope 所持有的第一块强池。
-    chain_head_: Option<NonNull<StrongPool>>,
-
-    /// 指向 Scope 所持有的最新一块强池。
-    chain_tail_: Option<NonNull<StrongPool>>,
-
-    /// 旧设计的存活链链头（弱槽位）。
-    ///
-    /// 新设计不再逐槽位维护存活链，而是由 `WeakSlotState::for_each_live_slot_` 从池链
-    /// 与槽位状态反推；这两个字段待 `ScopeInner` 迁移时移除。
-    live_head_: Option<NonNull<WeakSlot<()>>>,
-
-    /// 旧设计的存活链链尾（弱槽位）；含义同 [`ScopeInner::live_head_`]。
-    live_tail_: Option<NonNull<WeakSlot<()>>>,
-
-    /// 指向 root 的具体分配器（已擦除）；既用于分配，也用于回到 root 的 B+ 树。
-    allocator_: &'static dyn Allocator,
-}
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- 旧设计的字段（父域 / 兄弟链 / 待回收名单）——暂时保留在这里作对照，不再参与布局。

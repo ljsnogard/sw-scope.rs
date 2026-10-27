@@ -13,22 +13,22 @@
 //! `todo!()` 标记，等 B+ 树操作与对象分配管线迁移完成后再补回。
 
 use core::{
-    alloc::{Allocator, Layout},
+    alloc::Layout,
     mem::MaybeUninit,
     ptr::{self, NonNull},
-    sync::atomic::AtomicPtr,
 };
 
-use abs_cancel::TrCancellationToken;
+use abs_cancel::{TrCancellationToken, TrMayCancel};
 use gen_mcf2::gen_may_cancel_future;
 
 use crate::{
-    abs_::{TrEmplace, TrPredrop, TrScope},
+    abs_::{IntoEmplace, TrEmplace, TrPredrop, TrScope},
     index_::Retain,
-    scope_inner_::{ScopeInner, ScopeKey},
-    scope_str_::ScopeStr,
-    x_deps::abs_cancel,
+    scope_inner_::{self, ScopeInner},
+    scope_str_::ScopeStr, x_deps::abs_cancel,
 };
+
+pub use scope_inner_::TrScopeInnerConfig;
 
 #[derive(Debug)]
 pub enum ScopeError {
@@ -49,10 +49,26 @@ pub enum ScopeError {
 /// 新设计里它只是 root B+ 树中一个条目的句柄：`root_` 指出树，`key_` 指出条目。
 /// 旧实现直接持有 `&'static ScopeInner`，并靠父子链维持代际关系；见文件末尾注释。
 pub struct Scope {
-    inner_: NonNull<ScopeInner>,
+    inner_: NonNull<ScopeInner>
 }
 
 impl Scope {
+    /// 尝试以某种配置来初始化根域
+    pub fn try_init_root<TyCfg>() -> bool {
+        // 旧签名使用 `&'static AtomicPtr<ScopeInner>`，并在初始化后直接包装 root 的
+        // `ScopeInner`。新设计必须先让 `RootScope::try_init_default_root_scope_` 把 root
+        // 发布到 B+ 树，再为 root 自身分配一个 `ScopeKey`。
+        //
+        // let x = RootScope::try_init_default_root_scope_(
+        //     root_ptr,
+        //     page_size,
+        //     allocator,
+        // );
+        // x.map(Self::make_scope_)
+        //     .map_err(Self::make_scope_)
+        todo!()
+    }
+
     /// 从默认的 RootScope 中创建一个子 scope。
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
@@ -68,6 +84,13 @@ impl Scope {
         // // 以 root 域为父创建子 Scope；root 自身没有父域，临时句柄析构时会被跳过
         // let root_scope = Self::make_scope_(root);
         // Self::new_from_parent(&root_scope)
+        Self::new_with_cfg::<scope_inner_::DefaultConfig>()
+    }
+
+    pub fn new_with_cfg<C>() -> Self
+    where
+        C: TrScopeInnerConfig,
+    {
         todo!()
     }
 
@@ -77,29 +100,6 @@ impl Scope {
 }
 
 impl Scope {
-    /// 获取或者创建一个 root scope。若当前进程内已存在 root scope 则通过 Err
-    /// 返回已创建的 root scope。
-    pub fn root<A>(
-        _root_ptr: &'static AtomicPtr<RootScope>,
-        _page_size: usize,
-        _allocator: A,
-    ) -> Result<Self, Self>
-    where
-        A: 'static + Allocator,
-    {
-        // 旧签名使用 `&'static AtomicPtr<ScopeInner>`，并在初始化后直接包装 root 的
-        // `ScopeInner`。新设计必须先让 `RootScope::try_init_default_root_scope_` 把 root
-        // 发布到 B+ 树，再为 root 自身分配一个 `ScopeKey`。
-        //
-        // let x = RootScope::try_init_default_root_scope_(
-        //     root_ptr,
-        //     page_size,
-        //     allocator,
-        // );
-        // x.map(Self::make_scope_)
-        //     .map_err(Self::make_scope_)
-        todo!()
-    }
 
     /// 在同一个 root 下创建 `parent` 的子域。
     pub fn new_from_parent(_parent: &Scope) -> Self {
@@ -328,15 +328,16 @@ impl Scope {
     }
 
     /// 用 root 与键构造一个句柄。
-    fn make_scope_(root: &'static RootScope, key: ScopeKey) -> Self {
-        Scope { root_: root, key_: key }
+    fn make_scope_() -> Self {
+        todo!()
     }
 }
 
 impl TrScope for Scope {
     type Err = ScopeError;
 
-    type EmplaceWithPredropAsync<'f, M, P> = ScopeEmplaceWithPredropAsync<'f, 'f, M, P>
+    type EmplaceWithPredropAsync<'f, M, P>
+        = ScopeEmplaceWithPredropAsync<'f, 'f, M, P>
     where
         M: 'f + TrEmplace,
         P: 'f + TrPredrop<M::Target>,
@@ -354,11 +355,68 @@ impl TrScope for Scope {
     {
         ScopeEmplaceWithPredropAsync::new(self, layout, emplace, predrop)
     }
+
+    type PutWithFactoryPredropAsync<'f, Ft, Fp, P, T>
+        = ScopePutWithFactoryPredropAsync<'f, 'f, Ft, Fp, P, T>
+    where
+        Ft: 'f + FnOnce() -> T,
+        Fp: 'f + FnOnce() -> P,
+        P: 'f + TrPredrop<T>,
+        T: 'f,
+        Self: 'f;
+
+    fn put_with_factory_predrop_async<'f, Ft, Fp, P, T>(
+        &'f self,
+        val_factory: Ft,
+        predrop_factory: Fp,
+    ) -> Self::PutWithFactoryPredropAsync<'f, Ft, Fp, P, T>
+    where
+        Ft: FnOnce() -> T,
+        Fp: FnOnce() -> P,
+        P: TrPredrop<T>,
+    {
+        ScopePutWithFactoryPredropAsync::new(self, val_factory, predrop_factory)
+    }
+
+    type PutStrAsync<'f, P>
+        = ScopePutStrWithPredropAsync<'f, 'f, P>
+    where
+        P: 'f + TrPredrop<ScopeStr>,
+        Self: 'f;
+
+    fn put_str_with_predrop_async<'f, P>(
+        &'f self,
+        str: &'f str,
+        predrop: P,
+    ) -> Self::PutStrAsync<'f, P>
+    where
+        P: TrPredrop<ScopeStr>,
+    {
+        ScopePutStrWithPredropAsync::new(self, str, predrop)
+    }
+
+    type AllocUninitSliceAsync<'f, P, T>
+        = ScopeAllocUninitSliceAsync<'f, 'f, P, T>
+    where
+        P: 'f + TrPredrop<[MaybeUninit<T>]>,
+        T: 'f,
+        Self: 'f;
+
+    fn alloc_uninit_slice_async<'f, P, T>(
+        &'f self,
+        length: usize,
+        predrop: P,
+    ) -> Self::AllocUninitSliceAsync<'f, P, T>
+    where
+        P: TrPredrop<[MaybeUninit<T>]>,
+    {
+        ScopeAllocUninitSliceAsync::new(self, length, predrop)
+    }
 }
 
 impl core::cmp::PartialEq for Scope {
     fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self.root_, other.root_) && self.key_ == other.key_
+        ptr::eq(self.inner_.as_ptr(), other.inner_.as_ptr())
     }
 }
 
@@ -388,7 +446,7 @@ impl Drop for Scope {
     }
 }
 
-#[gen_may_cancel_future(ScopeEmplaceWithPredrop)]
+#[gen_may_cancel_future(ScopeEmplaceWithPredrop, pub, new(pub(crate)))]
 async fn scope_emplace_with_predrop_async<'f, M, P, K>(
     scope: &'f Scope,
     layout: Layout,
@@ -402,6 +460,84 @@ where
     K: TrCancellationToken,
 {
     Result::Err(ScopeError::ClosedScope)
+}
+
+#[gen_may_cancel_future(ScopePutWithFactoryPredrop, pub, new(pub(crate)))]
+async fn scope_put_with_factory_predrop_async<'f, Ft, Fp, P, T, K>(
+    scope: &'f Scope,
+    val_factory: Ft,
+    predrop_factory: Fp,
+    cancel: K,
+) -> Result<Retain<T>, ScopeError>
+where
+    Ft: 'f + FnOnce() -> T,
+    Fp: 'f + FnOnce() -> P,
+    P: 'f + TrPredrop<T>,
+    T: 'f,
+    K: TrCancellationToken,
+{
+    let value = val_factory();
+    let predrop = predrop_factory();
+    let layout = Layout::new::<T>();
+    let emplace = IntoEmplace::<_, T>::new(
+        |_layout, place: *mut T| {
+            // SAFETY: place 指向 arena 按 layout 划出、尚未初始化的数据区
+            unsafe { place.write(value) };
+        },
+        (),
+    );
+    // SAFETY: 由调用方满足 `TrEmplace` 的安全契约（见 trait 文档）
+    unsafe { scope.emplace_with_predrop_async(layout, emplace, predrop) }
+        .may_cancel_with(cancel)
+        .await
+}
+
+#[gen_may_cancel_future(ScopePutStrWithPredrop, pub, new(pub(crate)))]
+async fn scope_put_str_with_predrop_async<'f, P, K>(
+    scope: &'f Scope,
+    str: &'f str,
+    predrop: P,
+    cancel: K,
+) -> Result<Retain<ScopeStr>, ScopeError>
+where
+    P: 'f + TrPredrop<ScopeStr>,
+    K: TrCancellationToken,
+{
+    let len = str.len();
+    let layout = Layout::for_value(str);
+    // 元数据就是长度；闭包在 arena 给出的位置写入字节
+    let emplace = IntoEmplace::<_, ScopeStr>::new(
+        |_layout, place: *mut ScopeStr| {
+            // SAFETY: place 指向 layout 划定的数据区，写入长度与 str 一致
+            unsafe { core::ptr::copy_nonoverlapping(str.as_ptr(), place.cast::<u8>(), len) };
+        },
+        len,
+    );
+    // SAFETY: 写入长度与 layout 一致，且 str 不需要 Drop
+    unsafe { scope.emplace_with_predrop_async(layout, emplace, predrop) }
+        .may_cancel_with(cancel)
+        .await
+}
+
+#[gen_may_cancel_future(ScopeAllocUninitSlice, pub, new(pub(crate)))]
+async fn scope_alloc_uninit_slice_async<'f, P, T, K>(
+    scope: &'f Scope,
+    length: usize,
+    predrop: P,
+    cancel: K,
+) -> Result<Retain<[MaybeUninit<T>]>, ScopeError>
+where
+    P: 'f + TrPredrop<[MaybeUninit<T>]>,
+    T: 'f,
+    K: TrCancellationToken,
+{
+    let layout = Layout::array::<MaybeUninit<T>>(length).map_err(|_| ScopeError::MallocFailed)?;
+    // 未初始化切片不需要写入：arena 划出的数据区本身就是最终结果
+    let emplace = IntoEmplace::<_, [MaybeUninit<T>]>::new(|_layout, _place| {}, length);
+    // SAFETY: 数据区保持未初始化，调用方随后按契约写入
+    unsafe { scope.emplace_with_predrop_async(layout, emplace, predrop) }
+        .may_cancel_with(cancel)
+        .await
 }
 
 // ============================================================================

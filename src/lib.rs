@@ -1,3 +1,4 @@
+#![feature(allocator_ext)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(ptr_metadata)]
 #![feature(try_trait_v2)]
@@ -15,7 +16,7 @@ mod abs_;
 extern crate std;
 
 mod index_;
-mod page_size_;
+pub mod page_size;
 mod scope_;
 mod scope_inner_;
 mod scope_str_;
@@ -30,13 +31,12 @@ mod demo_;
 pub use abs_::{TrEmplace, TrScope, IntoEmplace};
 pub use index_::{Owning, Sharing, Retain};
 pub use scope_::{Scope, ScopeError};
-// 新设计里 root 是 B+ 树的持有者，`Scope::root` 需要在公开签名中引用它。
-pub use scope_inner_::RootScope;
+
 pub use scope_str_::ScopeStr;
 
 pub mod x_deps {
     pub use atomic_sync;
-    pub use atomic_sync::x_deps::{abs_cancel, abs_sync, funty};
+    pub use atomic_sync::x_deps::{abs_cancel, abs_sync, atomex, funty};
     pub use bplustree_cmp;
     pub use gen_mcf2;
 }
