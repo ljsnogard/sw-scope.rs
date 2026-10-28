@@ -35,6 +35,33 @@ where
 }
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+// 线程安全：与 `Box` / `Arc` 对齐的条件实现
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+// SAFETY: `Retain<T>` 只持有指向弱槽位的裸指针；跨线程移动它只是移动这个指针，
+// 所有状态推进都是槽位里的原子 CAS。`Clone` 只做一次弱计数原子加；`Drop` 可能
+// 在**当前线程**触发 `T` 的析构，故 `Send` 要求 `T: Send`。`&Retain<T>` 可以在
+// 多线程同时 `try_sharing()`，从而产生多个指向同一 `T` 的 `Sharing`，故 `Sync`
+// 要求 `T: Sync`。两者合起来取 `T: Send + Sync`，与 `Arc<T>` 的约束一致。
+unsafe impl<T> Send for Retain<T> where T: Send + Sync + ?Sized {}
+// SAFETY: 见上。
+unsafe impl<T> Sync for Retain<T> where T: Send + Sync + ?Sized {}
+
+// SAFETY: `Owning<T>` 是**独占**视图：它存在期间，同一对象的 `try_owning` /
+// `try_sharing` 都会失败（状态 CAS 保证），因此没有第二个线程能同时访问 `T`。
+// 跨线程移动 `Owning` 等价于把 `Box<T>` 移到另一线程，约束与 `Box<T>` 相同。
+unsafe impl<T> Send for Owning<'_, T> where T: Send + ?Sized {}
+// SAFETY: 独占视图，`&Owning<T>` 只交出 `&T`，约束与 `Box<T>` 的 `Sync` 相同。
+unsafe impl<T> Sync for Owning<'_, T> where T: Sync + ?Sized {}
+
+// SAFETY: `Sharing<T>` 是共享视图：克隆会加一次强计数，多个线程可同时持有并
+// deref 出 `&T`；最后一个共享视图析构时只改状态、不析构数据（数据由 `Retain` 或
+// 清盘负责）。与 `Arc<T>` 一致，`Send` / `Sync` 都要求 `T: Send + Sync`。
+unsafe impl<T> Send for Sharing<'_, T> where T: Send + Sync + ?Sized {}
+// SAFETY: 见上。
+unsafe impl<T> Sync for Sharing<'_, T> where T: Send + Sync + ?Sized {}
+
+// -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
 impl<'a, T> Owning<'a, T>

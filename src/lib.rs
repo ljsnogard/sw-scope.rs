@@ -34,6 +34,7 @@ mod demo_;
 pub use abs_::{TrEmplace, TrScope, IntoEmplace};
 pub use index_::{Owning, Sharing, Retain};
 pub use scope_::{Scope, ScopeError};
+pub use scope_inner_::{DefaultConfig, TrScopeInnerConfig};
 
 pub use scope_str_::ScopeStr;
 
