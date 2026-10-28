@@ -266,9 +266,11 @@ where
         // 弱计数归零：若此刻没有强引用（状态为 Created），立即走来源 (a)。
         // 若状态仍是 Owning / Sharing（只可能来自泄漏或 unsafe），留给清盘。
         let _ = claim_and_destroy_if_unreachable_(weak);
-        // 若本域已 close，最后一个 Retain 消失后重试清盘；这样并发/级联析构的
-        // 收尾也能把强池还掉。
-        try_flush_for_slot_(weak);
+        // 只有当这个槽位仍有存活数据时才值得重试关闭清盘；批量释放“已销毁”的外部
+        // Retain 时，避免每个句柄都重新扫描整条弱池链。
+        if weak.data_state().is_data_alive() {
+            try_flush_for_slot_(weak);
+        }
     }
 }
 
