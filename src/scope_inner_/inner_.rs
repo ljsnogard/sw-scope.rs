@@ -4,14 +4,13 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use atomex::LocksOrderings;
-use atomic_sync::rwlock::cooperative_arena::CooperativeRwLock;
+use atomic_sync::mutex::preemptive::SpinningMutexOwned;
 
 use crate::{
     scope_inner_::RootScope,
     strong_::{StrongChunk, StrongChunkBase, StrongPool},
     weak_::WeakPool,
-    x_deps::{atomex, atomic_sync},
+    x_deps::atomic_sync,
 };
 
 /// 一个域的内部表示。它总是内联在实体自己的 [`ScopeLock`] 里。
@@ -118,9 +117,10 @@ impl ScopeInner {
 
     /// 尝试执行延迟清盘。
     ///
-    /// 只有“已请求关闭”时才真正进入；用 `try_write` 避免在析构路径阻塞。若锁被占用，
-    /// 下一次句柄析构或 `Owning` / `Sharing` 释放时会重试。清盘循环会跳过仍然存活的
-    /// `Owning` / `Sharing` 对象，因此这里不需要等待它们全部消失。
+    /// 只有“已请求关闭”时才真正进入；用同步自旋锁 `lock().wait()` 等待。清盘循环会跳过
+    /// 仍然存活的 `Owning` / `Sharing` 对象，因此这里不需要等待它们全部消失。
+    ///
+    /// 调用方不能在已经持有本域锁的路径上再次进入；当前所有重试入口都来自释放路径。
     pub(crate) fn try_flush_(&self) {
         if !self.is_close_requested_() {
             return;
@@ -130,8 +130,8 @@ impl ScopeInner {
         };
         // SAFETY: lock_ 指向包含本结构的锁，实体在 root 池里长期存活
         let lock = unsafe { lock.as_ref() };
-        let mut session = lock.acquire_session();
-        let Result::Ok(mut guard) = session.try_write() else {
+        let mut session = lock.lock_session();
+        let Result::Ok(mut guard) = session.lock().wait() else {
             return;
         };
         // SAFETY: 已请求关闭；`flush_data_` 只强制析构 `Created` 状态的对象，遇到
@@ -151,15 +151,10 @@ impl ScopeInner {
     }
 }
 
-/// 固定的锁类型：`ScopeInner` 内联在 `UnsafeCell` 里，锁内核的分配器被擦成
-/// `&'static dyn Allocator`，因此 `Scope` 不需要知道创建期的 `C`。
-pub(crate) type ScopeLock = CooperativeRwLock<
-    ScopeInner,
-    usize,
-    AtomicUsize,
-    LocksOrderings,
-    &'static (dyn Allocator + Send + Sync),
->;
+/// 固定的锁类型：同步自旋锁，`ScopeInner` 内联在它的 `UnsafeCell` 里。
+///
+/// 不再需要锁内分配器，也不再保留异步读写锁的会话/future 形状。
+pub(crate) type ScopeLock = SpinningMutexOwned<ScopeInner>;
 
 /// 一个域的完整实体：锁（内含 [`ScopeInner`]）+ 每域一份的用户指定分配器。
 ///
@@ -234,7 +229,7 @@ where
         inner.handles_ = AtomicUsize::new(1);
         // SAFETY: entity 是刚分配、尚未写入的实体；lock_ 是首字段，地址稳定
         inner.lock_ = Option::Some(unsafe { NonNull::new_unchecked(entity.cast::<ScopeLock>()) });
-        let lock = ScopeLock::new_in(inner, AtomicUsize::new(0), root.allocator_());
+        let lock = ScopeLock::new_owned(inner);
         // SAFETY: chunk 数据区独占；锁 / 分配器分别就地写入
         unsafe {
             ptr::write(ptr::addr_of_mut!((*entity).lock_), lock);

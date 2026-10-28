@@ -1,8 +1,6 @@
 use core::{alloc::Layout, marker::PhantomData, mem::MaybeUninit};
 
-use abs_cancel::TrMayCancel;
-
-use crate::{index_::Retain, scope_str_::ScopeStr, x_deps::abs_cancel};
+use crate::{index_::Retain, scope_str_::ScopeStr};
 
 pub trait TrPredrop<T>
 where
@@ -71,12 +69,6 @@ pub trait TrEmplace {
 pub trait TrScope {
     type Err;
 
-    type EmplaceWithPredropAsync<'f, M, P>: TrMayCancel<'f, MayCancelOutput = Result<Retain<M::Target>, Self::Err>>
-    where
-        M: 'f + TrEmplace,
-        P: 'f + TrPredrop<M::Target>,
-        Self: 'f;
-
     /// Like placement new in C++, to construct big object directly in place
     /// instead of create on stack then move. This is also helpful when `T` has
     /// self-referential structure.
@@ -85,52 +77,38 @@ pub trait TrScope {
     /// - Caller must guarantee the emplaced value is safe for drop semantics;
     /// - Caller must guarantee the process of emplacement will not exceed the
     ///   memory border;
-    unsafe fn emplace_with_predrop_async<'f, M, P>(
-        &'f self,
+    unsafe fn emplace_with_predrop<M, P>(
+        &self,
         layout: Layout,
         emplace: M,
         predrop: P,
-    ) -> Self::EmplaceWithPredropAsync<'f, M, P>
+    ) -> Result<Retain<M::Target>, Self::Err>
     where
-        M: 'f + TrEmplace,
-        P: 'f + TrPredrop<M::Target>;
+        M: TrEmplace,
+        P: TrPredrop<M::Target>;
 
-    /// A convenient method calling `try_emplace_with` without `pre_drop`.
+    /// A convenient method calling [`TrScope::emplace_with_predrop`] without `predrop`.
     ///
     /// # Safety
     ///
-    /// 同 [`TrScope::emplace_with_predrop_async`]：调用方必须保证就地构造不越界，且构造
-    /// 结果满足析构语义。
-    unsafe fn emplace_async<'f, M>(
-        &'f self,
-        layout: Layout,
-        emplace: M,
-    ) -> Self::EmplaceWithPredropAsync<'f, M, ()>
+    /// 同 [`TrScope::emplace_with_predrop`]：调用方必须保证就地构造不越界，且构造结果
+    /// 满足析构语义。
+    unsafe fn emplace<M>(&self, layout: Layout, emplace: M) -> Result<Retain<M::Target>, Self::Err>
     where
         M: TrEmplace,
     {
-        unsafe { Self::emplace_with_predrop_async(self, layout, emplace, ()) }
+        // SAFETY: 由调用方保证
+        unsafe { Self::emplace_with_predrop(self, layout, emplace, ()) }
     }
 
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    type PutWithFactoryPredropAsync<'f, Ft, Fp, P, T>: TrMayCancel<'f, MayCancelOutput = Result<Retain<T>, Self::Err>>
-    where
-        Ft: FnOnce() -> T,
-        Fp: FnOnce() -> P,
-        P: TrPredrop<T>,
-        Ft: 'f,
-        Fp: 'f,
-        P: 'f,
-        T: 'f,
-        Self: 'f;
-
-    fn put_with_factory_predrop_async<'f, Ft, Fp, P, T>(
-        &'f self,
+    fn put_with_factory_predrop<Ft, Fp, P, T>(
+        &self,
         val_factory: Ft,
         predrop_factory: Fp,
-    ) -> Self::PutWithFactoryPredropAsync<'f, Ft, Fp, P, T>
+    ) -> Result<Retain<T>, Self::Err>
     where
         Ft: FnOnce() -> T,
         Fp: FnOnce() -> P,
@@ -139,46 +117,20 @@ pub trait TrScope {
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    type PutStrAsync<'f, P>: TrMayCancel<'f, MayCancelOutput = Result<Retain<ScopeStr>, Self::Err>>
-    where
-        P: TrPredrop<ScopeStr>,
-        P: 'f,
-        Self: 'f;
-
-    fn put_str_with_predrop_async<'f, P>(
-        &'f self,
-        str: &'f str,
-        predrop: P,
-    ) -> Self::PutStrAsync<'f, P>
+    fn put_str_with_predrop<P>(&self, str: &str, predrop: P) -> Result<Retain<ScopeStr>, Self::Err>
     where
         P: TrPredrop<ScopeStr>;
 
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
     // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    type AllocUninitSliceAsync<'f, P, T>: TrMayCancel<'f, MayCancelOutput = Result<Retain<[MaybeUninit<T>]>, Self::Err>>
-    where
-        P: TrPredrop<[MaybeUninit<T>]>,
-        P: 'f,
-        T: 'f,
-        Self: 'f;
-
-    fn alloc_uninit_slice_async<'f, P, T>(
-        &'f self,
+    fn alloc_uninit_slice<P, T>(
+        &self,
         length: usize,
         predrop: P,
-    ) -> Self::AllocUninitSliceAsync<'f, P, T>
+    ) -> Result<Retain<[MaybeUninit<T>]>, Self::Err>
     where
         P: TrPredrop<[MaybeUninit<T>]>;
-}
-
-pub trait TrScopeExt
-where
-    Self: TrScope,
-{
-    async fn put_async<T>(&self, _data: T) -> Result<Retain<T>, Self::Err> {
-        todo!()
-    }
 }
 
 /// 用一个"收到胖指针后自己就地写入"的闭包实现的 [`TrEmplace`]。

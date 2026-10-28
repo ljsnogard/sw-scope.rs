@@ -56,4 +56,7 @@ drops=12000
 3. 需要在 close 期间让出执行权（`close_async`），或把锁的等待路径改成适应高竞争的自旋
    锁。
 
-目前保持同步 `close` 与 `CooperativeRwLock`，避免为未测出的瓶颈增加 API 复杂度。
+旧版本保持同步 `close` 与 `CooperativeRwLock`，避免为未测出的瓶颈增加 API 复杂度。
+
+后续在 `feat/spin-scope-lock` 分支把锁换成同步 `SpinningMutexOwned` 并移除全部异步分配
+入口，重新跑了同一压力测试；对比数据见 `scope-spinlock-20261028-2252.md`。

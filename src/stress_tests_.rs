@@ -73,8 +73,8 @@ impl Drop for StressNode {
 ///   / What: all four closes return before the timeout, total close latency is below a
 ///   conservative 30s bound, no node drops during close, and exactly 12000 nodes drop after
 ///   close; releasing the now-dead external Retains does not add drops.
-#[compio::test]
-async fn many_scopes_small_pages_close_concurrently_without_deadlock() {
+#[test]
+fn many_scopes_small_pages_close_concurrently_without_deadlock() {
     const SCOPES: usize = 4;
     const PER_SCOPE: usize = 3000;
     const TOTAL: usize = SCOPES * PER_SCOPE;
@@ -92,8 +92,7 @@ async fn many_scopes_small_pages_close_concurrently_without_deadlock() {
         for index in 0..PER_SCOPE {
             per_scope.push(
                 scope
-                    .put_async(StressNode::new(index))
-                    .await
+                    .put(StressNode::new(index))
                     .expect("压力节点放入应当成功"),
             );
         }

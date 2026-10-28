@@ -1,5 +1,4 @@
 #![feature(allocator_ext)]
-#![feature(impl_trait_in_assoc_type)]
 #![feature(ptr_metadata)]
 #![feature(try_trait_v2)]
 #![no_std]

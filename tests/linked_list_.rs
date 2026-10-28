@@ -99,14 +99,13 @@ impl Drop for ViewNode {
 ///
 /// - 手段：新节点先带 `prev = tail.clone()` 放入 arena，再把旧尾的 `next` 指向新节点。
 /// - 判断：返回的句柄可继续作为下一轮的尾。
-async fn append_node(scope: &Scope, tail: &Retain<Node>, value: usize) -> Retain<Node> {
+fn append_node(scope: &Scope, tail: &Retain<Node>, value: usize) -> Retain<Node> {
     let node = scope
-        .put_async(Node {
+        .put(Node {
             value,
             prev: Some(tail.clone()),
             next: None,
         })
-        .await
         .expect("节点放入应当成功");
     {
         let mut tail_owning = tail.try_owning().expect("尾节点应当可独占");
@@ -178,18 +177,18 @@ fn collect_values(head: &Retain<Node>, count: usize) -> std::vec::Vec<usize> {
 ///   `Scope::close` 后其余节点各析构一次。
 ///   / What: the deleted node's `Drop` runs immediately exactly once; with only cycles left
 ///   the count does not grow; after `Scope::close` every remaining node is dropped once.
-#[compio::test]
-async fn same_scope_cycle_deleted_node_drops_now_and_scope_close_reclaims_rest() {
+#[test]
+fn same_scope_cycle_deleted_node_drops_now_and_scope_close_reclaims_rest() {
     SAME_SCOPE_DROPS
         .lock()
         .expect("同域析构记录锁不应中毒")
         .clear();
     let scope = Scope::new();
 
-    let head = scope.put_async(Node::new(0)).await.expect("头节点放入");
+    let head = scope.put(Node::new(0)).expect("头节点放入");
     let mut tail = head.clone();
     for value in 1..6usize {
-        tail = append_node(&scope, &tail, value).await;
+        tail = append_node(&scope, &tail, value);
     }
     // 首尾相接，形成真正的循环引用。
     {
@@ -265,8 +264,8 @@ async fn same_scope_cycle_deleted_node_drops_now_and_scope_close_reclaims_rest()
 ///   析构一次。
 ///   / What: the deleted node drops immediately; the count stays flat with only cross-scope
 ///   cycles; after closing all Scopes every remaining node is dropped once.
-#[compio::test]
-async fn cross_scope_cycle_deleted_node_drops_now_and_all_scopes_close_reclaim_rest() {
+#[test]
+fn cross_scope_cycle_deleted_node_drops_now_and_all_scopes_close_reclaim_rest() {
     CROSS_SCOPE_DROPS
         .lock()
         .expect("跨域析构记录锁不应中毒")
@@ -275,8 +274,7 @@ async fn cross_scope_cycle_deleted_node_drops_now_and_all_scopes_close_reclaim_r
     let mut nodes: std::vec::Vec<Retain<CrossNode>> = std::vec::Vec::new();
     for value in 0..6usize {
         let node = scopes[value % scopes.len()]
-            .put_async(CrossNode::new(value))
-            .await
+            .put(CrossNode::new(value))
             .expect("跨域节点放入");
         nodes.push(node);
     }
@@ -365,8 +363,8 @@ async fn cross_scope_cycle_deleted_node_drops_now_and_all_scopes_close_reclaim_r
 ///   readable, upgrades through their Retain fields fail because the targets are gone, and no
 ///   drop is duplicated. Releasing the Owning clears node 1; releasing the last Sharing clears
 ///   node 3, so all five nodes are dropped exactly once.
-#[compio::test]
-async fn close_clears_retain_only_nodes_but_keeps_owning_and_sharing() {
+#[test]
+fn close_clears_retain_only_nodes_but_keeps_owning_and_sharing() {
     VIEW_DROPS
         .lock()
         .expect("直接视图析构记录锁不应中毒")
@@ -374,12 +372,7 @@ async fn close_clears_retain_only_nodes_but_keeps_owning_and_sharing() {
     let scope = Scope::new();
     let mut nodes: std::vec::Vec<Retain<ViewNode>> = std::vec::Vec::new();
     for value in 0..5usize {
-        nodes.push(
-            scope
-                .put_async(ViewNode::new(value))
-                .await
-                .expect("视图用例节点放入"),
-        );
+        nodes.push(scope.put(ViewNode::new(value)).expect("视图用例节点放入"));
     }
     // 连成 5 节点双向环：每个节点都持有前后两个 Retain。
     for (index, node) in nodes.iter().enumerate() {

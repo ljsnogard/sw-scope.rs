@@ -4,8 +4,8 @@ use std::boxed::Box;
 use crate::*;
 
 #[cfg(test)]
-#[compio::test]
-async fn demo() {
+#[test]
+fn demo() {
     fn owning_somewhere(retain: Retain<usize>) -> Retain<usize> {
         let mut x = retain.try_owning().unwrap();
         *x = 58;
@@ -25,7 +25,7 @@ async fn demo() {
     }
 
     let scope = Scope::new();
-    let retain = scope.put_async(42).await.unwrap();
+    let retain = scope.put(42).unwrap();
     {
         let x = retain.try_owning().unwrap();
         assert_eq!(*x, 42);

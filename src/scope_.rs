@@ -4,13 +4,13 @@
 //!
 //! # 实验分支 feat/scope-lock
 //!
-//! - [`Scope`] 直接指向域实体的 `StrongChunk`；chunk 数据区首字段是
-//!   `CooperativeRwLock<ScopeInner>`，因此 `ScopeInner` 内联在锁里，没有单独的头部或堆分配；
+//! - [`Scope`] 直接指向域实体的 `StrongChunk`；chunk 数据区首字段是同步自旋锁
+//!   `SpinningMutexOwned<ScopeInner>`，因此 `ScopeInner` 内联在锁里，没有单独的头部或堆分配；
 //! - 每域一份的池分配器 `A` 内联在实体尾部，`ScopeInner::allocator_` 指向它；
 //! - [`Scope`] 实现 `Clone`：锁外原子句柄计数，最后一个句柄只做关闭标记；
 //! - 显式 [`Scope::close`] 会在没有 `Owning` / `Sharing` 直接视图时清盘本域全部
 //!   `Created` 对象，因此循环引用不依赖链表自身的 `clear`；
-//! - 所有放入操作先 `write_async()` 拿锁，再调用同步的 `ScopeInner` 方法。
+//! - 所有放入 / emplace 操作都是同步的：先 `lock().wait()` 拿自旋锁，再调用 `ScopeInner`。
 //!
 //! 实体由 `RootScope` 的分配器分配并登记到 root 的 `scopes_` 树；当前实验分支尚未实现
 //! 实体回收与 `?Sized` 元信息登记。旧实现保留在文件末尾的块注释中。
@@ -21,16 +21,12 @@ use core::{
     ptr::NonNull,
 };
 
-use abs_cancel::{NonCancellableToken, TrCancellationToken, TrMayCancel};
-use gen_mcf2::gen_may_cancel_future;
-
 use crate::{
     abs_::{IntoEmplace, TrEmplace, TrPredrop, TrScope},
     index_::Retain,
     scope_inner_::{self, DEFAULT_PAGE_SIZE, RootScope, ScopeEntity, ScopeInner, ScopeLock},
     scope_str_::ScopeStr,
     strong_::StrongChunkBase,
-    x_deps::abs_cancel,
 };
 
 pub use scope_inner_::TrScopeInnerConfig;
@@ -119,8 +115,30 @@ impl Scope {
         }
     }
 
-    pub async fn put_async<T>(&self, data: T) -> Result<Retain<T>, ScopeError> {
-        scope_put_async_(self, data, NonCancellableToken::new()).await
+    /// 同步放入一个值。
+    ///
+    /// 失败只来自弱池 / 强池分配，或域已关闭。
+    ///
+    /// # Errors
+    ///
+    /// 域已关闭，或池分配失败时返回 [`ScopeError`]。
+    pub fn put<T>(&self, data: T) -> Result<Retain<T>, ScopeError> {
+        self.with_inner_(|inner| inner.put_value_(data))?
+            .map_err(|_| ScopeError::MallocFailed)
+    }
+
+    /// 在同步自旋锁内访问本域状态。
+    fn with_inner_<R>(&self, op: impl FnOnce(&mut ScopeInner) -> R) -> Result<R, ScopeError> {
+        if self.inner_().is_closed_() {
+            return Result::Err(ScopeError::ClosedScope);
+        }
+        let mut session = self.lock_().lock_session();
+        let mut guard = match session.lock().wait() {
+            Result::Ok(guard) => guard,
+            // 同步自旋锁没有 poisoning 语义；把异常状态映射成关闭错误。
+            Result::Err(_) => return Result::Err(ScopeError::ClosedScope),
+        };
+        Result::Ok(op(&mut guard))
     }
 
     /// 显式关闭本域：拒绝后续放入，并在没有 `Owning` / `Sharing` 直接视图时清盘。
@@ -164,81 +182,48 @@ impl Scope {
 impl TrScope for Scope {
     type Err = ScopeError;
 
-    type EmplaceWithPredropAsync<'f, M, P>
-        = ScopeEmplaceWithPredropAsync<'f, 'f, M, P>
-    where
-        M: 'f + TrEmplace,
-        P: 'f + TrPredrop<M::Target>,
-        Self: 'f;
-
-    unsafe fn emplace_with_predrop_async<'f, M, P>(
-        &'f self,
+    unsafe fn emplace_with_predrop<M, P>(
+        &self,
         layout: Layout,
         emplace: M,
         predrop: P,
-    ) -> Self::EmplaceWithPredropAsync<'f, M, P>
+    ) -> Result<Retain<M::Target>, Self::Err>
     where
-        M: 'f + TrEmplace,
-        P: 'f + TrPredrop<M::Target>,
+        M: TrEmplace,
+        P: TrPredrop<M::Target>,
     {
-        ScopeEmplaceWithPredropAsync::new(self, layout, emplace, predrop)
+        scope_emplace_with_predrop_(self, layout, emplace, predrop)
     }
 
-    type PutWithFactoryPredropAsync<'f, Ft, Fp, P, T>
-        = ScopePutWithFactoryPredropAsync<'f, 'f, Ft, Fp, P, T>
-    where
-        Ft: 'f + FnOnce() -> T,
-        Fp: 'f + FnOnce() -> P,
-        P: 'f + TrPredrop<T>,
-        T: 'f,
-        Self: 'f;
-
-    fn put_with_factory_predrop_async<'f, Ft, Fp, P, T>(
-        &'f self,
+    fn put_with_factory_predrop<Ft, Fp, P, T>(
+        &self,
         val_factory: Ft,
         predrop_factory: Fp,
-    ) -> Self::PutWithFactoryPredropAsync<'f, Ft, Fp, P, T>
+    ) -> Result<Retain<T>, Self::Err>
     where
         Ft: FnOnce() -> T,
         Fp: FnOnce() -> P,
         P: TrPredrop<T>,
     {
-        ScopePutWithFactoryPredropAsync::new(self, val_factory, predrop_factory)
+        scope_put_with_factory_predrop_(self, val_factory, predrop_factory)
     }
 
-    type PutStrAsync<'f, P>
-        = ScopePutStrWithPredropAsync<'f, 'f, P>
-    where
-        P: 'f + TrPredrop<ScopeStr>,
-        Self: 'f;
-
-    fn put_str_with_predrop_async<'f, P>(
-        &'f self,
-        str: &'f str,
-        predrop: P,
-    ) -> Self::PutStrAsync<'f, P>
+    fn put_str_with_predrop<P>(&self, str: &str, predrop: P) -> Result<Retain<ScopeStr>, Self::Err>
     where
         P: TrPredrop<ScopeStr>,
     {
-        ScopePutStrWithPredropAsync::new(self, str, predrop)
+        scope_put_str_with_predrop_(self, str, predrop)
     }
 
-    type AllocUninitSliceAsync<'f, P, T>
-        = ScopeAllocUninitSliceAsync<'f, 'f, P, T>
-    where
-        P: 'f + TrPredrop<[MaybeUninit<T>]>,
-        T: 'f,
-        Self: 'f;
-
-    fn alloc_uninit_slice_async<'f, P, T>(
-        &'f self,
+    fn alloc_uninit_slice<P, T>(
+        &self,
         length: usize,
         predrop: P,
-    ) -> Self::AllocUninitSliceAsync<'f, P, T>
+    ) -> Result<Retain<[MaybeUninit<T>]>, Self::Err>
     where
         P: TrPredrop<[MaybeUninit<T>]>,
     {
-        ScopeAllocUninitSliceAsync::new(self, length, predrop)
+        scope_alloc_uninit_slice_(self, length, predrop)
     }
 }
 
@@ -280,73 +265,32 @@ impl Drop for Scope {
     }
 }
 
-#[gen_may_cancel_future(ScopeEmplaceWithPredrop, pub, new(pub(crate)))]
-async fn scope_emplace_with_predrop_async<'f, M, P, K>(
-    scope: &'f Scope,
+fn scope_emplace_with_predrop_<M, P>(
+    scope: &Scope,
     layout: Layout,
     emplace: M,
     predrop: P,
-    cancel: K,
 ) -> Result<Retain<M::Target>, ScopeError>
 where
-    M: 'f + TrEmplace,
-    P: 'f + TrPredrop<M::Target>,
-    K: TrCancellationToken,
+    M: TrEmplace,
+    P: TrPredrop<M::Target>,
 {
-    if scope.inner_().is_closed_() {
-        return Result::Err(ScopeError::ClosedScope);
-    }
-    let mut sess = scope.lock_().acquire_session();
-    let mut guard = sess
-        .write_async()
-        .may_cancel_with(cancel)
-        .await
-        // TODO(实验): 锁错误（Cancelled / Poisoned）还没有独立的公开错误变体
-        .map_err(|_| ScopeError::ClosedScope)?;
-    // SAFETY: 调用方是 `unsafe fn emplace_with_predrop_async` 的下游，已经承担
+    // SAFETY: 调用方是 `unsafe fn emplace_with_predrop` 的下游，已经承担
     // `TrEmplace::emplace` 与数据布局的安全契约。
-    unsafe { guard.emplace_value_with_(layout, emplace, predrop) }
-        .map_err(|_| ScopeError::MallocFailed)
+    let result = scope
+        .with_inner_(|inner| unsafe { inner.emplace_value_with_(layout, emplace, predrop) })?;
+    result.map_err(|_| ScopeError::MallocFailed)
 }
 
-#[gen_may_cancel_future(ScopePut)]
-async fn scope_put_async_<'f, T, K>(
-    scope: &'f Scope,
-    value: T,
-    cancel: K,
-) -> Result<Retain<T>, ScopeError>
-where
-    T: 'f,
-    K: TrCancellationToken,
-{
-    if scope.inner_().is_closed_() {
-        return Result::Err(ScopeError::ClosedScope);
-    }
-    let mut sess = scope.lock_().acquire_session();
-    let mut guard = sess
-        .write_async()
-        .may_cancel_with(cancel)
-        .await
-        // TODO(实验): 锁错误（Cancelled / Poisoned）还没有独立的公开错误变体
-        .map_err(|_| ScopeError::ClosedScope)?;
-    guard
-        .put_value_(value)
-        .map_err(|_| ScopeError::MallocFailed)
-}
-
-#[gen_may_cancel_future(ScopePutWithFactoryPredrop, pub, new(pub(crate)))]
-async fn scope_put_with_factory_predrop_async<'f, Ft, Fp, P, T, K>(
-    scope: &'f Scope,
+fn scope_put_with_factory_predrop_<Ft, Fp, P, T>(
+    scope: &Scope,
     val_factory: Ft,
     predrop_factory: Fp,
-    cancel: K,
 ) -> Result<Retain<T>, ScopeError>
 where
-    Ft: 'f + FnOnce() -> T,
-    Fp: 'f + FnOnce() -> P,
-    P: 'f + TrPredrop<T>,
-    T: 'f,
-    K: TrCancellationToken,
+    Ft: FnOnce() -> T,
+    Fp: FnOnce() -> P,
+    P: TrPredrop<T>,
 {
     let value = val_factory();
     let predrop = predrop_factory();
@@ -359,21 +303,16 @@ where
         (),
     );
     // SAFETY: 由调用方满足 `TrEmplace` 的安全契约（见 trait 文档）
-    unsafe { scope.emplace_with_predrop_async(layout, emplace, predrop) }
-        .may_cancel_with(cancel)
-        .await
+    unsafe { scope.emplace_with_predrop(layout, emplace, predrop) }
 }
 
-#[gen_may_cancel_future(ScopePutStrWithPredrop, pub, new(pub(crate)))]
-async fn scope_put_str_with_predrop_async<'f, P, K>(
-    scope: &'f Scope,
-    str: &'f str,
+fn scope_put_str_with_predrop_<P>(
+    scope: &Scope,
+    str: &str,
     predrop: P,
-    cancel: K,
 ) -> Result<Retain<ScopeStr>, ScopeError>
 where
-    P: 'f + TrPredrop<ScopeStr>,
-    K: TrCancellationToken,
+    P: TrPredrop<ScopeStr>,
 {
     let len = str.len();
     let layout = Layout::for_value(str);
@@ -386,30 +325,22 @@ where
         len,
     );
     // SAFETY: 写入长度与 layout 一致，且 str 不需要 Drop
-    unsafe { scope.emplace_with_predrop_async(layout, emplace, predrop) }
-        .may_cancel_with(cancel)
-        .await
+    unsafe { scope.emplace_with_predrop(layout, emplace, predrop) }
 }
 
-#[gen_may_cancel_future(ScopeAllocUninitSlice, pub, new(pub(crate)))]
-async fn scope_alloc_uninit_slice_async<'f, P, T, K>(
-    scope: &'f Scope,
+fn scope_alloc_uninit_slice_<P, T>(
+    scope: &Scope,
     length: usize,
     predrop: P,
-    cancel: K,
 ) -> Result<Retain<[MaybeUninit<T>]>, ScopeError>
 where
-    P: 'f + TrPredrop<[MaybeUninit<T>]>,
-    T: 'f,
-    K: TrCancellationToken,
+    P: TrPredrop<[MaybeUninit<T>]>,
 {
     let layout = Layout::array::<MaybeUninit<T>>(length).map_err(|_| ScopeError::MallocFailed)?;
     // 未初始化切片不需要写入：arena 划出的数据区本身就是最终结果
     let emplace = IntoEmplace::<_, [MaybeUninit<T>]>::new(|_layout, _place| {}, length);
     // SAFETY: 数据区保持未初始化，调用方随后按契约写入
-    unsafe { scope.emplace_with_predrop_async(layout, emplace, predrop) }
-        .may_cancel_with(cancel)
-        .await
+    unsafe { scope.emplace_with_predrop(layout, emplace, predrop) }
 }
 
 // ============================================================================
@@ -883,8 +814,8 @@ mod tests_ {
     /// - 判断：两个句柄相等，两次放入都能读回原值，计数分配器至少被调用一次。
     ///   / What: handles compare equal, both puts read back, and the counting allocator was
     ///   called at least once.
-    #[compio::test]
-    async fn scope_clone_shares_locked_entity_and_uses_per_scope_allocator() {
+    #[test]
+    fn scope_clone_shares_locked_entity_and_uses_per_scope_allocator() {
         assert_send_sync::<Scope>();
 
         ALLOCS.store(0, Ordering::SeqCst);
@@ -894,8 +825,8 @@ mod tests_ {
         let clone = scope.clone();
         assert!(scope == clone, "克隆句柄必须指向同一个实体");
 
-        let first = scope.put_async(11u32).await.expect("第一次放入应当成功");
-        let second = clone.put_async(22u32).await.expect("第二次放入应当成功");
+        let first = scope.put(11u32).expect("第一次放入应当成功");
+        let second = clone.put(22u32).expect("第二次放入应当成功");
         assert_eq!(*first.try_owning().expect("第一个值应当可独占"), 11);
         assert_eq!(*second.try_owning().expect("第二个值应当可独占"), 22);
         assert!(
@@ -908,13 +839,13 @@ mod tests_ {
         drop(second);
     }
 
-    /// 测试多个线程通过各自的 Runtime 并发放入时，所有写操作都在同一把实体锁上排队。
-    /// Test that concurrent puts from multiple threads are serialized by the entity lock.
+    /// 测试多个线程并发同步放入时，所有写操作都在同一把实体自旋锁上排队。
+    /// Test that concurrent synchronous puts from multiple threads are serialized by the
+    /// entity spinlock.
     ///
-    /// - 手段：克隆同一个 `Scope` 到 4 个线程，每个线程建自己的 compio Runtime 并放入
-    ///   一个不同的值。
-    ///   / How: clone one scope into four threads, each with its own compio Runtime, and put
-    ///   a distinct value.
+    /// - 手段：克隆同一个 `Scope` 到 4 个线程，每个线程直接调用同步 `put` 放入一个不同的值。
+    ///   / How: clone one scope into four threads and call the synchronous `put` directly in
+    ///   each thread.
     /// - 判断：所有线程都成功读回自己放入的值，说明锁与句柄计数在跨线程下可用。
     ///   / What: every thread reads back its own value, showing the lock and handle count work
     ///   across threads.
@@ -925,13 +856,10 @@ mod tests_ {
         for round in 0..4u32 {
             let scope = scope.clone();
             threads.push(std::thread::spawn(move || {
-                let runtime = compio::runtime::Runtime::new().expect("创建 Runtime 应当成功");
-                runtime.block_on(async move {
-                    let retain = scope.put_async(round).await.expect("跨线程放入应当成功");
-                    let value = *retain.try_owning().expect("数据应当可独占");
-                    drop(retain);
-                    value
-                })
+                let retain = scope.put(round).expect("跨线程放入应当成功");
+                let value = *retain.try_owning().expect("数据应当可独占");
+                drop(retain);
+                value
             }));
         }
         let values: std::vec::Vec<u32> = threads
@@ -950,17 +878,14 @@ mod tests_ {
     /// - 判断：两个域都能读回各自的值，说明异质 `ScopeEntity` 共存于 root 的强块池。
     ///   / What: both scopes read back their own values, showing heterogeneous scope entities
     ///   coexist in the root strong pool.
-    #[compio::test]
-    async fn root_entity_pool_holds_heterogeneous_scope_entities() {
+    #[test]
+    fn root_entity_pool_holds_heterogeneous_scope_entities() {
         let tagged = Scope::new_with_alloc_value::<TaggedAlloc, scope_inner_::DefaultConfig<Global>>(
             TaggedAlloc { _tag: 7 },
         );
         let plain = Scope::new_with_alloc::<Global, scope_inner_::DefaultConfig<Global>>();
-        let first = tagged
-            .put_async(1u32)
-            .await
-            .expect("TaggedAlloc 域放入应当成功");
-        let second = plain.put_async(2u32).await.expect("Global 域放入应当成功");
+        let first = tagged.put(1u32).expect("TaggedAlloc 域放入应当成功");
+        let second = plain.put(2u32).expect("Global 域放入应当成功");
         assert_eq!(*first.try_owning().expect("第一个值应当可独占"), 1);
         assert_eq!(*second.try_owning().expect("第二个值应当可独占"), 2);
         assert!(
@@ -998,12 +923,12 @@ mod tests_ {
     /// - 判断：`DropProbe` 尺寸为 0；放入后计数为 0，`Retain` 析构后计数恰好为 1。
     ///   / What: `DropProbe` is zero-sized; the counter is 0 after the put and exactly 1 after
     ///   the Retain is dropped.
-    #[compio::test]
-    async fn retain_drop_runs_typed_destructor() {
+    #[test]
+    fn retain_drop_runs_typed_destructor() {
         assert_eq!(core::mem::size_of::<DropProbe>(), 0, "本用例覆盖 ZST");
         DROPS.store(0, Ordering::SeqCst);
         let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
-        let retain = scope.put_async(DropProbe).await.expect("放入应当成功");
+        let retain = scope.put(DropProbe).expect("放入应当成功");
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
         drop(retain);
         assert_eq!(DROPS.load(Ordering::SeqCst), 1, "应当执行一次 T::drop");
@@ -1018,10 +943,10 @@ mod tests_ {
     /// - 判断：每一步之后仍能重新独占 / 读取；最后一个 Retain 析构时数据恰好销毁一次。
     ///   / What: after each step the data can be read/owned again, and the final Retain drop
     ///   destroys it exactly once.
-    #[compio::test]
-    async fn owning_and_sharing_handles_roundtrip() {
+    #[test]
+    fn owning_and_sharing_handles_roundtrip() {
         let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
-        let retain = scope.put_async(10u32).await.expect("放入应当成功");
+        let retain = scope.put(10u32).expect("放入应当成功");
         {
             let mut owned = retain.try_owning().expect("应当可独占");
             *owned = 20;
@@ -1143,14 +1068,14 @@ mod erased_drop_tests_ {
     ///   one.
     /// - 判断：放入后计数为 0；每析构一个句柄计数加 1，最终恰好为 3。
     ///   / What: the counter is 0 after the puts and increments once per handle drop, ending at 3.
-    #[compio::test]
-    async fn repeated_puts_of_same_type_drop_each_once() {
+    #[test]
+    fn repeated_puts_of_same_type_drop_each_once() {
         SAME_TYPE_DROPS.store(0, Ordering::Release);
         let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
 
-        let first = scope.put_async(SameTypeProbe).await.expect("第一次放入");
-        let second = scope.put_async(SameTypeProbe).await.expect("第二次放入");
-        let third = scope.put_async(SameTypeProbe).await.expect("第三次放入");
+        let first = scope.put(SameTypeProbe).expect("第一次放入");
+        let second = scope.put(SameTypeProbe).expect("第二次放入");
+        let third = scope.put(SameTypeProbe).expect("第三次放入");
         assert_eq!(SAME_TYPE_DROPS.load(Ordering::Acquire), 0);
 
         drop(first);
@@ -1171,8 +1096,8 @@ mod erased_drop_tests_ {
     /// - 判断：`try_owning` 得到的切片长度为 3；析构句柄前计数为 0，析构后恰好为 3。
     ///   / What: the owned slice has length 3; the counter is 0 before the drop and exactly 3
     ///   afterwards.
-    #[compio::test]
-    async fn unsized_slice_drop_reads_per_object_metadata() {
+    #[test]
+    fn unsized_slice_drop_reads_per_object_metadata() {
         SLICE_DROPS.store(0, Ordering::Release);
         let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
 
@@ -1196,8 +1121,7 @@ mod erased_drop_tests_ {
             len,
         );
         // SAFETY: emplace 写入的元素个数与 layout、metadata 一致
-        let retain = unsafe { scope.emplace_with_predrop_async(layout, emplace, ()) }
-            .await
+        let retain = unsafe { scope.emplace_with_predrop(layout, emplace, ()) }
             .expect("?Sized 放入应当成功");
 
         assert_eq!(
@@ -1217,22 +1141,21 @@ mod erased_drop_tests_ {
     /// 测试 Predrop 类型参与 vtable 合成键，析构时先跑钩子再析构数据。
     /// Test that the Predrop type is part of the vtable key and runs before the data drop.
     ///
-    /// - 手段：通过 `put_with_factory_predrop_async` 放入 `PredropProbe`，钩子类型为
+    /// - 手段：通过 `put_with_factory_predrop` 放入 `PredropProbe`，钩子类型为
     ///   `PredropHook`，随后析构 `Retain`。
-    ///   / How: put a `PredropProbe` through `put_with_factory_predrop_async` with `PredropHook`
+    ///   / How: put a `PredropProbe` through `put_with_factory_predrop` with `PredropHook`
     ///   as the Predrop type, then drop the `Retain`.
     /// - 判断：析构前两个计数都是 0；析构后钩子与 `Drop` 都恰好为 1。
     ///   / What: both counters are 0 before the drop and exactly 1 for both the hook and `Drop`
     ///   afterwards.
-    #[compio::test]
-    async fn predrop_vtable_runs_hook_then_drop() {
+    #[test]
+    fn predrop_vtable_runs_hook_then_drop() {
         PREDROP_HOOKS.store(0, Ordering::Release);
         PREDROP_DROPS.store(0, Ordering::Release);
         let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
 
         let retain = scope
-            .put_with_factory_predrop_async(|| PredropProbe, || PredropHook)
-            .await
+            .put_with_factory_predrop(|| PredropProbe, || PredropHook)
             .expect("带 Predrop 的放入应当成功");
         assert_eq!(PREDROP_HOOKS.load(Ordering::Acquire), 0);
         assert_eq!(PREDROP_DROPS.load(Ordering::Acquire), 0);
@@ -1245,18 +1168,17 @@ mod erased_drop_tests_ {
     /// 测试 `str` 的每对象长度元数据能经类型擦除路径还原为 `&str`。
     /// Test that per-object length metadata for `str` round-trips through the erased path.
     ///
-    /// - 手段：通过 `put_str_with_predrop_async` 放入 `"hello"`，再用 `Owning` 读取。
-    ///   / How: put `"hello"` through `put_str_with_predrop_async` and read it through `Owning`.
+    /// - 手段：通过 `put_str_with_predrop` 放入 `"hello"`，再用 `Owning` 读取。
+    ///   / How: put `"hello"` through `put_str_with_predrop` and read it through `Owning`.
     /// - 判断：读出的字符串内容与长度都正确，析构句柄不会触发错误析构。
     ///   / What: the string content and length are correct, and dropping the handle does not run
     ///   a wrong destructor.
-    #[compio::test]
-    async fn put_str_keeps_length_metadata() {
+    #[test]
+    fn put_str_keeps_length_metadata() {
         let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
 
         let retain = scope
-            .put_str_with_predrop_async("hello", ())
-            .await
+            .put_str_with_predrop("hello", ())
             .expect("放入 str 应当成功");
         let owning = retain.try_owning().expect("字符串应当可独占");
         let text: &str = &owning;
@@ -1268,14 +1190,14 @@ mod erased_drop_tests_ {
     /// 测试固定尺寸、非 ZST、带较高对齐要求且实现 `Drop` 的类型。
     /// Test a fixed-size, non-ZST type with a stronger alignment requirement and a `Drop` impl.
     ///
-    /// - 手段：通过 `put_async` 放入 `FixedProbe`（16 字节对齐），先用 `Owning` 读回字段，
+    /// - 手段：通过同步 `put` 放入 `FixedProbe`（16 字节对齐），先用 `Owning` 读回字段，
     ///   再析构最后一个 `Retain`。
-    ///   / How: put a 16-byte-aligned `FixedProbe` through `put_async`, read its field through
+    ///   / How: put a 16-byte-aligned `FixedProbe` through synchronous `put`, read its field through
     ///   `Owning`, then drop the last `Retain`.
     /// - 判断：读回值与写入值一致；析构计数从 0 变为恰好 1。
     ///   / What: the read value matches the written one and the drop counter goes from 0 to 1.
-    #[compio::test]
-    async fn fixed_sized_aligned_drop_runs_once() {
+    #[test]
+    fn fixed_sized_aligned_drop_runs_once() {
         FIXED_DROPS.store(0, Ordering::Release);
         assert_eq!(
             core::mem::align_of::<FixedProbe>(),
@@ -1286,11 +1208,10 @@ mod erased_drop_tests_ {
         let expected = 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEFu128;
 
         let retain = scope
-            .put_async(FixedProbe {
+            .put(FixedProbe {
                 value: expected,
                 text: String::from("fixed-probe"),
             })
-            .await
             .expect("固定尺寸类型放入应当成功");
         let owned = retain.try_owning().expect("固定尺寸对象应当可独占");
         assert_eq!(owned.value, expected);
@@ -1313,8 +1234,8 @@ mod erased_drop_tests_ {
     ///   具体类型的 `Drop`。
     ///   / What: the trait method reads the original value and the drop counter is exactly 1,
     ///   proving the vtable metadata is rebuilt and dispatches to the concrete `Drop`.
-    #[compio::test]
-    async fn trait_object_dst_drop_uses_vtable_metadata() {
+    #[test]
+    fn trait_object_dst_drop_uses_vtable_metadata() {
         DYN_DROPS.store(0, Ordering::Release);
         let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
 
@@ -1337,8 +1258,7 @@ mod erased_drop_tests_ {
             meta,
         );
         // SAFETY: 数据区大小/对齐来自 source，闭包写入一个完整的 DynProbe
-        let retain = unsafe { scope.emplace_with_predrop_async(layout, emplace, ()) }
-            .await
+        let retain = unsafe { scope.emplace_with_predrop(layout, emplace, ()) }
             .expect("trait object DST 放入应当成功");
 
         assert_eq!(
@@ -1367,15 +1287,12 @@ mod erased_drop_tests_ {
     /// - 判断：视图存活时 Drop 计数为 0；释放视图后各自恰好析构一次，且不重复。
     ///   / What: the drop counter stays 0 while the views are alive, then each object is dropped
     ///   exactly once after its view is released.
-    #[compio::test]
-    async fn close_skips_live_access_views_until_released() {
+    #[test]
+    fn close_skips_live_access_views_until_released() {
         CLOSE_DROPS.store(0, Ordering::Release);
 
         let scope_owning = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
-        let retain_owning = scope_owning
-            .put_async(CloseProbe)
-            .await
-            .expect("Owning 用例放入");
+        let retain_owning = scope_owning.put(CloseProbe).expect("Owning 用例放入");
         let owning = retain_owning.try_owning().expect("应当可独占");
         scope_owning.close();
         assert_eq!(
@@ -1393,10 +1310,7 @@ mod erased_drop_tests_ {
         assert_eq!(CLOSE_DROPS.load(Ordering::Acquire), 1, "不得重复析构");
 
         let scope_sharing = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
-        let retain_sharing = scope_sharing
-            .put_async(CloseProbe)
-            .await
-            .expect("Sharing 用例放入");
+        let retain_sharing = scope_sharing.put(CloseProbe).expect("Sharing 用例放入");
         let sharing = retain_sharing.try_sharing().expect("应当可共享");
         scope_sharing.close();
         assert_eq!(
