@@ -482,7 +482,9 @@ impl WeakSlotState {
     pub(crate) fn reset_all(&mut self) {
         // 归还时还锁着，说明有线程卡在升级/初始化路径里，这属于逻辑错误
         debug_assert!(!self.is_locked(), "归还槽位时状态锁应当已经释放");
-        self.weak_state_ = AtomicFlags::new(AtomicU32::new(0));
+        // 必须用原子 store，而不能整体替换 `AtomicFlags`：归还槽位可能与清盘线程的
+        // `data_state()` 原子读并发，整体替换会变成对同一块内存的非原子写。
+        self.weak_state_.as_ref().store(0, Ordering::Release);
     }
 
     /// 首次初始化一个从未使用过的槽位的状态字：无条件写入初值。
@@ -490,7 +492,7 @@ impl WeakSlotState {
     /// 与 [`WeakSlotState::reset_all`] 的区别是这里不做任何断言——此刻内存里是分配器
     /// 给的随机字节，没有"上一个使用者"可言。
     pub(crate) fn init_unallocated(&mut self) {
-        self.weak_state_ = AtomicFlags::new(AtomicU32::new(0));
+        self.weak_state_.as_ref().store(0, Ordering::Release);
     }
 }
 

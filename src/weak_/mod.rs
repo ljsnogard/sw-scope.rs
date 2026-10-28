@@ -5,6 +5,8 @@ mod slot_;
 mod tests_;
 
 pub(crate) use pool_::WeakPool;
+#[cfg(test)]
+pub(crate) use pool_::freed_count_of_;
 // `meta_to_raw_` 供分配管线把 `?Sized` 的每对象元数据搬成裸字，直接写进强块 meta 槽；
 // 类型表只保存类型级 vtable，不承载每对象长度。
 #[allow(unused_imports)]

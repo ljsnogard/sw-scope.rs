@@ -1,19 +1,22 @@
 //! [`Scope`]：整棵树里一个域的公开句柄。
 //!
-//! # 新设计（重构中）
+//! # 多 root 下的域创建
 //!
-//! # 实验分支 feat/scope-lock
+//! `Scope` 不再有“进程默认 root”可用：每个域都必须显式绑定一个
+//! [`RootScope`](crate::RootScope)。推荐入口是 [`Scope::new_in`] 系列；域实体由 root 的
+//! 实体池分配，实体里的 `ScopeInner.root_` 指回 root，类型表查找也因此是 per-root 的。
 //!
 //! - [`Scope`] 直接指向域实体的 `StrongChunk`；chunk 数据区首字段是
-//!   `CooperativeRwLock<ScopeInner>`，因此 `ScopeInner` 内联在锁里，没有单独的头部或堆分配；
+//!   `CooperativeRwLock<ScopeInner>`，因此 `ScopeInner` 内联在锁里；
 //! - 每域一份的池分配器 `A` 内联在实体尾部，`ScopeInner::allocator_` 指向它；
 //! - [`Scope`] 实现 `Clone`：锁外原子句柄计数，最后一个句柄只做关闭标记；
 //! - 显式 [`Scope::close`] 会在没有 `Owning` / `Sharing` 直接视图时清盘本域全部
 //!   `Created` 对象，因此循环引用不依赖链表自身的 `clear`；
-//! - 所有放入操作先 `write_async()` 拿锁，再调用同步的 `ScopeInner` 方法。
+//! - 所有放入操作先 `write_async()` 拿锁，再调用同步的 `ScopeInner` 方法；
+//! - root 被 [`RootScope::close`](crate::RootScope::close) 关闭后，本域拒绝新放入并返回
+//!   [`ScopeError::ClosedRoot`]；最后一个完成清空的域所在线程负责 root 的最终清理。
 //!
-//! 实体由 `RootScope` 的分配器分配并登记到 root 的 `scopes_` 树；当前实验分支尚未实现
-//! 实体回收与 `?Sized` 元信息登记。旧实现保留在文件末尾的块注释中。
+//! 旧实现保留在文件末尾的块注释中。
 
 use core::{
     alloc::{Allocator, Layout},
@@ -27,7 +30,7 @@ use gen_mcf2::gen_may_cancel_future;
 use crate::{
     abs_::{IntoEmplace, TrEmplace, TrPredrop, TrScope},
     index_::Retain,
-    scope_inner_::{self, DEFAULT_PAGE_SIZE, RootScope, ScopeEntity, ScopeInner, ScopeLock},
+    scope_inner_::{self, RootLease, RootScope, ScopeInner, ScopeLock},
     scope_str_::ScopeStr,
     strong_::StrongChunkBase,
     x_deps::abs_cancel,
@@ -47,6 +50,9 @@ pub enum ScopeError {
     ///
     /// 未开启该 feature 时，关闭标记会被忽略，放入照常成功。
     ClosedScope,
+
+    /// 所属 root 已经被 [`RootScope::close`] 关闭，不再允许创建新域或放入新对象。
+    ClosedRoot,
 }
 
 /// 一个域的公开句柄：与 `Sharing` 类似，直接指向域实体的 `StrongChunk`。
@@ -55,68 +61,80 @@ pub enum ScopeError {
 /// `ScopeLock`（内含 `ScopeInner`），尾部是每域分配器。`Scope` 不需要知道 `A`，
 /// 因为锁、句柄计数和分配器都可以从 chunk 的数据地址 / `ScopeInner` 取得。
 pub struct Scope {
-    /// 域实体的强块首址；root 的实体池保证它在进程内稳定。
+    /// 域实体的强块首址；root 的实体池保证它在 root 最终清理前稳定。
     chunk_: NonNull<StrongChunkBase>,
 }
 
 impl Scope {
-    /// 用给定配置的页大小初始化默认 root。
+    /// 在指定 root 下创建一个使用默认分配器 / 默认配置的域。
     ///
-    /// 后到的并发调用会拿到先到者发布的 root；返回 `true` 表示 root 已可用。
-    pub fn try_init_root<TyCfg>() -> bool
-    where
-        TyCfg: TrScopeInnerConfig,
-    {
-        let page_size = <TyCfg::PageSize as crate::page_size::TrPageSizeSelect>::PAGE_SIZE;
-        // root 自己的实体池使用配置的分配器类型；已发布的 root 不会被替换。
-        let root_alloc = <TyCfg::PoolAlloc as Default>::default();
-        let _ = RootScope::try_init_default_root_scope_(page_size, root_alloc);
-        true
+    /// # Errors
+    ///
+    /// root 已经关闭时返回 [`ScopeError::ClosedRoot`]；实体分配失败时返回
+    /// [`ScopeError::MallocFailed`]。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::{ptr, sync::atomic::AtomicPtr};
+    /// use std::alloc::Global;
+    /// use sw_scope::{RootScope, Scope};
+    ///
+    /// let slot: &'static mut AtomicPtr<RootScope> =
+    ///     Box::leak(Box::new(AtomicPtr::new(ptr::null_mut())));
+    /// let root = match RootScope::try_init_in(slot, 4096, Global) {
+    ///     Ok(root) | Err(root) => root,
+    /// };
+    /// let scope = Scope::new_in(root).expect("新建域应当成功");
+    /// drop(scope);
+    /// ```
+    pub fn new_in(root: &'static RootScope) -> Result<Self, ScopeError> {
+        Self::new_in_with_cfg::<scope_inner_::DefaultConfig<alloc::alloc::Global>>(root)
     }
 
-    /// 从默认的 RootScope 中创建一个子 scope。
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self::new_with_cfg::<scope_inner_::DefaultConfig<alloc::alloc::Global>>()
-    }
-
-    /// 按给定配置创建域句柄：`C::PoolAlloc` 决定每域分配器类型，
+    /// 按给定配置在指定 root 下创建域：`C::PoolAlloc` 决定每域分配器类型，
     /// `C::PageSize` 决定开新池的页大小。
-    pub fn new_with_cfg<C>() -> Self
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Scope::new_in`]。
+    pub fn new_in_with_cfg<C>(root: &'static RootScope) -> Result<Self, ScopeError>
     where
         C: TrScopeInnerConfig,
     {
-        Self::new_with_alloc::<C::PoolAlloc, C>()
+        Self::new_in_with_alloc::<C::PoolAlloc, C>(root)
     }
 
-    /// 按给定配置创建域句柄，池分配器使用 `A::default()`。
-    pub fn new_with_alloc<A, C>() -> Self
+    /// 按给定配置在指定 root 下创建域，池分配器使用 `A::default()`。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Scope::new_in`]。
+    pub fn new_in_with_alloc<A, C>(root: &'static RootScope) -> Result<Self, ScopeError>
     where
         A: Allocator + Default + Send + Sync + 'static,
         C: TrScopeInnerConfig,
     {
-        Self::new_with_alloc_value::<A, C>(A::default())
+        Self::new_in_with_alloc_value::<A, C>(root, A::default())
     }
 
-    /// 按给定配置与具体分配器值创建域句柄。
+    /// 按给定配置与具体分配器值，在指定 root 下创建域。
     ///
-    /// `A` 是每域一份的池分配器，直接内联存放在实体尾部，不会单独堆分配。
+    /// `A` 是每域一份的池分配器，直接内联存放在实体尾部，不会单独堆分配；root 最终清理
+    /// 时由实体 vtable 析构。
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// root 分配器无法提供实体内存时 panic；需要可恢复错误时请后续接入
-    /// `try_new_with_alloc_value`。
-    pub fn new_with_alloc_value<A, C>(alloc: A) -> Self
+    /// 同 [`Scope::new_in`]。
+    pub fn new_in_with_alloc_value<A, C>(
+        root: &'static RootScope,
+        alloc: A,
+    ) -> Result<Self, ScopeError>
     where
         A: Allocator + Send + Sync + 'static,
         C: TrScopeInnerConfig,
     {
-        let root = Self::default_root_();
-        let page_size = <C::PageSize as crate::page_size::TrPageSizeSelect>::PAGE_SIZE;
-        match ScopeEntity::<A>::allocate_entity_(root, alloc, page_size) {
-            Result::Ok(chunk_) => Scope { chunk_ },
-            Result::Err(_) => panic!("分配 ScopeEntity 失败"),
-        }
+        root.try_new_scope_::<A, C>(alloc)
     }
 
     pub async fn put_async<T>(&self, data: T) -> Result<Retain<T>, ScopeError> {
@@ -130,21 +148,27 @@ impl Scope {
     /// 释放后再清盘。指向已清除对象的 `Retain` 会变成失效句柄（`try_owning` /
     /// `try_sharing` 返回 [`None`]），但不会悬空。
     ///
-    /// 该方法消费一个 `Scope` 句柄；若还有其他克隆句柄，它们同样会看到关闭状态。
+    /// 该方法消费一个 `Scope` 句柄；若还有其他克隆句柄，它们同样会看到关闭状态。若这是
+    /// 最后一个完成清空的域，且 root 已经 close，则本调用会在返回前完成 root 最终清理。
+    ///
+    /// # 注意
+    ///
+    /// 若 root 已经被 [`RootScope::close`](crate::RootScope::close)（unsafe）关闭，调用方
+    /// 必须遵守那里的契约：不要在 root 最终清理之后继续使用本域创建的句柄。
     pub fn close(self) {
-        self.inner_().request_close_();
+        // request_close_ 内部会 flush；此时仍有一个句柄（self），因此不会触发 root 清理。
+        let _ = self.inner_().request_close_();
+        // self 在函数结束时 Drop：减句柄、再 flush、必要时 finalize root。
     }
 
-    /// 取默认 root；并发初始化时后到者拿到先到者发布的 root。
-    fn default_root_() -> &'static RootScope {
-        match RootScope::try_init_default_root_scope_(DEFAULT_PAGE_SIZE, alloc::alloc::Global) {
-            Result::Ok(root) | Result::Err(root) => root,
-        }
+    /// 由 root 实体分配路径构造句柄。
+    pub(crate) const fn from_chunk_(chunk: NonNull<StrongChunkBase>) -> Self {
+        Scope { chunk_: chunk }
     }
 
     /// 实体 chunk 首址。
     fn chunk_(&self) -> &StrongChunkBase {
-        // SAFETY: 实体由 'static root 持有，且在句柄存活期间不会被释放
+        // SAFETY: 实体由 root 实体池持有，在 root 最终清理前不会释放
         unsafe { self.chunk_.as_ref() }
     }
 
@@ -158,6 +182,34 @@ impl Scope {
     fn inner_(&self) -> &ScopeInner {
         // SAFETY: lock 由实体持有；ScopeInner 内联在锁的 UnsafeCell 中，地址稳定
         unsafe { &*self.lock_().as_mut_ptr() }
+    }
+
+    /// 实体里 `ScopeInner` 的裸指针；供需要在退出实体后才能完成的收尾路径使用。
+    fn inner_ptr_(&self) -> NonNull<ScopeInner> {
+        // SAFETY: ScopeInner 内联在实体锁里，指针非空且地址稳定
+        unsafe { NonNull::new_unchecked(self.lock_().as_mut_ptr()) }
+    }
+
+    /// 本域所属的 root。
+    fn root_(&self) -> Option<NonNull<RootScope>> {
+        self.inner_().root_()
+    }
+
+    /// 检查本域是否还能接受新放入。
+    ///
+    /// 先检查本域自己的关闭标记，再检查所属 root 的 closing 信号。
+    fn closed_error_(&self) -> Option<ScopeError> {
+        let inner = self.inner_();
+        if inner.is_closed_() {
+            return Option::Some(ScopeError::ClosedScope);
+        }
+        if let Option::Some(root) = inner.root_() {
+            // SAFETY: 本域仍存活，说明 root 的 live_scopes_ > 0，root 不会被释放
+            if unsafe { root.as_ref() }.is_closing() {
+                return Option::Some(ScopeError::ClosedRoot);
+            }
+        }
+        Option::None
     }
 }
 
@@ -267,15 +319,44 @@ unsafe impl Sync for Scope {}
 impl Drop for Scope {
     /// 句柄析构：减引用计数；最后一个句柄只做关闭标记。
     ///
-    /// 普通析构**不**强制清盘，以保留“句柄先消失、`Retain` 仍可继续使用”的既有语义。
+    /// 普通析构**不强制清盘**，以保留“句柄先消失、`Retain` 仍可继续使用”的既有语义。
     /// 需要释放循环引用时必须显式调用 [`Scope::close`]；关闭请求会在这里重试一次清盘。
+    ///
+    /// 若本次析构让“句柄归零 + 数据清空 + 弱池清空”同时成立，且 root 已经 close，
+    /// 则本线程负责 root 的最终清理；因此 `finalize` 必须放在所有对 `ScopeInner` 的
+    /// 访问都结束之后。
     fn drop(&mut self) {
-        let inner = self.inner_();
-        if inner.decr_handle_() == 1 {
-            inner.mark_closed_();
-        }
-        if inner.is_close_requested_() {
-            inner.try_flush_();
+        let inner_ptr = self.inner_ptr_();
+        // SAFETY: 实体由 root 实体池持有；本句柄尚未析构，root 一定存活
+        let inner = unsafe { inner_ptr.as_ref() };
+        let root = inner.root_();
+        let lease = root.and_then(RootLease::enter_);
+        let lease_ok = lease.is_some();
+        // 先取租约再减句柄：减到 0 之后本线程仍然需要访问 inner 做收尾。
+        inner.incr_user_();
+        // 句柄计数与状态位在同一个原子字里：最后一次减一会同时置 CLOSED。
+        let _ = inner.decr_handle_();
+        let root_to_free = inner.try_flush_();
+        // 退出登记要求 users_ == 1，因此必须在 finalize 之前归还租约。
+        inner.decr_user_();
+        // 没能在 try_flush_ 里赢得清理权时，退出前再检查一次：可能 close 刚刚置位，
+        // 而本线程是最后一个持有租约的域线程。
+        let finalize_root = match (lease_ok, root_to_free) {
+            (true, Option::Some(root)) => Option::Some(root),
+            (true, Option::None) => match root {
+                // SAFETY: 本线程持有 root 租约，root 存储仍然有效
+                Option::Some(root) if unsafe { root.as_ref() }.try_elect_finalize_() => {
+                    Option::Some(root)
+                }
+                _ => Option::None,
+            },
+            _ => Option::None,
+        };
+        // 先归还 root 租约，finalize_ 才能观察到 active_ 归零。
+        drop(lease);
+        if let Option::Some(root) = finalize_root {
+            // SAFETY: 本线程是最后一个完成清空的域线程；返回后不得再访问 self.chunk_ 指向的实体
+            unsafe { RootScope::finalize_(root) };
         }
     }
 }
@@ -293,8 +374,8 @@ where
     P: 'f + TrPredrop<M::Target>,
     K: TrCancellationToken,
 {
-    if scope.inner_().is_closed_() {
-        return Result::Err(ScopeError::ClosedScope);
+    if let Option::Some(err) = scope.closed_error_() {
+        return Result::Err(err);
     }
     let mut sess = scope.lock_().acquire_session();
     let mut guard = sess
@@ -319,8 +400,8 @@ where
     T: 'f,
     K: TrCancellationToken,
 {
-    if scope.inner_().is_closed_() {
-        return Result::Err(ScopeError::ClosedScope);
+    if let Option::Some(err) = scope.closed_error_() {
+        return Result::Err(err);
     }
     let mut sess = scope.lock_().acquire_session();
     let mut guard = sess
@@ -822,7 +903,13 @@ mod tests_ {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use crate::{Scope, scope_inner_};
+    use crate::{
+        Scope,
+        page_size::PageSize1KB,
+        scope_inner_,
+        test_support_::test_root_,
+        weak_::{WeakPool, freed_count_of_},
+    };
 
     static ALLOCS: AtomicUsize = AtomicUsize::new(0);
     static TAG_ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -888,9 +975,11 @@ mod tests_ {
         assert_send_sync::<Scope>();
 
         ALLOCS.store(0, Ordering::SeqCst);
-        let scope = Scope::new_with_alloc_value::<CountingAlloc, scope_inner_::DefaultConfig<Global>>(
+        let scope = Scope::new_in_with_alloc_value::<
             CountingAlloc,
-        );
+            scope_inner_::DefaultConfig<Global>,
+        >(test_root_(), CountingAlloc)
+        .expect("建域应当成功");
         let clone = scope.clone();
         assert!(scope == clone, "克隆句柄必须指向同一个实体");
 
@@ -920,7 +1009,9 @@ mod tests_ {
     ///   across threads.
     #[test]
     fn scope_lock_serializes_puts_across_threads() {
-        let scope = Scope::new_with_alloc::<Global, scope_inner_::DefaultConfig<Global>>();
+        let scope =
+            Scope::new_in_with_alloc::<Global, scope_inner_::DefaultConfig<Global>>(test_root_())
+                .expect("建域应当成功");
         let mut threads = std::vec::Vec::new();
         for round in 0..4u32 {
             let scope = scope.clone();
@@ -952,10 +1043,14 @@ mod tests_ {
     ///   coexist in the root strong pool.
     #[compio::test]
     async fn root_entity_pool_holds_heterogeneous_scope_entities() {
-        let tagged = Scope::new_with_alloc_value::<TaggedAlloc, scope_inner_::DefaultConfig<Global>>(
-            TaggedAlloc { _tag: 7 },
-        );
-        let plain = Scope::new_with_alloc::<Global, scope_inner_::DefaultConfig<Global>>();
+        let tagged = Scope::new_in_with_alloc_value::<
+            TaggedAlloc,
+            scope_inner_::DefaultConfig<Global>,
+        >(test_root_(), TaggedAlloc { _tag: 7 })
+        .expect("建域应当成功");
+        let plain =
+            Scope::new_in_with_alloc::<Global, scope_inner_::DefaultConfig<Global>>(test_root_())
+                .expect("建域应当成功");
         let first = tagged
             .put_async(1u32)
             .await
@@ -981,8 +1076,12 @@ mod tests_ {
     ///   root strong pools.
     #[test]
     fn new_with_cfg_creates_scopes_across_root_entity_pools() {
+        let root = test_root_();
         let scopes: std::vec::Vec<Scope> = (0..300)
-            .map(|_| Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>())
+            .map(|_| {
+                Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(root)
+                    .expect("建域应当成功")
+            })
             .collect();
         assert_eq!(scopes.len(), 300);
         assert!(scopes[0] != scopes[299], "实体地址必须互不相同");
@@ -1002,7 +1101,8 @@ mod tests_ {
     async fn retain_drop_runs_typed_destructor() {
         assert_eq!(core::mem::size_of::<DropProbe>(), 0, "本用例覆盖 ZST");
         DROPS.store(0, Ordering::SeqCst);
-        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
         let retain = scope.put_async(DropProbe).await.expect("放入应当成功");
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
         drop(retain);
@@ -1020,7 +1120,8 @@ mod tests_ {
     ///   destroys it exactly once.
     #[compio::test]
     async fn owning_and_sharing_handles_roundtrip() {
-        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
         let retain = scope.put_async(10u32).await.expect("放入应当成功");
         {
             let mut owned = retain.try_owning().expect("应当可独占");
@@ -1040,6 +1141,114 @@ mod tests_ {
         assert_eq!(*clone.try_owning().expect("克隆句柄仍应可独占"), 20);
         drop(clone);
     }
+
+    /// 1KB 页的测试配置；用于制造多个弱池。
+    struct TinyPoolConfig;
+
+    impl crate::TrScopeInnerConfig for TinyPoolConfig {
+        type PoolAlloc = Global;
+        type LockAlloc = Global;
+        type PageSize = PageSize1KB;
+    }
+
+    /// 收集本域弱池链上的所有池地址与测试实例号（测试观测用）。
+    ///
+    /// 地址会被分配器复用，因此“恰好释放一次”必须按实例号断言，而不能按地址。
+    fn weak_pools_of_(scope: &Scope) -> std::vec::Vec<(NonNull<WeakPool>, usize)> {
+        let mut pools = std::vec::Vec::new();
+        let mut cursor = scope.inner_().weak_head_();
+        while let Option::Some(pool) = cursor {
+            // SAFETY: 池仍挂在链上，测试期间不会并发摘链
+            let pool_ref = unsafe { pool.as_ref() };
+            pools.push((pool, pool_ref.test_id_()));
+            cursor = pool_ref.next();
+        }
+        pools
+    }
+
+    /// 所有 `Retain` 释放后，每个 WeakPool 恰好被释放一次，且 ScopeInner 仍然可用。
+    /// After every `Retain` is dropped each WeakPool is freed exactly once and the ScopeInner
+    /// stays usable.
+    ///
+    /// - 手段：用 1KB 页的配置创建域，放入 256 个对象以跨多个弱池；记录弱池链上的池地址，
+    ///   然后逐个释放全部 `Retain`。
+    ///   / How: create a scope with a 1 KB page size, put 256 objects so several weak pools are
+    ///   needed, record the pool addresses, then drop every `Retain`.
+    /// - 判断：弱池链上原本至少有两个池；释放后每个池地址的释放计数恰好为 1，弱池链为空；
+    ///   之后仍能通过同一个 Scope 放入并读回新值，证明释放弱池没有破坏 ScopeInner。
+    ///   / What: there were at least two pools; after the drops every pool address has a free
+    ///   count of exactly one and the chain is empty; the same scope can still accept and read
+    ///   back a new value, proving the ScopeInner survived.
+    #[compio::test]
+    async fn weak_pools_are_freed_when_last_retain_drops() {
+        let scope = Scope::new_in_with_cfg::<TinyPoolConfig>(test_root_()).expect("建域应当成功");
+        let mut retains = std::vec::Vec::new();
+        for value in 0..256u32 {
+            retains.push(scope.put_async(value).await.expect("压力放入应当成功"));
+        }
+        let pools = weak_pools_of_(&scope);
+        assert!(
+            pools.len() >= 2,
+            "1KB 页下 256 个对象应至少落在两个弱池，实际 {}",
+            pools.len()
+        );
+
+        drop(retains);
+        for (_pool, id) in pools.iter().copied() {
+            assert_eq!(freed_count_of_(id), 1, "每个弱池必须恰好释放一次");
+        }
+        assert!(
+            scope.inner_().weak_head_().is_none(),
+            "所有槽位归还后弱池链应当为空"
+        );
+
+        // ScopeInner 仍然存在：同一个域还能继续分配。
+        let again = scope.put_async(7u32).await.expect("域必须仍然可用");
+        assert_eq!(*again.try_owning().expect("新数据应当可独占"), 7);
+        drop(again);
+    }
+
+    /// 多线程同时释放同一池的 `Retain` 时，池只被释放一次且没有 UAF。
+    /// Concurrent drops of one pool's `Retain`s free the pool exactly once without UAF.
+    ///
+    /// - 手段：用 1KB 页的配置放入 8 个对象，确认它们都在同一个弱池里；把 8 个 `Retain`
+    ///   分给 8 个线程同时 drop，join 之后再检查池状态。
+    ///   / How: put eight objects under a 1 KB page config and confirm they share one weak pool;
+    ///   move the eight `Retain`s into eight threads that drop them concurrently, then inspect
+    ///   the pool after joining.
+    /// - 判断：池地址的释放计数恰好为 1，弱池链为空；之后仍能在同一个 Scope 放入新对象，
+    ///   说明末槽判定唯一、没有双重释放或提前释放 ScopeInner。
+    ///   / What: the pool address has exactly one free event and the chain is empty; the same
+    ///   scope can still accept a new object, proving unique last-slot detection with no double
+    ///   free or premature ScopeInner release.
+    #[compio::test]
+    async fn concurrent_last_retain_drops_free_pool_exactly_once() {
+        let scope = Scope::new_in_with_cfg::<TinyPoolConfig>(test_root_()).expect("建域应当成功");
+        let mut retains = std::vec::Vec::new();
+        for value in 0..8u32 {
+            retains.push(scope.put_async(value).await.expect("放入应当成功"));
+        }
+        let pools = weak_pools_of_(&scope);
+        assert_eq!(pools.len(), 1, "8 个对象应落在同一个弱池");
+        let pool_id = pools[0].1;
+
+        let mut threads = std::vec::Vec::new();
+        for retain in retains {
+            threads.push(std::thread::spawn(move || drop(retain)));
+        }
+        for thread in threads {
+            thread.join().expect("drop 线程不应 panic");
+        }
+
+        assert_eq!(freed_count_of_(pool_id), 1, "并发归还只能释放池一次");
+        assert!(
+            scope.inner_().weak_head_().is_none(),
+            "所有槽位归还后弱池链应当为空"
+        );
+
+        let again = scope.put_async(1u32).await.expect("域必须仍然可用");
+        drop(again);
+    }
 }
 
 #[cfg(test)]
@@ -1052,7 +1261,9 @@ mod erased_drop_tests_ {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use crate::{IntoEmplace, Scope, TrScope, abs_::TrPredrop, scope_inner_};
+    use crate::{
+        IntoEmplace, Scope, TrScope, abs_::TrPredrop, scope_inner_, test_support_::test_root_,
+    };
 
     static SAME_TYPE_DROPS: AtomicUsize = AtomicUsize::new(0);
     static SLICE_DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -1146,7 +1357,8 @@ mod erased_drop_tests_ {
     #[compio::test]
     async fn repeated_puts_of_same_type_drop_each_once() {
         SAME_TYPE_DROPS.store(0, Ordering::Release);
-        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
 
         let first = scope.put_async(SameTypeProbe).await.expect("第一次放入");
         let second = scope.put_async(SameTypeProbe).await.expect("第二次放入");
@@ -1174,7 +1386,8 @@ mod erased_drop_tests_ {
     #[compio::test]
     async fn unsized_slice_drop_reads_per_object_metadata() {
         SLICE_DROPS.store(0, Ordering::Release);
-        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
 
         let len = 3usize;
         let mut src: [MaybeUninit<SliceProbe>; 3] = [const { MaybeUninit::uninit() }; 3];
@@ -1228,7 +1441,8 @@ mod erased_drop_tests_ {
     async fn predrop_vtable_runs_hook_then_drop() {
         PREDROP_HOOKS.store(0, Ordering::Release);
         PREDROP_DROPS.store(0, Ordering::Release);
-        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
 
         let retain = scope
             .put_with_factory_predrop_async(|| PredropProbe, || PredropHook)
@@ -1252,7 +1466,8 @@ mod erased_drop_tests_ {
     ///   a wrong destructor.
     #[compio::test]
     async fn put_str_keeps_length_metadata() {
-        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
 
         let retain = scope
             .put_str_with_predrop_async("hello", ())
@@ -1282,7 +1497,8 @@ mod erased_drop_tests_ {
             16,
             "本用例要覆盖高于指针宽度的对齐"
         );
-        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
         let expected = 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEFu128;
 
         let retain = scope
@@ -1316,7 +1532,8 @@ mod erased_drop_tests_ {
     #[compio::test]
     async fn trait_object_dst_drop_uses_vtable_metadata() {
         DYN_DROPS.store(0, Ordering::Release);
-        let scope = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
 
         let value = ManuallyDrop::new(DynProbe { value: 0xDEAD_BEEF });
         let source: &dyn DynTarget = &*value;
@@ -1371,7 +1588,9 @@ mod erased_drop_tests_ {
     async fn close_skips_live_access_views_until_released() {
         CLOSE_DROPS.store(0, Ordering::Release);
 
-        let scope_owning = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope_owning =
+            Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+                .expect("建域应当成功");
         let retain_owning = scope_owning
             .put_async(CloseProbe)
             .await
@@ -1392,7 +1611,9 @@ mod erased_drop_tests_ {
         drop(retain_owning);
         assert_eq!(CLOSE_DROPS.load(Ordering::Acquire), 1, "不得重复析构");
 
-        let scope_sharing = Scope::new_with_cfg::<scope_inner_::DefaultConfig<Global>>();
+        let scope_sharing =
+            Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+                .expect("建域应当成功");
         let retain_sharing = scope_sharing
             .put_async(CloseProbe)
             .await

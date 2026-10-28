@@ -1,12 +1,27 @@
-//! 域的延迟清盘：`Scope::close` 之后，在没有直接数据视图时强制析构全部存活对象。
+//! 域的延迟清盘与池回收。
 //!
-//! 这里不处理父子域，也不依赖旧的存活链字段。存活槽位由弱池链 + 槽位状态直接枚举；
-//! 析构入口复用 `index_` 的 `force_destroy_slot_`，因此与“最后一个 Retain 释放”的
-//! 确定性析构共用同一套 vtable 和 `try_claim_destroy` 语义。
+//! `Scope::close` 之后，在没有直接数据视图时强制析构全部存活对象；root 最终清理时，
+//! 则直接回收实体池里剩余的弱池 / 强池（此时所有域都已登记退出）。
+//!
+//! # 并发要点
+//!
+//! `flush_data_` 持有域写锁遍历弱池链，同时可能**级联析构**数据里的 `Retain`。这些
+//! `Retain` 的 drop 会进入末槽归还路径，而归还路径可能想摘链并释放空池。为了避免
+//! “遍历中的池被释放”，清盘分三步：
+//!
+//! 1. 在弱池链锁内**钉住**链上所有池（`WeakPool::pin_`）；
+//! 2. 释放链锁后遍历 / 析构；此时归还者只能把空池标记为 `retire_pending_`；
+//! 3. 重新拿链锁逐个解钉，把已经在钉住期间变空的池摘下，最后在锁外释放内存。
+//!
+//! 与 [`crate::weak_::WeakPool`] 的锁顺序约定一致：**域写锁 → 弱池链锁 → 池锁**。
 
 use core::ptr;
 
-use crate::{index_::force_destroy_slot_, strong_::StrongPool, weak_::DataState};
+use crate::{
+    index_::force_destroy_slot_,
+    strong_::StrongPool,
+    weak_::{DataState, WeakPool},
+};
 
 use super::ScopeInner;
 
@@ -24,10 +39,12 @@ impl ScopeInner {
     ///
     /// 必须在持有本域写锁（或等价地确认没有并发放入）时调用。
     pub(super) unsafe fn flush_data_(&mut self) {
+        // 1) 钉住整条弱池链：阻止并发归还者摘链 / 释放池内存。
+        self.pin_weak_chain_();
         let mut all_dead = true;
-        let mut pool = self.weak_head_;
+        let mut pool = self.weak_head_();
         while let Option::Some(pool_ptr) = pool {
-            // SAFETY: 弱池链上的池都由本域分配且仍然存活
+            // SAFETY: 弱池链上的池都由本域分配、钉住期间不会被释放
             let pool_ref = unsafe { pool_ptr.as_ref() };
             pool = pool_ref.next();
             let capacity = pool_ref.capacity();
@@ -61,6 +78,78 @@ impl ScopeInner {
             // SAFETY: 所有槽位都已不再存活；外部 Retain 只读弱槽位状态
             unsafe { self.reclaim_strong_pools_() };
         }
+        // 2) 解钉，并释放钉住期间变空的池。
+        self.unpin_weak_chain_();
+    }
+
+    /// 钉住链上所有弱池；调用方必须持有域写锁。
+    fn pin_weak_chain_(&self) {
+        self.with_weak_chain_(|chain| {
+            let mut cursor = chain.head_;
+            while let Option::Some(pool) = cursor {
+                // SAFETY: 链锁保证链上的池仍然存活
+                let pool_ref = unsafe { pool.as_ref() };
+                cursor = pool_ref.next();
+                pool_ref.pin_();
+            }
+        });
+    }
+
+    /// 解除钉住；把钉住期间变空的池摘下，并在链锁之外释放。
+    fn unpin_weak_chain_(&mut self) {
+        let mut pending_free = Option::None;
+        self.with_weak_chain_(|chain| {
+            let mut cursor = chain.head_;
+            while let Option::Some(pool) = cursor {
+                // SAFETY: 链锁保证链上的池仍然存活
+                let pool_ref = unsafe { pool.as_ref() };
+                let next = pool_ref.next();
+                let unpinned = pool_ref.unpin_();
+                if unpinned && pool_ref.try_claim_after_unpin_() {
+                    chain.unlink_(pool);
+                    // 复用池自己的 next_ 字段串一条临时待释放链；此时它已经不在弱池链上。
+                    // SAFETY: 池已 detached，不再被其它线程访问
+                    let Option::Some(pool_mut) = (unsafe { pool.as_ptr().as_mut() }) else {
+                        cursor = next;
+                        continue;
+                    };
+                    pool_mut.set_next_(pending_free);
+                    pending_free = Option::Some(pool);
+                }
+                cursor = next;
+            }
+        });
+        let alloc = unsafe { self.allocator_.as_ref() };
+        let mut cursor = pending_free;
+        while let Option::Some(pool) = cursor {
+            // SAFETY: 待释放链上的池都已摘链且不再被访问
+            let next = unsafe { pool.as_ref() }.next();
+            // SAFETY: 同上
+            unsafe { WeakPool::dealloc_(pool, alloc) };
+            cursor = next;
+        }
+    }
+
+    /// 释放本域弱池链上的**全部**弱池，不管其活槽计数。
+    ///
+    /// 只用于 root 最终清理：调用时所有域都已登记退出，实体池里剩下的弱池只承载实体
+    /// 自身的身份槽位，不会再被任何 `Retain` 使用。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须独占本 `ScopeInner`（持有 root 实体池锁），且不存在任何仍在使用的
+    /// `WeakSlot` / `WeakPool` 指针。
+    pub(crate) unsafe fn free_all_weak_pools_(&mut self) {
+        let head = self.with_weak_chain_(|chain| chain.take_all_());
+        let alloc = unsafe { self.allocator_.as_ref() };
+        let mut cursor = head;
+        while let Option::Some(pool) = cursor {
+            // SAFETY: 调用方保证没有其它线程访问链上的池
+            let next = unsafe { pool.as_ref() }.next();
+            // SAFETY: 同上
+            unsafe { WeakPool::dealloc_(pool, alloc) };
+            cursor = next;
+        }
     }
 
     /// 整链回收本域的强池。
@@ -69,7 +158,7 @@ impl ScopeInner {
     ///
     /// 本域所有强块数据必须已经析构，且不再有代码会通过 `WeakSlot::strong_chunk()` 解引用
     /// 这些池。
-    unsafe fn reclaim_strong_pools_(&mut self) {
+    pub(crate) unsafe fn reclaim_strong_pools_(&mut self) {
         let alloc = unsafe { self.allocator_.as_ref() };
         let mut cursor = self.strong_tail_;
         while let Option::Some(pool) = cursor {

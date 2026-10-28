@@ -1,7 +1,7 @@
 use std::boxed::Box;
 
 #[cfg(test)]
-use crate::*;
+use crate::{test_support_::test_root_, *};
 
 #[cfg(test)]
 #[compio::test]
@@ -24,7 +24,7 @@ async fn demo() {
         retain
     }
 
-    let scope = Scope::new();
+    let scope = Scope::new_in(test_root_()).expect("建域应当成功");
     let retain = scope.put_async(42).await.unwrap();
     {
         let x = retain.try_owning().unwrap();

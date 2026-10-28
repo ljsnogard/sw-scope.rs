@@ -26,18 +26,21 @@ use core::{
 use crate::{
     abs_::{TrEmplace, TrPredrop},
     index_::Retain,
-    scope_inner_::{DEFAULT_CELL_SIZE, PoolIndex, RootScope, ScopeInner},
+    scope_inner_::{DEFAULT_CELL_SIZE, PoolIndex, ScopeInner},
     strong_::{StrongChunk, StrongPool},
     weak_::{WeakPool, WeakSlot, meta_to_raw_},
 };
 
-/// 在默认 root 存在时登记 `T` / `P` 组合的类型级 vtable。
-///
-/// 低层分配管线会被单元测试直接调用而没有 root；那种情况下跳过登记（测试不进入类型擦除
-/// 析构路径）。生产路径上的 root 一定已由 [`crate::Scope::default_root_`] 初始化。
-fn ensure_chunk_meta_<T: ?Sized, P: TrPredrop<T>>() {
-    if let Option::Some(root) = RootScope::default_() {
-        let _ = root.ensure_chunk_meta_::<T, P>();
+impl ScopeInner {
+    /// 在本域所属 root 的类型表里登记 `T` / `P` 组合。
+    ///
+    /// 低层分配管线会被单元测试直接调用而没有 root；那种情况下跳过登记（测试不进入类型
+    /// 擦除析构路径）。生产路径上的 root 由 `Scope::new_in` 系列显式绑定。
+    fn ensure_chunk_meta_<T: ?Sized, P: TrPredrop<T>>(&self) {
+        if let Option::Some(root) = self.root_ {
+            // SAFETY: 本域存活期间 root 不会被最终清理
+            let _ = unsafe { root.as_ref() }.ensure_chunk_meta_::<T, P>();
+        }
     }
 }
 
@@ -100,42 +103,50 @@ impl ScopeInner {
 
     /// 从本域弱池链上取一个槽位；链尾池满了就开一个新池接到链尾。
     ///
-    /// 新池会把自己的所属域记为 `self`（[`WeakPool::set_scope`]），供清盘与池链回收
+    /// 新池会把自己的所属域记为 `self`（[`WeakPool::set_scope`]），供清盘与末槽归还
     /// 路径反查。返回 [`None`] 只会在底层分配器失败时发生。
+    ///
+    /// # 同步
+    ///
+    /// 取槽与“末槽归还后摘链”都必须在弱池链锁内完成：否则 `Retain` drop 线程可能在
+    /// 本线程选中链尾池之后把这个空池摘链并释放，导致悬垂访问。链锁顺序为
+    /// **域写锁 → 弱池链锁 → 池锁**。
     pub(crate) fn allocate_weak_(&mut self) -> Option<NonNull<WeakSlot<()>>> {
-        if let Option::Some(tail) = self.weak_tail_ {
-            // SAFETY: 池链上的池都由本域分配器分配且仍然存活，本域独占
-            let pool = unsafe { tail.as_ptr().as_mut() }?;
+        // 先取 self 指针，避免与 `weak_chain_` 的不可变借用冲突
+        let self_ptr = NonNull::from(&mut *self);
+        let mut session = self.weak_chain_.lock_session();
+        let mut chain = match session.lock().wait() {
+            Result::Ok(guard) => guard,
+            Result::Err(_) => unreachable!("weak chain 自旋锁不应失败"),
+        };
+        if let Option::Some(tail) = chain.tail_ {
+            // SAFETY: 链尾池在链锁内仍然存活
+            let pool = unsafe { tail.as_ref() };
             if pool.free_count() != 0 {
-                let index = pool.allocate()?;
-                return Option::Some(Self::slot_at_(pool, index));
+                // SAFETY: 链锁保证没有其它线程摘链；池锁由 allocate 内部获取
+                let pool_mut = unsafe { tail.as_ptr().as_mut() }?;
+                let index = pool_mut.allocate()?;
+                return Option::Some(Self::slot_at_(pool_mut, index));
             }
         }
-        // 尾池已满（或还没有池）：开一个新池，登记所属域并接到链尾
+        // 尾池已满（或还没有池）：开一个新池，登记所属域并接到链尾。
+        // 新池分配调用用户分配器；这是罕见路径，且必须在链锁内完成链修改。
         // SAFETY: allocator_ 指向本实体尾部、在实体析构前一直有效
         let alloc = unsafe { self.allocator_.as_ref() };
         let new = WeakPool::try_new_with_max_size(self.page_size_, alloc).ok()?;
-        // SAFETY: new 是刚初始化的独占池
-        let new_ref = unsafe { new.as_ptr().as_mut() }?;
-        // 池只保存所属域的地址，不取得所有权
-        new_ref.set_scope(NonNull::from(&mut *self));
-        match self.weak_tail_ {
-            Option::Some(mut tail) => {
-                // SAFETY: tail 与 new 是两块不同的池
-                unsafe { tail.as_mut() }.link_siblings(new_ref);
-            }
-            Option::None => {
-                self.weak_head_ = Option::Some(new);
-            }
-        }
-        self.weak_tail_ = Option::Some(new);
-        let index = new_ref.allocate()?;
-        Option::Some(Self::slot_at_(new_ref, index))
+        // 链锁内把新池接到链尾；pool.scope_ 由 push_back_ 一并写入
+        chain.push_back_(new, self_ptr);
+        // SAFETY: new 是刚初始化、独占的池，且已经挂在链上
+        let new_mut = unsafe { new.as_ptr().as_mut() }?;
+        let index = new_mut.allocate()?;
+        Option::Some(Self::slot_at_(new_mut, index))
     }
 
     /// 把一个尚未投入使用的弱槽位归还给所属池。
     ///
-    /// 这是分配失败时的回滚路径：槽位尚未写入状态与强块指针，直接还给空闲链即可。
+    /// 这是分配失败时的回滚路径：槽位尚未写入状态与强块指针，直接还给空闲链即可。若
+    /// 这次回滚让池变成空池（例如新池的第一个槽位就分配失败），则顺手把池摘链并释放，
+    /// 避免留下永远不会再被使用的空池。
     pub(crate) fn deallocate_weak_(&mut self, weak: NonNull<WeakSlot<()>>) {
         let Option::Some(pool) = WeakPool::of_slot_(weak) else {
             return;
@@ -144,11 +155,31 @@ impl ScopeInner {
         let Option::Some(index) = unsafe { pool.as_ref() }.index_of_(weak) else {
             return;
         };
-        // SAFETY: 同上；本域独占整条池链
-        let Option::Some(pool_ref) = (unsafe { pool.as_ptr().as_mut() }) else {
-            return;
-        };
-        let _ = pool_ref.deallocate(index);
+        let mut to_free = Option::None;
+        {
+            let mut session = self.weak_chain_.lock_session();
+            let mut chain = match session.lock().wait() {
+                Result::Ok(guard) => guard,
+                Result::Err(_) => unreachable!("weak chain 自旋锁不应失败"),
+            };
+            // SAFETY: 链锁 + 池锁串行化；池仍在链上
+            let Option::Some(pool_mut) = (unsafe { pool.as_ptr().as_mut() }) else {
+                return;
+            };
+            if !pool_mut.deallocate(index) {
+                return;
+            }
+            if pool_mut.live_count_() == 0 && pool_mut.try_mark_detached_() {
+                chain.unlink_(pool);
+                to_free = Option::Some(pool);
+            }
+        }
+        if let Option::Some(pool) = to_free {
+            // SAFETY: 已摘链且没有活槽位；池不再被任何线程访问
+            let alloc = unsafe { self.allocator_.as_ref() };
+            // SAFETY: 同上
+            unsafe { WeakPool::dealloc_(pool, alloc) };
+        }
     }
 
     /// 把刚取出的槽位正式投入使用：状态置 `Created`，并给 `Retain` 登记一次弱计数。
@@ -215,7 +246,7 @@ impl ScopeInner {
                 return Result::Err(err);
             }
         };
-        ensure_chunk_meta_::<T, P>();
+        self.ensure_chunk_meta_::<T, P>();
         let base = mem.as_ptr() as *mut u8 as *mut StrongChunk<T, P>;
         // SAFETY: mem 满足 chunk_layout 且本域独占；weak 是本域刚取出的槽位
         unsafe {
@@ -279,7 +310,7 @@ impl ScopeInner {
         let place = ptr::from_raw_parts_mut::<TyEmp::Target>(data.cast::<()>(), meta);
         // SAFETY: 布局匹配、数据尚未初始化，且由调用方保证 emplace 的契约
         unsafe { emplace.emplace(layout, place) };
-        ensure_chunk_meta_::<TyEmp::Target, P>();
+        self.ensure_chunk_meta_::<TyEmp::Target, P>();
         let chunk = base as *mut StrongChunk<TyEmp::Target, P>;
         // SAFETY: 数据刚由 emplace 就地构造完毕；weak 是本域刚取出的槽位；
         // meta_raw 与 T 的 metadata 同源，且已直接写进强块 meta 槽
@@ -364,9 +395,9 @@ mod tests_ {
         let mut inner = empty_scope_(&COUNTING);
 
         assert!(inner.put_value_(7u32).is_err(), "强池分配失败应向上报告");
-        // SAFETY: 弱池由本测试独占
-        let weak_tail = unsafe { inner.weak_tail_.expect("弱池应已创建").as_ref() };
-        assert_eq!(weak_tail.used_count(), 0, "失败后槽位必须归还给弱池");
+        // 回滚把唯一的槽位还回去后池已经空，按新策略空池会立即摘链并释放，因此这里不再
+        // 有弱池留给下一次放入。
+        assert!(inner.weak_tail_().is_none(), "失败后空弱池应被摘链回收");
         assert!(inner.strong_head_.is_none(), "失败时不应登记强池");
         assert_eq!(inner.free_size_(), 0, "没有强池时可用空间为 0");
 
@@ -375,7 +406,7 @@ mod tests_ {
         assert_eq!(*retain.try_owning().expect("数据应当可独占"), 7);
 
         // SAFETY: 强池、弱池都由本测试独占
-        let weak_tail = unsafe { inner.weak_tail_.expect("弱池应存在").as_mut() };
+        let weak_tail = unsafe { inner.weak_tail_().expect("弱池应存在").as_mut() };
         assert_eq!(weak_tail.used_count(), 1);
         let slots = weak_tail.slots();
         // SAFETY: 第一个槽位已分配，落在池内
@@ -427,7 +458,7 @@ mod tests_ {
         assert_eq!(&*retain.try_owning().expect("数据应当可独占"), &values[..]);
 
         // SAFETY: 弱池由本测试独占
-        let weak_tail = unsafe { inner.weak_tail_.expect("弱池应存在").as_mut() };
+        let weak_tail = unsafe { inner.weak_tail_().expect("弱池应存在").as_mut() };
         let slots = weak_tail.slots();
         // SAFETY: 第一个槽位已分配，落在池内
         let slot = unsafe { slots.as_ref() }.first().expect("槽位应存在");
@@ -469,7 +500,7 @@ mod tests_ {
         assert_eq!(*retain.try_owning().expect("数据应当可独占"), 0xDEAD_BEEF);
 
         // SAFETY: 弱池由本测试独占
-        let weak_tail = unsafe { inner.weak_tail_.expect("弱池应存在").as_mut() };
+        let weak_tail = unsafe { inner.weak_tail_().expect("弱池应存在").as_mut() };
         let slots = weak_tail.slots();
         // SAFETY: 第一个槽位已分配，落在池内
         let slot = unsafe { slots.as_ref() }.first().expect("槽位应存在");

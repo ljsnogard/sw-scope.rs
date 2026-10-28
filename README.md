@@ -9,41 +9,51 @@
 ## 使用思路
 
 ```rust
-fn demo() {
-    fn owning_somewhere(retain: Retain<usize>) -> Retain<usize> {
-        let mut x = retain.try_owning().unwrap();
+use core::{ptr, sync::atomic::AtomicPtr};
+use std::alloc::Global;
+use sw_scope::{Retain, RootScope, Scope};
+
+async fn demo() {
+    // 每个 root 都有自己的发布槽位；root 不再是进程级单例。
+    let slot: &'static mut AtomicPtr<RootScope> =
+        Box::leak(Box::new(AtomicPtr::new(ptr::null_mut())));
+    let root = match RootScope::try_init_in(slot, 4096, Global) {
+        Ok(root) | Err(root) => root,
+    };
+
+    let scope = Scope::new_in(root).expect("新建域");
+    let retain = scope.put_async(42usize).await.expect("放入");
+
+    {
+        let mut x = retain.try_owning().expect("独占");
         *x = 58;
-        drop(x); // `Owning` 实现了 Drop，借用持续到它被析构
-        retain
+        drop(x); // `Owning` 析构只归还访问权，数据仍由 `Retain` 保活
     }
 
-    fn share_everywhere(retain: Retain<usize>) -> Retain<usize> {
-        // 依然可以成功尽管强引用一度归零，但 retain 还在，scope 也在
-        let x = retain.try_sharing().unwrap();
-        assert_eq!(*x, 58);
+    // 显式结束域：析构域内数据、回收强池；弱池保留到 Retain 消失。
+    scope.close();
+    drop(retain);
 
-        // 手动制造一个泄露，下次 try_owning 就会失败
-        let _ = Box::leak(Box::new(x));
-        retain
-    }
-
-    let mut scope = Scope::new();
-    let retain = scope.put(42);
-    {
-        let x = retain.try_owning().unwrap();
-        assert_eq!(*x, 42);
-    }
-    let retain = owning_somewhere(retain);
-    {
-        let x = retain.try_owning().unwrap();
-        assert_eq!(*x, 58);
-    }
-    let retain = share_everywhere(retain);
-
-    assert!(retain.try_owning().is_none());
-    assert!(retain.try_sharing().is_some());
+    // root close 是更高一层的结束信号，标记为 unsafe：此后只能析构该 root 创建的
+    // Scope / Retain，不得再读取或升级它们。最后一个清空的域线程负责最终清理。
+    // SAFETY: 上面已经释放全部 Scope / Retain，之后不再访问它们。
+    unsafe { RootScope::close(root.slot()) };
 }
 ```
+
+## 多 root、Scope close 与 root close
+
+- `RootScope` 不再全局唯一、也不再默认 static。调用方为每个 root 提供
+  `&'static mut AtomicPtr<RootScope>` 发布槽位；每个 root 有自己的实体池、类型表与
+  分配器，同一个 `ConstTypeId` 在不同 root 里各自登记，不会串表。
+- `Scope::close` 是**域级**结束：析构本域数据、回收强池；弱池与槽位保留到对应的
+  `Retain` 全部释放，最后一个归还槽位的 `Retain` drop 负责把空 `WeakPool` 从
+  `ScopeInner` 的弱池链上摘下并释放内存。
+- `RootScope::close` 是**树级**结束信号：它只设置 closing，让所有域拒绝新分配；真正的
+  最终清理由最后一个完成清空的域线程执行（实体 vtable 析构、root 实体池、per-root 类型
+  表、root 存储）。
+- root close 的 unsafe 契约：关闭之后只能继续析构该 root 创建的 `Scope` / `Retain`，
+  不得再读取、升级或放入；最终清理完成后任何句柄都会悬空。
 
 # sw-scope
 

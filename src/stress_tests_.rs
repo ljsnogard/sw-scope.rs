@@ -17,7 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Retain, Scope, TrScopeInnerConfig, page_size::PageSize1KB};
+use crate::{
+    Retain, RootScope, Scope, TrScopeInnerConfig, page_size::PageSize1KB, test_support_::test_root_,
+};
 
 /// 1KB 页的测试配置；每域仍使用 `Global` 作为池分配器。
 struct TinyPageConfig;
@@ -82,8 +84,9 @@ async fn many_scopes_small_pages_close_concurrently_without_deadlock() {
     STRESS_DROPS.store(0, Ordering::Release);
 
     let create_start = Instant::now();
+    let root = test_root_();
     let scopes: std::vec::Vec<Scope> = (0..SCOPES)
-        .map(|_| Scope::new_with_cfg::<TinyPageConfig>())
+        .map(|_| Scope::new_in_with_cfg::<TinyPageConfig>(root).expect("建域应当成功"))
         .collect();
     let mut nodes: std::vec::Vec<std::vec::Vec<Retain<StressNode>>> =
         std::vec::Vec::with_capacity(SCOPES);
@@ -173,4 +176,14 @@ async fn many_scopes_small_pages_close_concurrently_without_deadlock() {
         "释放失效 Retain 不得重复析构"
     );
     eprintln!("[close_stress] release_dead_retains={release_elapsed:?} drops={TOTAL}");
+
+    // 所有域都已清空；此时才允许 close root。最终清理应释放 root 存储并清空槽位。
+    // 槽位本身在 leaked Box 里，与 root 存储分离，因此 close 之后仍可使用这个引用。
+    let slot = root.slot();
+    // SAFETY: 上面已经释放全部 Scope 句柄与外部 Retain，不再访问它们创建的数据。
+    unsafe { RootScope::close(slot) };
+    assert!(
+        RootScope::get(slot).is_none(),
+        "所有域清空后 root 必须被最终清理"
+    );
 }

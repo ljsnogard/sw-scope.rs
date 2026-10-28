@@ -4,9 +4,19 @@
 //! 删除节点时只改邻居链接并释放外部句柄，不调用任何 `clear`；循环引用由
 //! `Scope::close` 的统一清盘兜底。
 
+use core::{ptr, sync::atomic::AtomicPtr};
 use std::sync::Mutex;
 
-use sw_scope::{Retain, Scope};
+use sw_scope::{Retain, RootScope, Scope};
+
+/// 为集成测试创建一个独立的 root；发布槽位泄漏到测试进程结束。
+fn test_root_() -> &'static RootScope {
+    let slot: &'static mut AtomicPtr<RootScope> =
+        Box::leak(Box::new(AtomicPtr::new(ptr::null_mut())));
+    match RootScope::try_init_in(slot, 4096, std::alloc::Global) {
+        Ok(root) | Err(root) => root,
+    }
+}
 
 /// 同域用例的节点析构记录。
 static SAME_SCOPE_DROPS: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
@@ -184,7 +194,7 @@ async fn same_scope_cycle_deleted_node_drops_now_and_scope_close_reclaims_rest()
         .lock()
         .expect("同域析构记录锁不应中毒")
         .clear();
-    let scope = Scope::new();
+    let scope = Scope::new_in(test_root_()).expect("建域应当成功");
 
     let head = scope.put_async(Node::new(0)).await.expect("头节点放入");
     let mut tail = head.clone();
@@ -271,7 +281,10 @@ async fn cross_scope_cycle_deleted_node_drops_now_and_all_scopes_close_reclaim_r
         .lock()
         .expect("跨域析构记录锁不应中毒")
         .clear();
-    let scopes: std::vec::Vec<Scope> = (0..3).map(|_| Scope::new()).collect();
+    let root = test_root_();
+    let scopes: std::vec::Vec<Scope> = (0..3)
+        .map(|_| Scope::new_in(root).expect("建域应当成功"))
+        .collect();
     let mut nodes: std::vec::Vec<Retain<CrossNode>> = std::vec::Vec::new();
     for value in 0..6usize {
         let node = scopes[value % scopes.len()]
@@ -371,7 +384,7 @@ async fn close_clears_retain_only_nodes_but_keeps_owning_and_sharing() {
         .lock()
         .expect("直接视图析构记录锁不应中毒")
         .clear();
-    let scope = Scope::new();
+    let scope = Scope::new_in(test_root_()).expect("建域应当成功");
     let mut nodes: std::vec::Vec<Retain<ViewNode>> = std::vec::Vec::new();
     for value in 0..5usize {
         nodes.push(

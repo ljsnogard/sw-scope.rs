@@ -7,11 +7,7 @@
 use std::{alloc::Global, vec, vec::Vec};
 
 use abs_cancel::{CancelledToken, NonCancellableToken, TrCancellationToken};
-use core::{
-    mem::MaybeUninit,
-    ptr::NonNull,
-    sync::atomic::Ordering,
-};
+use core::{mem::MaybeUninit, ptr::NonNull, sync::atomic::Ordering};
 
 use crate::{
     scope_inner_::{PoolIndex, ScopeInner},
@@ -67,7 +63,10 @@ fn weak_chunk_pool_capacity_math() {
 
     let slot = size_of::<WeakSlot<()>>();
     // 池头按槽位个数向上取整，槽位起点因此始终对齐
-    assert_eq!(Pool::min_size_for_max_count(0), size_of::<Pool>().div_ceil(slot) * slot);
+    assert_eq!(
+        Pool::min_size_for_max_count(0),
+        size_of::<Pool>().div_ceil(slot) * slot
+    );
 
     for count in [1u16, 7, 1000, PoolIndex::MAX] {
         let need = Pool::min_size_for_max_count(count);
@@ -76,7 +75,10 @@ fn weak_chunk_pool_capacity_math() {
         // 恰好足够的预算应换回同样的槽位数
         assert_eq!(Pool::max_count_within_max_size(need), count as usize);
         // 少一个字节就再也放不下这么多槽位
-        assert_eq!(Pool::max_count_within_max_size(need - 1), count as usize - 1);
+        assert_eq!(
+            Pool::max_count_within_max_size(need - 1),
+            count as usize - 1
+        );
     }
 
     // 预算连池头都放不下时没有任何槽位可用
@@ -221,11 +223,9 @@ fn weak_chunk_pool_deallocate_rejects_invalid_input() {
 ///   两种不足的预算都必须返回 `Err`。
 #[test]
 fn weak_chunk_pool_with_max_size_budget() {
-    let mut pool = WeakChunkPool::try_new_with_max_size(
-        WeakChunkPool::min_size_for_max_count(8),
-        &Global,
-    )
-    .unwrap();
+    let mut pool =
+        WeakChunkPool::try_new_with_max_size(WeakChunkPool::min_size_for_max_count(8), &Global)
+            .unwrap();
     // SAFETY: pool 由 try_new_with_max_size 分配，非空且在测试期间一直存活
     let pool = unsafe { pool.as_mut() };
     assert_eq!(pool.capacity(), 8);
@@ -303,7 +303,11 @@ struct OpStream {
 impl OpStream {
     /// 以 `seed` 为起点构造。种子为 0 时会被替换成一个非零常量，避免退化。
     const fn new_(seed: u64) -> Self {
-        let state_ = if seed == 0 { 0x2545_F491_4F6C_DD1D } else { seed };
+        let state_ = if seed == 0 {
+            0x2545_F491_4F6C_DD1D
+        } else {
+            seed
+        };
         OpStream { state_ }
     }
 
@@ -527,7 +531,7 @@ fn weak_chunk_pool_chain_survives_random_alloc_and_free() {
         assert_eq!(pool.allocate(), Option::None, "池 {p} 已满却仍能分配");
         // 每个池都应当仍然认得住自己的域
         assert_eq!(
-            pool.root().map(|r| r.as_ptr()),
+            pool.scope().map(|r| r.as_ptr()),
             Option::Some(scope.as_ptr()),
             "池 {p} 的域在随机操作后丢失"
         );
@@ -579,14 +583,17 @@ fn check_chain_(owners: &mut [NonNull<TestPool>], allocated: &[u64], cap: usize)
     assert_eq!(walked, owners.len(), "池链长度与预期不符");
     // 第一个池没有前驱
     // SAFETY: owners[0] 指向存活的池
-    assert!(unsafe { owners[0].as_ref() }.prev().is_none(), "链头不应有前驱");
+    assert!(
+        unsafe { owners[0].as_ref() }.prev().is_none(),
+        "链头不应有前驱"
+    );
 
-    let expected_root = unsafe { owners[0].as_ref() }.root();
+    let expected_root = unsafe { owners[0].as_ref() }.scope();
     for (p, owner) in owners.iter_mut().enumerate() {
         // SAFETY: owner 指向独占分配的池
         let pool = unsafe { owner.as_mut() };
         assert_eq!(
-            pool.root().map(|r| r.as_ptr()),
+            pool.scope().map(|r| r.as_ptr()),
             expected_root.map(|r| r.as_ptr()),
             "池 {p} 的域绑定与其他池不一致"
         );
@@ -599,7 +606,11 @@ fn check_chain_(owners: &mut [NonNull<TestPool>], allocated: &[u64], cap: usize)
 fn check_pool_invariants_(pool: &mut TestPool, allocated: u64, cap: usize) {
     let used = allocated.count_ones() as usize;
     assert_eq!(pool.used_count() as usize, used, "used_count 与账本不符");
-    assert_eq!(pool.free_count() as usize, cap - used, "free_count 与账本不符");
+    assert_eq!(
+        pool.free_count() as usize,
+        cap - used,
+        "free_count 与账本不符"
+    );
 
     let free_mask = !allocated & (u64::MAX >> (64 - cap));
     if used == cap {
@@ -648,7 +659,6 @@ fn last_free_index_(pool: &mut TestPool) -> Option<PoolIndex> {
         Option::Some(pool.latest_free())
     }
 }
-
 
 /// 反向验证不变式检查器本身是有效的：人为把空闲链表的表头改成一个越界下标之后，
 /// `check_pool_invariants_` 必须报错，而不是默默放过。
@@ -816,8 +826,8 @@ fn weak_chunk_lock_busy_acquires_and_releases() {
 ///   若锁失效，两个线程会同时看到计数为 1，溢出计数大于 0。
 #[test]
 fn weak_chunk_state_lock_is_mutually_exclusive_across_threads() {
-    use std::sync::Arc;
     use core::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
     use std::thread;
 
     const THREADS: usize = 8;
@@ -938,7 +948,11 @@ fn weak_chunk_data_state_full_transition_path() {
 
     // Owning 之后不能再被认领成 Sharing / Created
     assert!(state.try_set_state(DataState::Sharing).is_none());
-    assert!(state.try_transition_state(DataState::Created, DataState::Sharing).is_none());
+    assert!(
+        state
+            .try_transition_state(DataState::Created, DataState::Sharing)
+            .is_none()
+    );
 
     // Owning → Destroying → Destroyed → Finalized
     assert_eq!(state.try_claim_destroy(), Some(DataState::Owning));
@@ -1003,14 +1017,14 @@ fn live_chain_is_rebuilt_from_slot_states_after_random_free() {
     // 1) 构造池链。每个池的容量不同，避免只在小池上碰巧成立。
     let mut owners: Vec<NonNull<TestPool>> = Vec::with_capacity(CAPS.len());
     for cap in CAPS {
-        owners.push(
-            TestPool::try_new_with_cell_count(cap, &Global).expect("测试用池应当构造成功"),
-        );
+        owners.push(TestPool::try_new_with_cell_count(cap, &Global).expect("测试用池应当构造成功"));
     }
     for i in 0..owners.len() - 1 {
         // SAFETY: 两个池互不相同且都由本测试独占持有
         unsafe {
-            owners[i].as_mut().link_siblings(&mut *owners[i + 1].as_ptr());
+            owners[i]
+                .as_mut()
+                .link_siblings(&mut *owners[i + 1].as_ptr());
         }
     }
 
@@ -1049,7 +1063,10 @@ fn live_chain_is_rebuilt_from_slot_states_after_random_free() {
                 continue;
             }
             chosen.push(index);
-            assert!(pool.deallocate(index as PoolIndex), "归还池 {p} 的槽位 {index} 应当成功");
+            assert!(
+                pool.deallocate(index as PoolIndex),
+                "归还池 {p} 的槽位 {index} 应当成功"
+            );
         }
         for index in chosen {
             freed.push(constructed[constructed_offset_(p, &CAPS) + index]);

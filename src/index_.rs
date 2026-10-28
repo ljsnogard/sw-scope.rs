@@ -1,9 +1,9 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
 use crate::{
-    scope_inner_::{RootScope, try_flush_for_slot_},
+    scope_inner_::{RootLease, RootScope, ScopeInner, try_flush_for_slot_},
     strong_::{StrongChunk, StrongChunkBase},
-    weak_::{DataState, WeakSlot},
+    weak_::{DataState, WeakPool, WeakSlot},
 };
 
 /// Like `Box<T>` but scoped.
@@ -25,6 +25,16 @@ where
 }
 
 /// Like a gc handle. The lifetime is the same as the scope that allocates it.
+///
+/// # 与 root close 的关系
+///
+/// `Retain<T>` **不带** `'root` 生命周期参数，编译器无法阻止它跨越
+/// [`crate::RootScope::close`]。因此：
+///
+/// - root `close` 之后只能析构 `Retain`，不能再 `try_owning` / `try_sharing`，否则
+///   可能访问已被最终清理的数据；
+/// - 必须最终释放所有 `Retain`，否则域的弱池链不会清空，root 也不会完成最终清理
+///   （安全泄漏，而不是 UB）。
 pub struct Retain<T>
 where
     T: ?Sized,
@@ -266,10 +276,64 @@ where
         // 弱计数归零：若此刻没有强引用（状态为 Created），立即走来源 (a)。
         // 若状态仍是 Owning / Sharing（只可能来自泄漏或 unsafe），留给清盘。
         let _ = claim_and_destroy_if_unreachable_(weak);
-        // 只有当这个槽位仍有存活数据时才值得重试关闭清盘；批量释放“已销毁”的外部
-        // Retain 时，避免每个句柄都重新扫描整条弱池链。
-        if weak.data_state().is_data_alive() {
-            try_flush_for_slot_(weak);
+        // 归还槽位可能会释放 WeakPool，因此必须先取出所属域，再归还。取出后立刻取一次
+        // 使用租约：只要本线程还在收尾，实体就不能被登记退出并从 root 实体池释放。
+        let scope = scope_of_slot_(weak);
+        let root = scope.and_then(|scope| {
+            // SAFETY: 槽位仍活着，说明实体尚未退出；root 实体池也尚未清理它
+            let scope_ref = unsafe { scope.as_ref() };
+            scope_ref.incr_user_();
+            scope_ref.root_()
+        });
+        // root 租约必须在归还槽位之前取得：槽位一旦归还，池可能被释放。
+        let lease = root.and_then(RootLease::enter_);
+        let lease_ok = lease.is_some();
+        let released = try_release_dead_slot_(weak);
+        let Option::Some(scope) = scope else {
+            return;
+        };
+        let root_to_free = match released {
+            Option::Some(true) => {
+                // 整条弱池链刚刚清空：只有此时才可能登记域退出。没有句柄、也还没有
+                // 退出过时，再做一次轻量的 try_retire_only_（只回收强池 / 登记退出，
+                // 不扫描空池链）。
+                let scope_ref = unsafe { scope.as_ref() };
+                if scope_ref.handle_count_() == 0 && !scope_ref.is_retired_() {
+                    scope_ref.try_retire_only_()
+                } else {
+                    Option::None
+                }
+            }
+            // 池链仍非空：本域不可能在本次归还后退出，无需碰域写锁。
+            Option::Some(false) => Option::None,
+            // 没有归还槽位（数据或槽位仍活）；只有仍有存活数据时才值得重试关闭清盘。
+            Option::None => {
+                if weak.data_state().is_data_alive() {
+                    try_flush_for_slot_(weak);
+                }
+                Option::None
+            }
+        };
+        // SAFETY: 本线程仍持有使用租约；try_flush_ 不会在租约未归还时登记退出
+        unsafe { scope.as_ref() }.decr_user_();
+        // 没能在 try_flush_ 里赢得清理权时，退出前再检查一次：可能 close 刚刚置位，
+        // 而本线程是最后一个持有租约的域线程。
+        let finalize_root = match (lease_ok, root_to_free) {
+            (true, Option::Some(root)) => Option::Some(root),
+            (true, Option::None) => match root {
+                // SAFETY: 本线程持有 root 租约，root 存储仍然有效
+                Option::Some(root) if unsafe { root.as_ref() }.try_elect_finalize_() => {
+                    Option::Some(root)
+                }
+                _ => Option::None,
+            },
+            _ => Option::None,
+        };
+        // 先归还 root 租约，finalize_ 才能观察到 active_ 归零。
+        drop(lease);
+        if let Option::Some(root) = finalize_root {
+            // SAFETY: 本线程是最后一个完成清空的域；不再访问该实体
+            unsafe { RootScope::finalize_(root) };
         }
     }
 }
@@ -322,7 +386,11 @@ unsafe fn finish_destroy_(weak: &WeakSlot<()>) {
                 chunk_ref.pointee_meta_(),
             )
         };
-        let vtable = RootScope::default_().and_then(|root| root.get_meta_(type_id));
+        let root = scope_root_of_slot_(weak);
+        let vtable = root.and_then(|root| {
+            // SAFETY: root 至少还有一个存活域（本槽位所属的域），不会被最终清理
+            unsafe { root.as_ref() }.get_meta_(type_id)
+        });
         match vtable {
             Option::Some(vtable) => {
                 // Predrop 对象内联在 chunk 里，定位它需要 chunk 首址；数据本身则只用
@@ -337,8 +405,8 @@ unsafe fn finish_destroy_(weak: &WeakSlot<()>) {
             // 宁可保守地不调用未知析构，也不做错误的类型投影。生产路径上 root 必然存在，
             // 此时“查不到 vtable”属于不变量被破坏。
             Option::None => debug_assert!(
-                RootScope::default_().is_none(),
-                "默认 root 已存在，但强块的 type_id 在类型表里查不到 vtable"
+                root.is_none(),
+                "槽位所属 root 存在，但强块的 type_id 在类型表里查不到 vtable"
             ),
         }
     }
@@ -351,4 +419,39 @@ fn raw_to_strong_<T: ?Sized>(
 ) -> NonNull<StrongChunkBase> {
     let _ = core::marker::PhantomData::<T>;
     raw
+}
+
+/// 由弱槽位找到所属域。
+fn scope_of_slot_(weak: &WeakSlot<()>) -> Option<NonNull<ScopeInner>> {
+    let slot = NonNull::from(weak);
+    let pool = WeakPool::of_slot_(slot)?;
+    // SAFETY: 槽位仍属于该池，池由所属域持有
+    unsafe { pool.as_ref() }.scope()
+}
+
+/// 由弱槽位沿 `WeakSlot -> WeakPool.scope_ -> ScopeInner.root_` 找到 root。
+fn scope_root_of_slot_(weak: &WeakSlot<()>) -> Option<NonNull<RootScope>> {
+    let scope = scope_of_slot_(weak)?;
+    // SAFETY: scope 指向存活实体内部的 ScopeInner
+    unsafe { scope.as_ref() }.root_()
+}
+
+/// 如果槽位已经彻底死亡（弱计数 0 且数据 `Destroyed`），把槽位归还给所属池。
+///
+/// - `None`：本次没有归还（槽位仍被使用，或已经归还过）；
+/// - `Some(false)`：归还了槽位，但弱池链仍非空；
+/// - `Some(true)`：归还了槽位，且整条弱池链已经清空（可以尝试登记域退出）。
+///
+/// 池的最后一个活槽被归还时，[`ScopeInner::release_slot_`] 会在弱池链锁内摘链并释放
+/// 池内存；返回 `Some(_)` 之后调用方不得再使用 `weak`。
+fn try_release_dead_slot_(weak: &WeakSlot<()>) -> Option<bool> {
+    if weak.weak_count() != 0 || weak.data_state() != DataState::Destroyed {
+        return Option::None;
+    }
+    let slot = NonNull::from(weak);
+    let pool = WeakPool::of_slot_(slot)?;
+    // SAFETY: 槽位属于该池；池在槽位被归还前一直存活
+    let scope = unsafe { pool.as_ref() }.scope()?;
+    // SAFETY: 上述条件保证没有线程还会访问该槽位
+    Option::Some(unsafe { scope.as_ref().release_slot_(slot) })
 }

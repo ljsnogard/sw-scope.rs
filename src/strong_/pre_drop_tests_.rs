@@ -5,14 +5,16 @@
 //! 的次序与次数。
 
 use core::{
-    mem::MaybeUninit,
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
 };
 use std::string::String;
 
 use super::PreDropRecord;
-use crate::{strong_::StrongChunk, weak_::WeakSlot};
+use crate::{
+    strong_::{StrongChunk, StrongChunkBase},
+    weak_::{DataState, WeakSlot},
+};
 
 /// 按值收下一个零尺寸钩子，只用它的类型取登记；用于在测试里推断 `Fin`。
 fn record_with_<T: ?Sized, Fin: FnOnce(&mut T) + 'static>(_hook: Fin) -> &'static PreDropRecord {
@@ -154,36 +156,78 @@ fn probe_hook(probe: &mut Probe) {
     PRE_DROPPED.fetch_add(1, Ordering::AcqRel);
 }
 
-/// 在栈上造一个真实身份槽位（`WeakChunk<()>`）与一块 `StrongChunk<Probe>`，返回强块首址。
+/// 测试用的对齐缓冲区：足够容纳 `StrongChunk<Probe>` 的头部与数据。
+///
+/// `StrongChunk<T>` 本身只是**头部视图**（本测试里 24 字节），真实块布局是
+/// `(StrongChunkBase, [meta], [predrop], data)`（Probe 时共 40 字节）。直接拿
+/// `MaybeUninit<StrongChunk<Probe>>` 当存储会把数据写到栈上相邻内存，属于越界写。
+#[repr(C, align(16))]
+struct ChunkBuf<const N: usize>([usize; N]);
+
+impl<const N: usize> ChunkBuf<N> {
+    const fn new_() -> Self {
+        ChunkBuf([0usize; N])
+    }
+
+    fn base_(&mut self) -> *mut StrongChunkBase {
+        self.0.as_mut_ptr().cast::<StrongChunkBase>()
+    }
+}
+
+/// 在测试缓冲区内就地构造一个合法的 `StrongChunk<Probe>`，返回强块首址。
 ///
 /// # Safety
 ///
-/// 返回值借用自 `slot`，调用方必须让 `slot` 活得比使用期更久。
-unsafe fn make_probe_chunk_(slot: &mut MaybeUninit<StrongChunk<Probe>>) -> *mut u8 {
-    let mut weak_slot = MaybeUninit::<WeakSlot<()>>::uninit();
-    // SAFETY: weak_slot 可写；init_slots 会把它当作未初始化内存初始化
-    let weak = unsafe { &mut *weak_slot.as_mut_ptr() };
-    WeakSlot::<()>::init_slots(core::slice::from_mut(weak), 1);
-
-    let chunk = slot.as_mut_ptr();
-    // SAFETY: chunk 可写；weak 是本测试栈上的有效身份槽位
+/// - `buf` 必须至少能容纳 `StrongChunk::<Probe>::layout_sized(Layout::new::<Probe>())`；
+/// - `weak` 必须活到数据析构之后：强块头部会保存指向它的身份指针。
+unsafe fn make_probe_chunk_(buf: &mut ChunkBuf<8>, weak: &mut WeakSlot<()>) -> *mut u8 {
+    let chunk = buf.base_() as *mut StrongChunk<Probe>;
+    // SAFETY: 由调用方保证 buf 足够大、weak 活过整个 chunk 使用期
     unsafe {
-        StrongChunk::<Probe>::init_with_value(chunk, core::ptr::NonNull::from(weak), Probe("hello"));
+        StrongChunk::<Probe>::init_with_value(
+            chunk,
+            core::ptr::NonNull::from(weak),
+            Probe("hello"),
+        );
     }
     chunk.cast::<u8>()
 }
 
 /// 验证清理次序与次数：`PreDrop` 先跑、能看到有效数据，随后才发生 `Drop`。
-/// - 手段：在栈上就地构造 `StrongChunk<Probe>`，用对象级记录 `run_` 触发一次清理。
-/// - 判断：钩子计数与 `Drop` 计数都恰好为 1；钩子内部断言数据内容为 `"hello"`。
+/// Verify that `PreDrop` runs once, before `Drop`, and sees valid data.
+///
+/// - 手段：在真实布局大小的栈缓冲区里就地构造 `StrongChunk<Probe>`，并让身份
+///   `WeakSlot` 在测试栈上活到 `run_` 结束；用对象级记录触发一次清理。
+///   / How: build a `StrongChunk<Probe>` in a stack buffer sized for the real chunk layout,
+///   keep the identity `WeakSlot` alive on the test stack until `run_` returns, and trigger
+///   one cleanup through an object-level record.
+/// - 判断：钩子计数与 `Drop` 计数都恰好为 1；钩子内部断言数据仍为 `"hello"`。
+///   / What: both the hook counter and the drop counter are exactly one, and the hook sees
+///   `"hello"` while the data is still alive.
+///
+/// 这个测试还隐含两条布局契约：`StrongChunk<T>` 只是头部视图，存储必须按
+/// `layout_sized` 的真实大小准备；`WeakSlot` 必须比强块/数据活得更久。
 #[test]
 fn pre_drop_runs_before_drop_exactly_once() {
     PRE_DROPPED.store(0, Ordering::Release);
     DROPPED.store(0, Ordering::Release);
 
-    let mut slot = MaybeUninit::<StrongChunk<Probe>>::uninit();
-    // SAFETY: slot 在本测试栈上，活得比 base 的使用期更久
-    let base = unsafe { make_probe_chunk_(&mut slot) };
+    // 先确认缓冲区确实放得下真实布局，避免再次出现“头部大小当整块”的过时假设。
+    let (chunk_layout, _) = StrongChunk::<Probe>::layout_sized(core::alloc::Layout::new::<Probe>())
+        .expect("Probe 的默认布局不应溢出");
+    assert!(
+        chunk_layout.size() <= core::mem::size_of::<ChunkBuf<8>>(),
+        "测试缓冲区必须容纳 StrongChunk 的真实布局"
+    );
+
+    let mut buf = ChunkBuf::<8>::new_();
+    let mut weak = WeakSlot::<()>::stack_empty_();
+    let _ = weak
+        .chunk_state()
+        .try_transition_state(DataState::Reclaimed, DataState::Created);
+
+    // SAFETY: buf 已按真实布局校验，weak 在本函数内活到 run_ 之后
+    let base = unsafe { make_probe_chunk_(&mut buf, &mut weak) };
     let record = record_with_::<Probe, _>(probe_hook);
 
     // SAFETY: base 来自上面刚构造好的 StrongChunk<Probe>；Probe 是 Sized，元数据为空

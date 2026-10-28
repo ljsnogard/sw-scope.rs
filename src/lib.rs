@@ -26,6 +26,9 @@ mod strong_;
 mod weak_;
 
 #[cfg(test)]
+mod test_support_;
+
+#[cfg(test)]
 mod demo_;
 
 #[cfg(test)]
@@ -34,7 +37,7 @@ mod stress_tests_;
 pub use abs_::{IntoEmplace, TrEmplace, TrScope};
 pub use index_::{Owning, Retain, Sharing};
 pub use scope_::{Scope, ScopeError};
-pub use scope_inner_::{DefaultConfig, TrScopeInnerConfig};
+pub use scope_inner_::{DefaultConfig, RootScope, TrScopeInnerConfig};
 
 pub use scope_str_::ScopeStr;
 
