@@ -4,9 +4,23 @@ name = "sw-scope"
 version = "0.1.0"
 
 description = "支持分区和依靠强弱引用管理的 Arena 分配器"
+license = "AGPL-3.0-or-later"
 
 [features]
-core-alloc = []
 std = []
 
-default = ["core-alloc"]
+# 开启后，向已被标记清盘的 Scope 放入数据会返回 `ScopeError::ClosedScope`；
+# 默认（不开启）则忽略清盘标记、照常放入。
+strict-put-after-close = []
+
+[dependencies]
+atomic_sync = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git" }
+bplus_tree_cmp = { git = "https://gitee.com/lino_snsalias/bplus_tree_cmp.git" }
+gen_mcf2 = { git = "https://gitee.com/lino_snsalias/cancel_rs.git" }
+
+# 类型键：`typeid::of::<T>()` 对非 `'static`、`?Sized` 的 `T` 也能给出稳定的
+# `core::any::TypeId`，用来取代原先不可靠的 `core::any::type_name`。
+typeid = { version = "1" }
+
+[dev-dependencies]
+compio = { version = "0.19.*", features = ["fs", "macros", "time", "net", "runtime"] }

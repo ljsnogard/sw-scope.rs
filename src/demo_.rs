@@ -4,11 +4,13 @@ use std::boxed::Box;
 use crate::*;
 
 #[cfg(test)]
-#[test]
-fn demo() {
+#[compio::test]
+async fn demo() {
     fn owning_somewhere(retain: Retain<usize>) -> Retain<usize> {
         let mut x = retain.try_owning().unwrap();
         *x = 58;
+        // `Owning` 现在实现了 Drop，因此借用持续到它被析构；要归还 retain 必须先放手
+        drop(x);
         retain
     }
 
@@ -22,8 +24,8 @@ fn demo() {
         retain
     }
 
-    let mut scope = Scope::new();
-    let retain = scope.put(42);
+    let scope = Scope::new();
+    let retain = scope.put_async(42).await.unwrap();
     {
         let x = retain.try_owning().unwrap();
         assert_eq!(*x, 42);
@@ -38,4 +40,3 @@ fn demo() {
     assert!(retain.try_owning().is_none());
     assert!(retain.try_sharing().is_some());
 }
-
