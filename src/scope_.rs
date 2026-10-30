@@ -1142,6 +1142,47 @@ mod tests_ {
         drop(clone);
     }
 
+    /// 测试目标：并发 `try_sharing` 与「最后一个 `Sharing` 释放」交错时，升级**必须**
+    /// 成功——它是「对象仍活着」的充分判据，不能因另一个线程刚把状态还原为
+    /// `Created` 而误报失败。
+    /// Test goal: concurrent `try_sharing` interleaved with the last `Sharing` drop must
+    /// still succeed; a transient `Created` observed after a failed CAS is not a failure.
+    ///
+    /// - 手段：把一个 `u64` 放进域，8 条线程各自反复 `try_sharing()` 并立刻丢弃视图，
+    ///   制造「CAS 失败后、读状态前，另一线程把最后一个 `Sharing` 放回 `Created`」的
+    ///   窗口。
+    ///   / How: put a `u64` into a scope, then 8 threads repeatedly `try_sharing()` and
+    ///   immediately drop the view, hitting the CAS-failed-then-reset-to-Created window.
+    /// - 判断：每一次 `try_sharing()` 都必须是 `Some`；任一 `None` 即失败。修复前该
+    ///   用例会以「`Err(Created)`」间歇失败。
+    ///   / What: every `try_sharing()` returns `Some`; a single `None` fails the test. The
+    ///   pre-fix implementation failed intermittently with `Err(Created)`.
+    #[compio::test]
+    async fn try_sharing_survives_concurrent_last_drop_() {
+        const K_THREADS: usize = 8usize;
+        const K_ITERS: usize = 50_000usize;
+
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
+        let retain = scope.put_async(7u64).await.expect("放入应当成功");
+        let retain = std::sync::Arc::new(retain);
+        std::thread::scope(|threads| {
+            for _ in 0usize..K_THREADS {
+                let retain = std::sync::Arc::clone(&retain);
+                threads.spawn(move || {
+                    for _ in 0usize..K_ITERS {
+                        let shared = retain.try_sharing().expect("并发共享不应失败");
+                        drop(shared);
+                    }
+                });
+            }
+        });
+        assert!(
+            retain.try_sharing().is_some(),
+            "并发压力结束后仍应可共享"
+        );
+    }
+
     /// 1KB 页的测试配置；用于制造多个弱池。
     struct TinyPoolConfig;
 

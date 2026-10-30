@@ -630,21 +630,31 @@ where
         let Some(chunk) = self.strong_chunk() else {
             return Result::Err(self.data_state());
         };
-        if self
-            .slot_state_
-            .try_transition_state(DataState::Created, DataState::Sharing)
-            .is_some()
-        {
-            // SAFETY: 强块与身份槽位互相绑定，chunk 有效
-            unsafe { &*chunk.as_ptr() }.incr_strong_count();
-            return Result::Ok(chunk);
+        loop {
+            if self
+                .slot_state_
+                .try_transition_state(DataState::Created, DataState::Sharing)
+                .is_some()
+            {
+                // SAFETY: 强块与身份槽位互相绑定，chunk 有效
+                unsafe { &*chunk.as_ptr() }.incr_strong_count();
+                return Result::Ok(chunk);
+            }
+            match self.data_state() {
+                DataState::Sharing => {
+                    // SAFETY: 同上
+                    unsafe { &*chunk.as_ptr() }.incr_strong_count();
+                    return Result::Ok(chunk);
+                }
+                // 竞态：另一线程刚把**最后一个** `Sharing` 放回 `Created`（本函数的
+                // 成功前提）。`Created -> Sharing` 的 CAS 与 `data_state()` 读取之间
+                // 没有原子性，直接返回 `Err(Created)` 会把一个仍然可共享的对象误判成
+                // 不可升级——调用方据此可能丢掉结果或误判「已放弃」。`Created` 本身
+                // 就是重试的成功前提，因此重试即可。
+                DataState::Created => core::hint::spin_loop(),
+                other => return Result::Err(other),
+            }
         }
-        if self.data_state() == DataState::Sharing {
-            // SAFETY: 同上
-            unsafe { &*chunk.as_ptr() }.incr_strong_count();
-            return Result::Ok(chunk);
-        }
-        Result::Err(self.data_state())
     }
 
     /// 初始化一整段从未使用过的槽位，是 `WeakPool` 构造期唯一的槽位入口。
