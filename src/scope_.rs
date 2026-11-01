@@ -1530,6 +1530,35 @@ mod erased_drop_tests_ {
         drop(owning);
         drop(retain);
     }
+    /// 测试目标：长度为 0 的 DST（空字符串）也能放入域并读回。
+    /// Test goal: a zero-length DST (empty string) can be put into a scope and read back.
+    ///
+    /// - 手段：通过 `put_str_with_predrop_async("")` 放入空串，再 `try_owning` 读回。
+    ///   / How: put `""` through `put_str_with_predrop_async` and read it back through `Owning`.
+    /// - 判断：读出的文本为空且长度为 0。修复前 `emplace_value_with_` 的
+    ///   `debug_assert_eq!(needs_meta_(), !meta_raw.is_null())` 会把「长度为 0 的 DST
+    ///   元数据」误判为「缺少元数据」，debug 构建下直接 panic。缺陷位置：
+    ///   `scope_inner_/alloc_.rs` 的 `emplace_value_with_`。
+    ///   / What: the text is empty and its length is 0. Before the fix the
+    ///   `debug_assert_eq!(needs_meta_(), !meta_raw.is_null())` in `emplace_value_with_`
+    ///   rejects zero-length DST metadata and panics in debug builds. Defect:
+    ///   `emplace_value_with_` in `scope_inner_/alloc_.rs`.
+    #[compio::test]
+    async fn put_empty_str_succeeds() {
+        let scope = Scope::new_in_with_cfg::<scope_inner_::DefaultConfig<Global>>(test_root_())
+            .expect("建域应当成功");
+
+        let retain = scope
+            .put_str_with_predrop_async("", ())
+            .await
+            .expect("放入空串应当成功");
+        let owning = retain.try_owning().expect("空串应当可独占");
+        let text: &str = &owning;
+        assert_eq!(text, "");
+        assert_eq!(text.len(), 0);
+        drop(owning);
+        drop(retain);
+    }
     /// 测试固定尺寸、非 ZST、带较高对齐要求且实现 `Drop` 的类型。
     /// Test a fixed-size, non-ZST type with a stronger alignment requirement and a `Drop` impl.
     ///

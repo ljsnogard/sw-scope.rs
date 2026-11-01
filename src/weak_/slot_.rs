@@ -111,9 +111,15 @@ impl DataState {
     }
 
     /// 该状态是否还能被认领销毁。
+    ///
+    /// 只有 [`DataState::Created`] 可以认领：它表示「没有直接数据视图，只有 `Retain`
+    /// 句柄挂着」。`Owning` / `Sharing` 一定伴随着活的 `&T` 借用，认领会析构活视图下的
+    /// 数据；它们必须先自行迁移回 `Created`（见 `Owning::drop` / `Sharing::drop`），
+    /// 再走本判据。这一约束同时封死了 `flush_data_` 的 TOCTOU：
+    /// 「读到 `Created` → 视图线程升级成功 → 认领」中的认领必须失败。
     #[inline]
     pub const fn is_claimable(self) -> bool {
-        self.is_data_alive()
+        matches!(self, DataState::Created)
     }
 
     pub const fn new(v: u8) -> Self {
@@ -427,12 +433,18 @@ impl WeakSlotState {
         self.transition_(|current| (current == from).then_some(to))
     }
 
-    /// 认领销毁：把状态从 `{Created, Owning, Sharing}` 搬到 [`DataState::Destroying`]。
+    /// 认领销毁：仅当状态仍为 [`DataState::Created`] 时把它搬到
+    /// [`DataState::Destroying`]。
     ///
-    /// 返回先前状态表示认领成功；返回 [`None`] 表示已有别的路径处理过（或该块从未携带
-    /// 存活数据），调用方必须放弃析构。这是在"多路径析构"下保证**恰好销毁一次**的唯一
-    /// 裁决点：`Owning::drop`、`Sharing::drop` 的最后一次减计数、以及清盘兜底，都只能
-    /// 通过这里竞争。
+    /// 返回先前状态表示认领成功；返回 [`None`] 表示已有别的路径处理过、该块从未携带
+    /// 存活数据，或当前存在 `Owning` / `Sharing` 直接视图。这是在"多路径析构"下保证
+    /// **恰好销毁一次**的唯一裁决点：`Owning::drop`、`Sharing::drop` 的最后一次减计数、
+    /// 以及清盘兜底，都只能通过这里竞争。
+    ///
+    /// # 为什么只认领 `Created`
+    ///
+    /// `Owning` / `Sharing` 的存在意味着外部持有 `&T`；此时认领并析构会让借用悬空。
+    /// 两条视图析构路径都会先把状态迁回 `Created`，因此不需要让本方法接受它们。
     pub(crate) fn try_claim_destroy(&self) -> Option<DataState> {
         self.transition_(|from| from.is_claimable().then_some(DataState::Destroying))
     }

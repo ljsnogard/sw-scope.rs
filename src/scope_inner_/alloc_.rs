@@ -282,10 +282,12 @@ impl ScopeInner {
     {
         let meta: <TyEmp::Target as ptr::Pointee>::Metadata = emplace.meta_().into();
         let meta_raw = meta_to_raw_(meta);
-        debug_assert_eq!(
-            StrongChunk::<TyEmp::Target, P>::needs_meta_(),
-            !meta_raw.is_null(),
-            "?Sized 数据的元数据裸字不应为空，Sized 数据应为空",
+        // 非空裸字只用于区分「Sized（元数据宽度为 0，裸字必为空）」；?Sized 的元数据
+        // 允许取值为 0（例如空 `str` / 空切片的长度），`meta_to_raw_(0)` 恰好是空指针，
+        // 因此不能用「裸字非空」反推「存在元数据」。
+        debug_assert!(
+            StrongChunk::<TyEmp::Target, P>::needs_meta_() || meta_raw.is_null(),
+            "Sized 数据的元数据裸字应为空；?Sized 数据允许零长度元数据",
         );
         // 1) 先取身份槽位
         let weak = self.allocate_weak_().ok_or(AllocError)?;

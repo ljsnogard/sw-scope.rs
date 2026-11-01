@@ -336,7 +336,17 @@ fn weak_state_sharing_path_claims_destroy_exactly_once() {
         state.try_set_state(DataState::Sharing),
         Option::Some(DataState::Created)
     );
-    assert_eq!(state.try_claim_destroy(), Option::Some(DataState::Sharing));
+    // `Sharing` 视图存在时不得认领；真实路径先迁回 `Created` 再认领。
+    assert_eq!(
+        state.try_claim_destroy(),
+        Option::None,
+        "有 Sharing 视图时不得认领销毁"
+    );
+    assert_eq!(
+        state.try_transition_state(DataState::Sharing, DataState::Created),
+        Option::Some(DataState::Sharing)
+    );
+    assert_eq!(state.try_claim_destroy(), Option::Some(DataState::Created));
     assert_eq!(state.try_claim_destroy(), Option::None);
     state.mark_destroyed();
     state.mark_finalized();

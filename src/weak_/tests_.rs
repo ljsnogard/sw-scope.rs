@@ -954,8 +954,16 @@ fn weak_chunk_data_state_full_transition_path() {
             .is_none()
     );
 
-    // Owning → Destroying → Destroyed → Finalized
-    assert_eq!(state.try_claim_destroy(), Some(DataState::Owning));
+    // Owning 视图存在时不得认领；必须先迁回 Created。
+    assert_eq!(state.try_claim_destroy(), None, "有 Owning 视图时不得认领销毁");
+    assert_eq!(state.data_state(), DataState::Owning);
+    assert_eq!(
+        state.try_transition_state(DataState::Owning, DataState::Created),
+        Some(DataState::Owning)
+    );
+
+    // Created → Destroying → Destroyed → Finalized
+    assert_eq!(state.try_claim_destroy(), Some(DataState::Created));
     assert_eq!(state.data_state(), DataState::Destroying);
     assert!(!state.data_state().is_data_alive(), "Destroying 不算存活");
     assert_eq!(state.try_claim_destroy(), None, "销毁认领必须唯一");
@@ -968,6 +976,46 @@ fn weak_chunk_data_state_full_transition_path() {
     // 全程不影响弱计数
     assert_eq!(state.weak_count(), 0);
     assert_eq!(state.pool_order(), 0);
+}
+
+/// 测试目标：存在 `Owning` / `Sharing` 直接视图时，销毁认领必须失败。
+/// Test goal: destroy claiming must fail while an `Owning` / `Sharing` view exists.
+///
+/// - 手段：分别构造一个 `Created` 槽位，迁移到 `Owning` / `Sharing`，再调用
+///   `try_claim_destroy`。
+///   / How: build a `Created` slot for each state, move it to `Owning` / `Sharing`, then call
+///   `try_claim_destroy`.
+/// - 判断：两种状态都必须返回 `None` 且保持原状态。修复前 `DataState::is_claimable`
+///   把 `Owning` / `Sharing` 也算作可认领；`close` 的 `flush_data_` 在
+///   「读到 `Created` → 视图线程升级 → `force_destroy_slot_`」的 TOCTOU 窗口内会析构
+///   活视图下的数据。缺陷位置：`weak_/slot_.rs` 的 `DataState::is_claimable`，
+///   受害路径：`scope_inner_/teardown_.rs` 的 `flush_data_`。
+///   / What: both must return `None` and keep the state unchanged. Before the fix
+///   `is_claimable` also accepted `Owning` / `Sharing`, so `flush_data_` could destroy data
+///   under a live view in the TOCTOU window. Defect: `DataState::is_claimable` in
+///   `weak_/slot_.rs`; victim path: `flush_data_` in `scope_inner_/teardown_.rs`.
+#[test]
+fn claim_destroy_must_reject_live_views() {
+    for target in [DataState::Owning, DataState::Sharing] {
+        let mut slot = MaybeUninit::<WeakSlot<()>>::uninit();
+        // SAFETY: 初始化 1 个槽位后取可变引用；slot 在本轮结束前一直存活
+        let chunk = unsafe {
+            let ptr = slot.as_mut_ptr();
+            WeakSlot::<()>::init_slots(core::slice::from_raw_parts_mut(ptr, 1), 1);
+            &mut *ptr
+        };
+        let state = &chunk.chunk_state();
+        state.init_created();
+        assert_eq!(state.try_set_state(target), Option::Some(DataState::Created));
+        assert_eq!(state.data_state(), target);
+
+        assert_eq!(
+            state.try_claim_destroy(),
+            Option::None,
+            "存在 {target:?} 直接视图时不得认领销毁",
+        );
+        assert_eq!(state.data_state(), target, "认领失败不得改写状态");
+    }
 }
 
 /// 测试"由槽位地址 O(1) 反推所属弱池"。
