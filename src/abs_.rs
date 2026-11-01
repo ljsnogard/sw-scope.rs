@@ -172,6 +172,14 @@ pub trait TrScope {
         P: TrPredrop<[MaybeUninit<T>]>;
 }
 
+/// 预留的便捷扩展 trait：`put_async` 的同步转发入口尚未接线。
+///
+/// 当前生产与测试路径都直接调用 [`TrScope`] 的 `put_*_async`，因此本 trait 处于
+/// “保留 API、暂未实现”的状态；方法体仍是 `todo!()`，不要在任何路径上调用它。
+#[allow(
+    dead_code,
+    reason = "预留扩展 API：同步 put 转发尚未接线，保留 trait 形状供后续实现"
+)]
 pub trait TrScopeExt
 where
     Self: TrScope,

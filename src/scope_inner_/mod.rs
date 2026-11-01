@@ -43,6 +43,9 @@ pub(crate) use inner_::{ScopeEntity, ScopeInner, ScopeLock};
 pub(crate) use root_::RootLease;
 pub use root_::RootScope;
 
+/// 旧默认页大小：显式 root API 落地后，生产路径的页大小由 `RootScope::try_init_in`
+/// 与各域配置给出；本常量只被 `#[cfg(test)]` 的低层夹具引用。
+#[cfg_attr(not(test), allow(dead_code, reason = "仅测试夹具使用：生产页大小由 root/域配置给出"))]
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 4 * 4096usize;
 
 pub const DEFAULT_CELL_SIZE: usize = core::mem::size_of::<usize>();

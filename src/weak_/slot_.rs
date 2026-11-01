@@ -131,6 +131,7 @@ impl DataState {
 }
 
 /// 状态字使用的锁信号策略：最高位。
+#[allow(dead_code, reason = "旧锁位别名：状态字已改用 WeakSlotState 自带编码")]
 type LockSignal = MsbAsMutexSignal<u32>;
 
 /// 状态字：锁位由 [`LockSignal`] 给出，其余位是状态与弱计数。
@@ -154,6 +155,7 @@ pub(crate) struct WeakSlotState {
 }
 
 /// 把状态与计数打包成一个字。
+#[allow(dead_code, reason = "旧状态打包函数：现由 WeakSlotState 的构造与 CAS 直接编码")]
 const fn pack_(state: DataState, count: u32) -> u32 {
     ((state as u32) << WeakSlotState::DATA_SHIFT) | (count & WeakSlotState::WEAK_RC_MASK)
 }
@@ -172,6 +174,7 @@ impl WeakSlotState {
     /// 槽位尚未被分配给任何对象时的初值。
     ///
     /// 因为 [`AtomicFlags::new`] 要构造原子字，所以本函数不是 `const fn`。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅弱槽位状态单测使用"))]
     pub(crate) fn empty_() -> Self {
         WeakSlotState {
             pool_order_: 0,
@@ -197,6 +200,7 @@ impl WeakSlotState {
     ///
     /// 调用方不需要再传 `&WeakSlot`：`WeakSlotState` 是 `WeakSlot` 的首字段，状态地址
     /// 就是槽位地址。
+    #[cfg_attr(not(test), allow(dead_code, reason = "旧状态锁获取：仅经 try_lock 等单测路径使用"))]
     fn acquire_<T, K>(&self, cancel: K) -> Option<WeakSlotGuard<'_, T>>
     where
         T: ?Sized,
@@ -242,11 +246,13 @@ impl WeakSlotState {
 
     /// 状态字里的锁位是否已置位。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅状态字单测使用"))]
     fn is_locked_raw_(raw: u32) -> bool {
         raw & Self::LOCK_ST_MASK != 0
     }
 
     /// 释放状态锁。**只应由 [`WeakSlotGuard`] 的 `Drop` 调用。**
+    #[cfg_attr(not(test), allow(dead_code, reason = "旧状态锁释放：仅经 WeakSlotGuard 单测路径使用"))]
     fn release_lock_(&self) {
         let mut current = self.weak_state_.value();
         loop {
@@ -349,6 +355,7 @@ impl WeakSlotState {
     /// 遍历范围是"本状态所在池的整条兄弟链"。若一条池链只属于一个 `Scope`，结果就是
     /// 该 `Scope` 的全部存活槽位；若多个 `Scope` 共享同一条池链，上层还需要按归属
     /// 进一步过滤。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅存活链单测经 for_each_live_slot_ 间接使用"))]
     pub(crate) fn for_each_live_slot_(&self, mut visit: impl FnMut(NonNull<WeakSlot<()>>)) {
         // SAFETY: `WeakSlotState` 是 `WeakSlot` 的首字段（见本文件的编译期断言）
         let slot = unsafe { NonNull::new_unchecked(self as *const Self as *mut WeakSlot<()>) };
@@ -437,6 +444,7 @@ impl WeakSlotState {
     }
 
     /// 标记已退出存活链、可随池回收。只有弱引用计数归零后才应调用。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅弱槽位状态机单测使用"))]
     pub(crate) fn mark_finalized(&self) {
         let _ = self.transition_(|_| Option::Some(DataState::Finalized));
     }
@@ -449,11 +457,13 @@ impl WeakSlotState {
     /// 只在当前为 `Created` 时把状态置为 `to`；返回先前状态。
     ///
     /// 这个条件迁移同时充当"无强引用"这一前提的判据与上锁动作，因此不需要额外的锁位。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅弱槽位状态机单测使用"))]
     pub(crate) fn try_set_state(&self, to: DataState) -> Option<DataState> {
         self.transition_(|from| (from == DataState::Created).then_some(to))
     }
 
     /// 把状态无条件搬到 `to`（保持锁位与两个计数不变）。
+    #[allow(dead_code, reason = "旧状态改写入口：生产路径一律走 CAS（try_claim_destroy 等）")]
     pub(crate) fn mark_state(&self, to: DataState) {
         let _ = self.transition_(|_| Option::Some(to));
         // 旧实现：
@@ -513,6 +523,7 @@ where
     /// "空闲"等价于状态为 [`DataState::Reclaimed`]：从未分配过的槽位与归还回池的
     /// 槽位都是这个状态。存活链推导据此把空闲槽位当作顺序上的空洞跳过。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅弱槽位单测检查空闲态"))]
     pub(crate) fn is_free_(&self) -> bool {
         self.data_state() == DataState::Reclaimed
     }
@@ -557,6 +568,7 @@ where
     /// 因此传 [`NonCancellableToken`] 是忙等，传
     /// [`CancelledToken`](abs_sync::x_deps::abs_cancel::CancelledToken) 是"只试一次"。
     /// 锁的释放只由守卫的析构负责。
+    #[cfg_attr(not(test), allow(dead_code, reason = "旧锁入口：仅单测使用"))]
     pub fn try_lock<K>(&self, cancel: K) -> Option<WeakSlotGuard<'_, T>>
     where
         K: TrCancellationToken,
@@ -566,6 +578,7 @@ where
 
     /// [`WeakSlot::try_lock`] 的别名，与状态层上的命名保持对应。
     #[inline]
+    #[allow(dead_code, reason = "旧锁入口：与 try_lock 重复，当前无调用点")]
     pub fn try_acq_state_guard<K>(&self, cancel: K) -> Option<WeakSlotGuard<'_, T>>
     where
         K: TrCancellationToken,
@@ -576,6 +589,7 @@ where
     /// 忙等直到拿到状态锁。
     ///
     /// 供确信锁会很快释放的阻塞式路径使用；锁总会在守卫析构时释放，因此不会永久自旋。
+    #[cfg_attr(not(test), allow(dead_code, reason = "旧锁入口：仅单测使用"))]
     pub fn lock_busy(&self) -> WeakSlotGuard<'_, T> {
         WeakSlotGuard::spin_acquire_(self)
     }
@@ -701,6 +715,7 @@ where
 
     /// 槽位状态的可变引用，供弱池在分配 / 归还时改写空闲链。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅弱槽位单测读取可变状态"))]
     pub(crate) fn chunk_state_mut(&mut self) -> &mut WeakSlotState {
         &mut self.slot_state_
     }
@@ -746,6 +761,7 @@ where
 ///
 /// 本守卫 `Deref` 到 [`WeakSlot`]，因此可以在临界区内改动槽位字段。`Drop` 负责释放
 /// 锁位——即使临界区里 panic，锁也一定被归还。
+    #[cfg_attr(not(test), allow(dead_code, reason = "旧锁守卫：仅单测经 try_lock / acquire_ 使用"))]
 pub(crate) struct WeakSlotGuard<'a, T>
 where
     T: ?Sized,
@@ -762,6 +778,7 @@ where
 // slot_ptr_: NonNull<WeakSlot<T>>,
 // _unuse_t_: PhantomData<&'a WeakSlot<T>>,
 
+    #[cfg_attr(not(test), allow(dead_code, reason = "旧锁守卫：仅单测使用"))]
 impl<'a, T> WeakSlotGuard<'a, T>
 where
     T: ?Sized,

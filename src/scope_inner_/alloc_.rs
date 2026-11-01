@@ -48,6 +48,7 @@ impl ScopeInner {
     /// 最新一块强池中尚未分配出去的字节数。
     ///
     /// 只统计链尾池：更早的池按 Scope 的既定策略不做局部复用，因此它们的剩余空间不必计入。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅分配管线单测读取，用于断言池回滚与开池"))]
     pub(crate) fn free_size_(&self) -> usize {
         let Option::Some(tail) = self.strong_tail_ else {
             return 0usize;

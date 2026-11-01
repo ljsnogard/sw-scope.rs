@@ -132,6 +132,7 @@ impl Drop for WeakPoolGuard<'_> {
 
 impl WeakPool {
     /// 根据目标要容纳的 WeakChunk 数量，计算最小内存占用量
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅弱池容量单测使用"))]
     pub fn min_size_for_max_count(count: PoolIndex) -> usize {
         Self::HEADER_SLOT_COUNT * Self::SLOT_SIZE + (count as usize) * Self::SLOT_SIZE
     }
@@ -212,6 +213,7 @@ impl WeakPool {
     /// # Safety
     ///
     /// 调用方必须持有本池的池锁，或用其它方式保证没有并发写。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅单测经 pins_/detached_/free_count 读取"))]
     unsafe fn status_(&self) -> &WeakPoolStatus {
         // SAFETY: 由调用方保证没有并发写
         unsafe { &*self.status_.get() }
@@ -248,6 +250,7 @@ impl WeakPool {
 
     /// 当前是否已被 flush 钉住。
     #[cfg(test)]
+    #[allow(dead_code, reason = "调试查询：pin 计数当前没有读取点")]
     pub(crate) fn pins_(&self) -> u32 {
         // SAFETY: 测试单线程读取
         unsafe { self.status_() }.pins_
@@ -255,6 +258,7 @@ impl WeakPool {
 
     /// 当前是否已经摘链（只在测试与不变量断言中使用）。
     #[cfg(test)]
+    #[allow(dead_code, reason = "调试查询：detached 标志当前没有读取点")]
     pub(crate) fn detached_(&self) -> bool {
         // SAFETY: 测试单线程读取
         unsafe { self.status_() }.detached_
@@ -317,6 +321,7 @@ impl WeakPool {
     }
 
     /// 把 `next` 接到本池之后，并回填其反向指针，从而把两个池串成双向链的一环。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅池链单测使用"))]
     pub fn link_siblings(&mut self, next: &mut WeakPool) {
         let this = NonNull::from(&mut *self);
         let next_ptr = NonNull::from(&mut *next);
@@ -467,6 +472,7 @@ impl WeakPool {
     // -- 布局与槽位定位 -------------------------------------------------------
 
     /// 读取某个槽位记录的所属池序号。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅存活链单测使用"))]
     pub fn pool_order_of(&self, index: PoolIndex) -> PoolIndex {
         // SAFETY: 由调用方保证 index 小于 capacity_，指向的是池内一个对齐的槽位
         let slot = unsafe { self.slot_at_(index) };
@@ -645,6 +651,7 @@ impl WeakPool {
     ///
     /// 空闲的判定是状态字为 [`DataState::Reclaimed`](crate::weak_::DataState::Reclaimed)：
     /// 从未分配过的槽位与归还回来的槽位都满足它。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅存活链单测经 for_each_live_from_ 间接使用"))]
     pub(crate) fn last_free_index_(&self) -> Option<PoolIndex> {
         let mut index = self.capacity_;
         while index > 0 {
@@ -686,6 +693,7 @@ impl WeakPool {
     /// # 复杂度
     ///
     /// 时间与所有池的槽位总数成正比，额外空间为 O(1)（只维护池游标与下标）。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅存活链单测经 for_each_live_slot_ 间接使用"))]
     pub(crate) fn for_each_live_from_(
         any_pool: NonNull<WeakPool>,
         visit: &mut impl FnMut(NonNull<WeakSlot<()>>),
@@ -747,6 +755,7 @@ impl WeakPool {
     ///
     /// 空闲槽位（状态为 [`DataState::Reclaimed`](crate::weak_::DataState::Reclaimed)）
     /// 是构造顺序上的空洞，直接跳过。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅存活链单测经 for_each_live_from_ 间接使用"))]
     fn visit_live_range_(
         &self,
         start: usize,

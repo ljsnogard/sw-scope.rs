@@ -113,7 +113,12 @@ pub(crate) type FnDebug = unsafe fn(*const (), &mut fmt::Formatter) -> fmt::Resu
 pub(crate) struct AnyTypeVTable {
     pub(super) drop_in_place: FnDropInPlace,
     pub(super) pre_drop: Option<FnPreDrop>,
+    /// 格式化入口预留槽：`Display` / `Debug` 的打印路径尚未接线，字段保留以便后续
+    /// 不破坏 vtable 布局地补上。
+    #[allow(dead_code, reason = "格式化 vtable 预留槽：Display/Debug 打印路径尚未接线")]
     pub(super) display: Option<FnDisplay>,
+    /// 见 [`Self::display`]。
+    #[allow(dead_code, reason = "格式化 vtable 预留槽：Display/Debug 打印路径尚未接线")]
     pub(super) debug: Option<FnDebug>,
 }
 
@@ -561,6 +566,12 @@ impl RootScope {
     ///
     /// 这把锁同时承担“创建域 vs root 最终清理”的互斥：创建路径在锁内检查 `closing_`，
     /// 最终清理在锁内回收实体池。
+    ///
+    /// 保留的通用入口：当前创建 / 回收路径都直接持锁，本方法暂无调用点。
+    #[allow(
+        dead_code,
+        reason = "通用实体池入口：创建/回收路径目前直接持 entity_pool_ 锁，本方法保留"
+    )]
     pub(crate) fn with_entity_pool_<R>(&self, op: impl FnOnce(&mut ScopeInner) -> R) -> R {
         let mut session = self.entity_pool_.lock_session();
         let mut guard = match session.lock().wait() {
@@ -613,6 +624,13 @@ impl RootScope {
     /// 登记一条类型级 vtable，返回表中实际生效的条目。
     ///
     /// 键已存在时不覆盖旧条目，而是返回已有条目（`try_insert` 的冲突分支）。
+    ///
+    /// 当前生产路径走 [`Self::ensure_chunk_meta_`]（按键幂等登记），本方法保留作
+    /// 显式插入入口。
+    #[allow(
+        dead_code,
+        reason = "显式 vtable 插入入口；生产路径走幂等的 ensure_chunk_meta_"
+    )]
     #[inline]
     pub(crate) fn insert_meta_(&self, id: ConstTypeId, table: AnyTypeVTable) -> AnyTypeVTable {
         self.with_metas_(|tree| match tree.try_insert(id, table) {
@@ -669,6 +687,12 @@ impl RootScope {
     }
 
     /// 按合成类型 id 摘除 vtable。
+    ///
+    /// 类型表的条目按进程生命期常驻，本方法保留作显式卸载入口，当前无调用点。
+    #[allow(
+        dead_code,
+        reason = "显式 vtable 卸载入口；类型表条目当前按进程生命期常驻"
+    )]
     #[inline]
     pub(crate) fn remove_meta_(&self, id: ConstTypeId) -> Option<AnyTypeVTable> {
         self.with_metas_(|tree| tree.remove(id))
@@ -866,6 +890,8 @@ mod tests_ {
     ///   lookup returns the same entry.
     #[test]
     fn ensure_meta_registers_once_per_type_id() {
+        /// 测试探针：字段只用于构造一个非零尺寸的类型，从不读取。
+        #[allow(dead_code, reason = "测试探针：字段仅用于占布局，从不读取")]
         struct TableProbe(u64);
 
         let root = test_root_();

@@ -191,6 +191,13 @@ impl Scope {
     }
 
     /// 本域所属的 root。
+    ///
+    /// 当前没有调用点：root 反查统一走 `WeakSlot -> WeakPool.scope_ ->
+    /// ScopeInner.root_`，本方法的路径只作调试辅助保留。
+    #[allow(
+        dead_code,
+        reason = "调试辅助：root 反查目前走弱槽位链，本便捷方法暂无调用"
+    )]
     fn root_(&self) -> Option<NonNull<RootScope>> {
         self.inner_().root_()
     }
@@ -1322,6 +1329,8 @@ mod erased_drop_tests_ {
         }
     }
 
+    /// 测试探针：字段只用于保证对象非零尺寸（`Drop` 计数），从不读取。
+    #[allow(dead_code, reason = "测试探针：只用 Drop 计数，字段仅用于占布局")]
     struct SliceProbe(u64);
 
     impl Drop for SliceProbe {

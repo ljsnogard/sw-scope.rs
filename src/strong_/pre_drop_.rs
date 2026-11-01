@@ -10,6 +10,14 @@
 //!   对象级钩子直接在放入点生成记录并覆盖类型级；
 //! - 钩子必须是**零尺寸类型**（函数项或非捕获闭包），捕获式闭包会在编译期被 `const` 断言拒绝。
 
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "旧 PreDropRecord 管线：生产已改走 TrPredrop + 强块内联 P，本模块目前仅单测使用"
+    )
+)]
+
 use core::{mem, ptr};
 
 use atomic_sync::mutex::preemptive::SpinningMutexOwned;
@@ -20,6 +28,12 @@ use crate::weak_::data_ptr_of_;
 ///
 /// 旧实现里的 `SpinMutex` 来自已删除的 `atomic_` 模块；这里改用 `atomic_sync` 提供的
 /// 具体锁类型。二者语义相同：把表包在锁里，守卫析构时释放。
+///
+/// 当前 `PreDropRecord` 不再持有锁（记录是类型级静态值），本别名只留作旧设计的对照。
+#[allow(
+    dead_code,
+    reason = "旧锁别名：PreDropRecord 已不持有登记表，本行仅保留旧设计对照"
+)]
 type SpinMutex<T> = SpinningMutexOwned<T>;
 
 // -- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----

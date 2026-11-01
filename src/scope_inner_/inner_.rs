@@ -219,6 +219,7 @@ impl ScopeInner {
     }
 
     /// 当前弱池链的链尾。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅分配管线单测读取，用于断言空弱池摘链"))]
     pub(crate) fn weak_tail_(&self) -> Option<NonNull<WeakPool>> {
         self.with_weak_chain_(|chain| chain.tail_)
     }

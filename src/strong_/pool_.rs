@@ -106,6 +106,7 @@ impl StrongPool {
     /// `pool_order_` 必须是该块在池内的**起始 cell 序号**。线程安全的池在归还块时需要
     /// 先通过这个反推拿到池地址并取得池锁，因此 `StrongChunkBase::pool_order_` 必须保留。
     /// 返回 `None` 表示地址不可能由本池的布局产生（越界或未按池对齐）。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测：由 chunk 反推所属池"))]
     pub(crate) fn of_chunk_(chunk: NonNull<StrongChunkBase>) -> Option<NonNull<Self>> {
         // SAFETY: 调用方保证 chunk 指向一个有效强块头部
         let order = unsafe { chunk.as_ref() }.pool_order_() as usize;
@@ -120,6 +121,7 @@ impl StrongPool {
     }
 
     /// 整块池子承载的全部 cell 空间。
+    #[allow(dead_code, reason = "旧池内存视图：分配路径直接用 free_addr_ 与 allocate_with_order_")]
     pub(crate) const fn memory_(&self) -> NonNull<[u8]> {
         let p = self as *const Self as *const u8;
         unsafe {
@@ -131,6 +133,7 @@ impl StrongPool {
     }
 
     /// 尚未分配出去的那段 cell 空间，从第一个空闲位置直到池尾。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅剩余空间断言读取（free_size_ 链）"))]
     pub(crate) const fn free_addr_(&self) -> NonNull<[u8]> {
         let p = self as *const Self as *const u8;
         let used = (self.used_count_ as usize) * CELL_SIZE;
@@ -150,6 +153,7 @@ impl StrongPool {
     /// # Errors
     ///
     /// 剩余空间放不下时返回当前可用的连续字节数，供上层决定是否开新池。
+    #[allow(dead_code, reason = "旧分配入口：生产路径使用 allocate_with_order_")]
     pub(crate) fn allocate_(&mut self, layout: Layout) -> Result<NonNull<[u8]>, usize> {
         self.allocate_with_order_(layout).map(|(mem, _)| mem)
     }

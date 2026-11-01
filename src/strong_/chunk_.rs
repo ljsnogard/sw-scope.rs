@@ -114,6 +114,7 @@ impl StrongChunkBase {
     pub(crate) const THIS_SIZE: usize = mem::size_of::<Self>();
 
     /// 构造空白头部；随后必须由 typed 工厂写入真实布局。
+    #[allow(dead_code, reason = "低层构造入口：当前由 layout_*/init_* 取代，保留作布局探针")]
     pub(crate) const fn empty_(weak_chunk: NonNull<WeakSlot<()>>, type_id: ConstTypeId) -> Self {
         StrongChunkBase {
             refc_: AtomicU32::new(0),
@@ -138,12 +139,14 @@ impl StrongChunkBase {
 
     /// 本块在所属 `StrongPool` 中的起始 cell 序号。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测使用（由强块反推池）"))]
     pub(crate) const fn pool_order_(&self) -> PoolIndex {
         self.pool_order_
     }
 
     /// 数据区相对头部首址的偏移（指针单位）。
     #[inline]
+    #[allow(dead_code, reason = "旧布局查询：数据偏移改由 dat_offset_bytes_ 提供")]
     pub(crate) const fn dat_offset_(&self) -> PoolIndex {
         self.dat_offset_
     }
@@ -176,6 +179,7 @@ impl StrongChunkBase {
 
     /// 是否存在 Predrop 对象。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测检查 Predrop 标志"))]
     pub(crate) fn has_predrop_(&self) -> bool {
         self.refc_.load(Ordering::Acquire) & Self::REFC_HAS_PREDROP != 0
     }
@@ -231,6 +235,7 @@ impl StrongChunkBase {
 
     /// 当前强引用计数（不含两个标志位）。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测检查强计数"))]
     pub(crate) fn strong_count(&self) -> u32 {
         self.refc_.load(Ordering::Acquire) & Self::REFC_COUNT_MASK
     }
@@ -251,6 +256,7 @@ impl StrongChunkBase {
 
     /// 把强计数清零，但保留两个结构标志位。
     #[inline]
+    #[allow(dead_code, reason = "旧计数复位入口：强计数由 tag 管理，测试未覆盖")]
     pub(crate) fn reset_strong_count(&self) {
         self.refc_
             .fetch_and(!Self::REFC_COUNT_MASK, Ordering::Release);
@@ -285,6 +291,7 @@ where
     /// # Errors
     ///
     /// 布局溢出或对齐非法时返回 [`None`]。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅?Sized 布局单测使用"))]
     pub(crate) fn layout_unsized(data_layout: Layout) -> Option<(Layout, PoolIndex)> {
         Self::layout_with(true, data_layout)
     }
@@ -344,18 +351,21 @@ where
 
     /// 数据的 `?Sized` 元数据字；没有 meta 槽时为空。
     #[inline]
+    #[allow(dead_code, reason = "旧每对象元数据查询：现由 data_ptr_of_ / chunk meta 槽直接处理")]
     pub(crate) fn pointee_meta_(&self) -> *const () {
         self.base_.pointee_meta_()
     }
 
     /// 本块是否带 meta 槽。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测检查 meta 槽"))]
     pub(crate) fn has_meta_(&self) -> bool {
         self.base_.has_meta_()
     }
 
     /// 本块是否带 Predrop 对象。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测检查 Predrop 槽"))]
     pub(crate) fn has_predrop_(&self) -> bool {
         self.base_.has_predrop_()
     }
@@ -368,6 +378,7 @@ where
 
     /// 只读头部视图。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测访问头部视图"))]
     pub(crate) fn base_(&self) -> &StrongChunkBase {
         &self.base_
     }
@@ -389,6 +400,7 @@ where
     ///
     /// 仅当 `DataState` 表明数据尚未析构时才可调用。
     #[inline]
+    #[allow(dead_code, reason = "未检查的 typed 数据视图：生产路径统一走 try_get_data")]
     pub(crate) unsafe fn data_ref_unchecked(&self) -> &T {
         // SAFETY: 由调用方保证数据仍然活着
         unsafe { &*self.data_ptr() }
@@ -396,6 +408,7 @@ where
 
     /// Predrop 对象引用；没有时返回 [`None`]。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测读取 Predrop 槽"))]
     pub(crate) fn predrop_(&self) -> Option<&P> {
         if P::IS_ABSENT {
             return Option::None;
@@ -408,6 +421,7 @@ where
 
     /// 当前强引用计数。
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测检查强计数"))]
     pub(crate) fn strong_count(&self) -> u32 {
         self.base_.strong_count()
     }
@@ -505,6 +519,7 @@ where
     /// # Safety
     ///
     /// 同 [`StrongChunk::init_with`]；`meta` 必须是同一个 `T` 的元数据裸字。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅?Sized 布局单测使用"))]
     pub(crate) unsafe fn init_unsized(
         base: *mut Self,
         weak_chunk: NonNull<WeakSlot<()>>,
@@ -575,6 +590,7 @@ where
     /// # Safety
     ///
     /// 必须先由状态机认领销毁，且恰好调用一次。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测的 typed 析构入口；生产走类型擦除 vtable"))]
     pub(crate) unsafe fn drop_data_(&mut self) {
         // SAFETY: 由调用方保证先认领销毁且恰好一次
         unsafe { self.run_predrop_() };
@@ -634,6 +650,7 @@ where
     /// # Safety
     ///
     /// 同 [`StrongChunk::init_sized`]；本块必须足够容纳默认布局。
+    #[cfg_attr(not(test), allow(dead_code, reason = "仅低层单测的构造入口"))]
     pub(crate) unsafe fn init_with_value(
         base: *mut Self,
         weak_chunk: NonNull<WeakSlot<()>>,
